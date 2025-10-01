@@ -966,7 +966,13 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
             }
         }
 
-        fs_err::rename(outfilename, filename)?;
+        let metadata = fs_err::symlink_metadata(filename)?;
+        if metadata.is_symlink() {
+            fs_err::copy(outfilename, filename)?;
+            fs_err::remove_file(outfilename)?;
+        } else {
+            fs_err::rename(outfilename, filename)?;
+        }
 
         Ok(())
     }
