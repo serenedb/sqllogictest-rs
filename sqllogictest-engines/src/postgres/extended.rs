@@ -220,6 +220,10 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
 
         pin_mut!(rows);
 
+        let column_names_row: Vec<String> =
+            stmt.columns().iter().map(|s| s.name().into()).collect();
+        output.push(column_names_row);
+
         while let Some(row) = rows.next().await {
             let row = row?;
             let mut row_vec = vec![];
