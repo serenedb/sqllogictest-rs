@@ -217,6 +217,8 @@ fn import_partition_config_from_ci() {
 pub async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    println!("Hello, world!");
+
     import_partition_config_from_ci();
 
     let cli = Opt::command().disable_help_flag(true).arg(
