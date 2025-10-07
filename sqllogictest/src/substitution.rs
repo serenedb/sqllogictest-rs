@@ -35,6 +35,7 @@ fn now_string() -> String {
         .to_string()
 }
 
+// TODO env vars and loop vars should be in separated flow
 impl Substitution<'_> {
     pub fn substitute(&self, input: &str) -> Result<String, SubstError> {
         if self.subst_env_vars {

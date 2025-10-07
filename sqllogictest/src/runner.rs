@@ -1131,12 +1131,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     .at(loc))
                 }
                 QueryExpect::Results { results, .. } if !results.is_empty() => {
+                    // TODO substitute
+                    let s = self
+                        .may_substitute(sql, true)
+                        .expect("cannot substitute: TODO expect later");
                     return Err(TestErrorKind::QueryResultMismatch {
-                        sql,
+                        sql: s,
                         expected: results.join("\n"),
                         actual: "".to_string(),
                     }
-                    .at(loc))
+                    .at(loc));
                 }
                 QueryExpect::Results { .. } => {}
             },
@@ -1257,8 +1261,13 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
                             let output_rows =
                                 rows.iter().map(|strs| strs.iter().join(" ")).collect_vec();
+                            // TODO substitute sql
+                            let s = self
+                                .may_substitute(sql, true)
+                                .expect("cannot substitute: TODO expect later");
+
                             return Err(TestErrorKind::QueryResultMismatch {
-                                sql,
+                                sql: s,
                                 expected: expected_results.join("\n"),
                                 actual: output_rows.join("\n"),
                             }
