@@ -912,7 +912,9 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
             }
             sqllogictest::RecordOutput::EndLoop => {
                 tracing::info!("record_id before end_loop: {record_id}");
-                let mut last = loop_ctx_stack.pop().ok_or_else(|| anyhow!("endloop without loop"))?;
+                let mut last = loop_ctx_stack
+                    .pop()
+                    .ok_or_else(|| anyhow!("endloop without loop"))?;
                 if last.next_iteration() {
                     record_id = last.record_id + 1; // Next after the loop record
                     runner.set_var(last.var_name.clone(), last.cur_value.to_string());
