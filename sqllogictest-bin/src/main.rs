@@ -912,7 +912,7 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
             }
             sqllogictest::RecordOutput::EndLoop => {
                 tracing::info!("record_id before end_loop: {record_id}");
-                let mut last = loop_ctx_stack.pop().expect("endloop without loop");
+                let mut last = loop_ctx_stack.pop().ok_or_else(|| anyhow!("endloop without loop"))?;
                 if last.next_iteration() {
                     record_id = last.record_id + 1; // Next after the loop record
                     runner.set_var(last.var_name.clone(), last.cur_value.to_string());
@@ -928,6 +928,9 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
                 record_id += 1;
             }
         }
+    }
+    if !loop_ctx_stack.is_empty() {
+        return Err(anyhow!("loop record does not meet endloop"));
     }
 
     let duration = begin_times[0].elapsed();
