@@ -10,6 +10,8 @@ use postgres_types::{ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
+use crate::postgres::error::PgDriverError;
+
 use super::{Extended, Postgres, Result};
 
 // Inspired by postgres_type::Array implementation of Display trait
@@ -237,7 +239,8 @@ fn float8_to_str(value: &f64) -> String {
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Extended> {
-    type Error = tokio_postgres::error::Error;
+    // TODO make custom postgres error that will wrap tokio_postgres::error that will print cause also
+    type Error = PgDriverError;
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>> {
