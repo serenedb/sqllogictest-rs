@@ -239,7 +239,6 @@ fn float8_to_str(value: &f64) -> String {
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Extended> {
-    // TODO make custom postgres error that will wrap tokio_postgres::error that will print cause also
     type Error = PgDriverError;
     type ColumnType = DefaultColumnType;
 
