@@ -201,12 +201,20 @@ macro_rules! array_process {
     };
 }
 
+fn placeholder_if_empty(value: String) -> String {
+    if value.is_empty() {
+        "(empty)".into()
+    } else {
+        value
+    }
+}
+
 macro_rules! single_process {
     ($row:ident, $row_vec:ident, $idx:ident, $t:ty) => {
         let value: Option<$t> = $row.get($idx);
         match value {
             Some(value) => {
-                $row_vec.push(value.to_string());
+                $row_vec.push(placeholder_if_empty(value.to_string()));
             }
             None => {
                 $row_vec.push("NULL".to_string());
@@ -217,7 +225,7 @@ macro_rules! single_process {
         let value: Option<$t> = $row.get($idx);
         match value {
             Some(value) => {
-                $row_vec.push($convert(&value).to_string());
+                $row_vec.push(placeholder_if_empty($convert(&value).to_string()));
             }
             None => {
                 $row_vec.push("NULL".to_string());
@@ -232,7 +240,7 @@ macro_rules! single_process {
                 let tmp_rows = $self.client().query(&sql, &[&value]).await.unwrap();
                 let value: &str = tmp_rows.get(0).unwrap().get(0);
                 assert!(value.len() > 0);
-                $row_vec.push(value.to_string());
+                $row_vec.push(placeholder_if_empty(value.to_string()));
             }
             None => {
                 $row_vec.push("NULL".to_string());
@@ -247,18 +255,6 @@ fn bool_to_str(value: &bool) -> &'static str {
     } else {
         "f"
     }
-}
-
-macro_rules! wrap_empty {
-    ($ty:ty, $converter:expr) => {
-        move |val: $ty| {
-            if val.is_empty() {
-                String::from("(empty)")
-            } else {
-                $converter(val)
-            }
-        }
-    };
 }
 
 fn bytea_to_str(value: &[u8]) -> String {
@@ -386,11 +382,10 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(row, row_vec, idx, f64, float8_to_str);
                     }
                     Type::VARCHAR | Type::TEXT | Type::BPCHAR => {
-                        let converter = wrap_empty!(&str, str::to_string);
-                        single_process!(row, row_vec, idx, &str, converter);
+                        single_process!(row, row_vec, idx, &str);
                     }
                     Type::VARCHAR_ARRAY | Type::TEXT_ARRAY | Type::BPCHAR_ARRAY => {
-                        array_process!(row, row_vec, idx, String);
+                        array_process!(row, row_vec, idx, &str);
                     }
                     Type::INTERVAL => {
                         single_process!(self, row, row_vec, idx, Interval, INTERVAL);
@@ -412,8 +407,7 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(self, row, row_vec, idx, DateTime<chrono::Utc>, TIMESTAMPTZ);
                     }
                     Type::BYTEA => {
-                        let converter = wrap_empty!(&[u8], bytea_to_str);
-                        single_process!(row, row_vec, idx, &[u8], converter);
+                        single_process!(row, row_vec, idx, &[u8], bytea_to_str);
                     }
                     Type::BYTEA_ARRAY => {
                         array_process!(row, row_vec, idx, &[u8], bytea_to_str);
