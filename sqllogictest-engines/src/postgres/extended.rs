@@ -249,18 +249,19 @@ fn bool_to_str(value: &bool) -> &'static str {
     }
 }
 
-fn placeholder_if_empty(value: &str) -> String {
-    if value.is_empty() {
-        "(empty)".to_string()
-    } else {
-        value.to_string()
-    }
+macro_rules! wrap_empty {
+    ($ty:ty, $converter:expr) => {
+        move |val: $ty| {
+            if val.is_empty() {
+                String::from("(empty)")
+            } else {
+                $converter(val)
+            }
+        }
+    };
 }
 
 fn bytea_to_str(value: &[u8]) -> String {
-    if value.is_empty() {
-        return "(empty)".to_string();
-    }
     let is_printable_ascii = value.iter().all(|&b| (32..=126).contains(&b) && b != 92);
     if is_printable_ascii {
         String::from_utf8_lossy(value).into_owned()
@@ -385,7 +386,8 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(row, row_vec, idx, f64, float8_to_str);
                     }
                     Type::VARCHAR | Type::TEXT | Type::BPCHAR => {
-                        single_process!(row, row_vec, idx, &str, placeholder_if_empty);
+                        let converter = wrap_empty!(&str, str::to_string);
+                        single_process!(row, row_vec, idx, &str, converter);
                     }
                     Type::VARCHAR_ARRAY | Type::TEXT_ARRAY | Type::BPCHAR_ARRAY => {
                         array_process!(row, row_vec, idx, String);
@@ -410,7 +412,8 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(self, row, row_vec, idx, DateTime<chrono::Utc>, TIMESTAMPTZ);
                     }
                     Type::BYTEA => {
-                        single_process!(row, row_vec, idx, &[u8], bytea_to_str);
+                        let converter = wrap_empty!(&[u8], bytea_to_str);
+                        single_process!(row, row_vec, idx, &[u8], converter);
                     }
                     Type::BYTEA_ARRAY => {
                         array_process!(row, row_vec, idx, &[u8], bytea_to_str);
