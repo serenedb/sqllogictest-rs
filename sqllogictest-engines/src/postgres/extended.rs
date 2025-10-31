@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fmt::Write;
 use std::process::Command;
 use std::time::Duration;
@@ -22,6 +23,55 @@ fn print_array<T: std::fmt::Display>(
     print_array_helper(0, arr.dimensions(), &mut arr.iter(), fmt)
 }
 
+// See https://www.postgresql.org/docs/current/arrays.html#ARRAYS-IO
+// The array output routine will put double quotes around element value if it
+// * is empty string
+// * equals to NULL (case insensitive)
+// Or contains
+// * curly braces
+// * delimiter characters(comma)
+// * double quotes
+// * backslashes
+// * space
+// We use it (although it's simple protocol specific) to not duplicate tests in simple and extended protocols.
+pub fn array_item_need_quotes_and_escape(data: &str) -> bool {
+    if data.is_empty() || data.eq_ignore_ascii_case("null") {
+        return true;
+    }
+
+    data.chars()
+        .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_ascii_whitespace())
+}
+
+// pub fn escape_default(self) -> EscapeDefault {
+//         match self {
+//             '\t' => EscapeDefault::backslash(ascii::Char::SmallT),
+//             '\r' => EscapeDefault::backslash(ascii::Char::SmallR),
+//             '\n' => EscapeDefault::backslash(ascii::Char::SmallN),
+//             '\\' | '\'' | '\"' => EscapeDefault::backslash(self.as_ascii().unwrap()),
+//             '\x20'..='\x7e' => EscapeDefault::printable(self.as_ascii().unwrap()),
+//             _ => EscapeDefault::unicode(self),
+//         }
+//     }
+
+pub fn escape_and_quote_ascii_only(input: &str) -> String {
+    assert!(array_item_need_quotes_and_escape(input));
+    let mut response = String::new();
+    let _ = write!(response, "{}", '"');
+
+    for c in input.chars() {
+        if c.is_ascii() {
+            let _ = write!(response, "{}", c.escape_default());
+        } else {
+            // Unicode should not be escaped
+            let _ = write!(response, "{}", c);
+        }
+    }
+    let _ = write!(response, "{}", '"');
+
+    response
+}
+
 fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Option<T>>>(
     depth: usize,
     dims: &[postgres_array::Dimension],
@@ -34,7 +84,14 @@ fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Opti
 
     if depth == dims.len() {
         return match data.next().unwrap() {
-            Some(value) => write!(fmt, "{}", value),
+            Some(value) => {
+                let mut item = String::new();
+                write!(item, "{}", value)?;
+                if array_item_need_quotes_and_escape(&item) {
+                    item = escape_and_quote_ascii_only(&item);
+                }
+                write!(fmt, "{}", item)
+            }
             None => write!(fmt, "NULL"),
         };
     }
@@ -75,9 +132,9 @@ impl<'a> FromSql<'a> for JsonPreservedValue {
     accepts!(JSON);
 }
 
-impl ToString for JsonPreservedValue {
-    fn to_string(&self) -> String {
-        self.payload.clone()
+impl fmt::Display for JsonPreservedValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.payload)
     }
 }
 
@@ -378,8 +435,10 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::BYTEA => {
                         single_process!(row, row_vec, idx, &[u8], bytea_to_str);
                     }
-                    // TODO Type::JSON_ARRAY
-                    Type::JSON_ARRAY | Type::JSONB_ARRAY => {
+                    Type::JSON_ARRAY => {
+                        array_process!(row, row_vec, idx, JsonPreservedValue);
+                    }
+                    Type::JSONB_ARRAY => {
                         array_process!(row, row_vec, idx, serde_json::Value);
                     }
                     Type::JSON => {
