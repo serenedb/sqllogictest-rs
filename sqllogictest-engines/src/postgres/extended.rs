@@ -33,7 +33,7 @@ fn print_array<T: std::fmt::Display>(
 // * double quotes
 // * backslashes
 // * space
-// We use it (although it's simple protocol specific) to not duplicate tests in simple and extended protocols.
+// It'is used (although it's simple protocol specific) to not duplicate tests for simple and extended protocols.
 pub fn array_item_need_quotes_and_escape(data: &str) -> bool {
     if data.is_empty() || data.eq_ignore_ascii_case("null") {
         return true;
@@ -43,32 +43,20 @@ pub fn array_item_need_quotes_and_escape(data: &str) -> bool {
         .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_ascii_whitespace())
 }
 
-// pub fn escape_default(self) -> EscapeDefault {
-//         match self {
-//             '\t' => EscapeDefault::backslash(ascii::Char::SmallT),
-//             '\r' => EscapeDefault::backslash(ascii::Char::SmallR),
-//             '\n' => EscapeDefault::backslash(ascii::Char::SmallN),
-//             '\\' | '\'' | '\"' => EscapeDefault::backslash(self.as_ascii().unwrap()),
-//             '\x20'..='\x7e' => EscapeDefault::printable(self.as_ascii().unwrap()),
-//             _ => EscapeDefault::unicode(self),
-//         }
-//     }
-
 pub fn escape_and_quote_ascii_only(input: &str) -> String {
     assert!(array_item_need_quotes_and_escape(input));
-    let mut response = String::new();
-    let _ = write!(response, "{}", '"');
+    let mut response = String::with_capacity(input.len());
+    response.push('"');
 
     for c in input.chars() {
         if c.is_ascii() {
             let _ = write!(response, "{}", c.escape_default());
         } else {
             // Unicode should not be escaped
-            let _ = write!(response, "{}", c);
+            response.push(c);
         }
     }
-    let _ = write!(response, "{}", '"');
-
+    response.push('"');
     response
 }
 
