@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use futures::{pin_mut, StreamExt};
 use pg_interval::Interval;
-use postgres_types::{ToSql, Type};
+use postgres_types::{accepts, FromSql, ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
@@ -54,6 +54,30 @@ struct ArrayFmt<'a, T>(&'a postgres_array::Array<Option<T>>);
 impl<'a, T: std::fmt::Display> std::fmt::Display for ArrayFmt<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         print_array(self.0, f)
+    }
+}
+
+#[derive(Debug)]
+struct JsonPreservedValue {
+    payload: String,
+}
+
+impl<'a> FromSql<'a> for JsonPreservedValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(JsonPreservedValue {
+            payload: std::str::from_utf8(raw)?.to_string(),
+        })
+    }
+
+    accepts!(JSON);
+}
+
+impl ToString for JsonPreservedValue {
+    fn to_string(&self) -> String {
+        self.payload.clone()
     }
 }
 
@@ -354,10 +378,14 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::BYTEA => {
                         single_process!(row, row_vec, idx, &[u8], bytea_to_str);
                     }
+                    // TODO Type::JSON_ARRAY
                     Type::JSON_ARRAY | Type::JSONB_ARRAY => {
                         array_process!(row, row_vec, idx, serde_json::Value);
                     }
-                    Type::JSON | Type::JSONB => {
+                    Type::JSON => {
+                        single_process!(row, row_vec, idx, JsonPreservedValue);
+                    }
+                    Type::JSONB => {
                         single_process!(row, row_vec, idx, serde_json::Value);
                     }
                     _ => {
