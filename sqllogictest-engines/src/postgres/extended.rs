@@ -34,7 +34,7 @@ fn print_array<T: std::fmt::Display>(
 // * backslashes
 // * space
 // It'is used (although it's simple protocol specific) to not duplicate tests for simple and extended protocols.
-pub fn array_item_need_quotes_and_escape(data: &str) -> bool {
+pub fn array_item_need_escape_and_quote(data: &str) -> bool {
     if data.is_empty() || data.eq_ignore_ascii_case("null") {
         return true;
     }
@@ -43,18 +43,16 @@ pub fn array_item_need_quotes_and_escape(data: &str) -> bool {
         .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_ascii_whitespace())
 }
 
-pub fn escape_and_quote_ascii_only(input: &str) -> String {
-    assert!(array_item_need_quotes_and_escape(input));
+pub fn escape_and_quote(input: &str) -> String {
+    debug_assert!(array_item_need_escape_and_quote(input));
     let mut response = String::with_capacity(input.len());
     response.push('"');
 
     for c in input.chars() {
-        if c.is_ascii() {
-            let _ = write!(response, "{}", c.escape_default());
-        } else {
-            // Unicode should not be escaped
-            response.push(c);
+        if matches!(c, '"' | '\\') {
+            response.push('\\');
         }
+        response.push(c);
     }
     response.push('"');
     response
@@ -75,8 +73,8 @@ fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Opti
             Some(value) => {
                 let mut item = String::new();
                 write!(item, "{}", value)?;
-                if array_item_need_quotes_and_escape(&item) {
-                    item = escape_and_quote_ascii_only(&item);
+                if array_item_need_escape_and_quote(&item) {
+                    item = escape_and_quote(&item);
                 }
                 write!(fmt, "{}", item)
             }
