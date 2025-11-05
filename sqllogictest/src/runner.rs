@@ -631,27 +631,27 @@ pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
     locals: RunnerLocals,
 }
 
-fn split_rows_at_newline(v: Vec<Vec<String>>) -> Vec<Vec<String>> {
+fn split_rows_at_newline(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
     let mut result = Vec::new();
 
-    for subvec in v {
-        let has_newline = subvec.iter().any(|s| s.contains('\n'));
+    for row in rows {
+        let has_newline = row.iter().any(|s| s.contains("\n"));
 
         if !has_newline {
-            result.push(subvec);
+            result.push(row);
             continue;
         }
 
-        let mut current_row = Vec::new();
+        let mut new_row = Vec::new();
 
-        for s in subvec {
-            if s.contains('\n') {
-                // Split this string by newlines
-                let parts: Vec<&str> = s.split('\n').collect();
+        for token in row {
+            if token.contains("\n") {
+                let parts: Vec<&str> = token.split('\n').collect();
 
-                // First part goes to current row
-                current_row.push(parts[0].to_string());
-                result.push(current_row);
+                new_row.push(parts[0].to_string());
+                if !new_row.is_empty() {
+                    result.push(new_row);
+                }
 
                 // Middle parts (if any) become complete rows with just that part
                 for part in &parts[1..parts.len() - 1] {
@@ -659,18 +659,20 @@ fn split_rows_at_newline(v: Vec<Vec<String>>) -> Vec<Vec<String>> {
                 }
 
                 // Last part starts a new row
-                current_row = vec![parts[parts.len() - 1].to_string()];
+                new_row = vec![parts[parts.len() - 1].to_string()];
             } else {
                 // No newline, add to current row
-                current_row.push(s);
+                new_row.push(token);
             }
         }
 
         // Push the last row if it's not empty
-        if !current_row.is_empty() {
-            result.push(current_row);
+        if !new_row.is_empty() {
+            result.push(new_row);
         }
     }
+
+    println!("RESULT={result:?}");
 
     result
 }
