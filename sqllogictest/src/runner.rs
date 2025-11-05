@@ -365,15 +365,21 @@ impl Display for TestErrorKindDisplay<'_> {
                 sql,
                 expected,
                 actual,
-            } => write!(
-                f,
-                "query result mismatch:\n[SQL] {sql}\n[Diff] ({}|{})\n{}",
-                "-expected".bright_red(),
-                "+actual".bright_green(),
-                TextDiff::from_lines(expected, actual)
-                    .iter_all_changes()
-                    .format_with("\n", |diff, f| format_diff(&diff, f, true))
-            ),
+            } => {
+                let e_len = expected.len();
+                let a_len = actual.len();
+                eprintln!("expected='{expected}'; len={e_len}");
+                eprintln!("actual='{actual}'; len={a_len}");
+                write!(
+                    f,
+                    "query result mismatch:\n[SQL] {sql}\n[Diff] ({}|{})\n{}",
+                    "-expected".bright_red(),
+                    "+actual".bright_green(),
+                    TextDiff::from_lines(expected, actual)
+                        .iter_all_changes()
+                        .format_with("\n", |diff, f| format_diff(&diff, f, true))
+                )
+            }
             TestErrorKind::QueryResultColumnsMismatch {
                 sql,
                 expected,
@@ -629,6 +635,42 @@ pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
     labels: HashSet<String>,
     /// Local variables/context for the runner.
     locals: RunnerLocals,
+}
+
+fn split_rows_at_newline(v: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut result = Vec::new();
+
+    for subvec in v {
+        // Search for any string in subvec containing "\n"
+        if let Some((idx, split_word)) = subvec.iter().enumerate().find_map(|(idx, s)| {
+            if let Some(pos) = s.find('\n') {
+                Some((idx, pos))
+            } else {
+                None
+            }
+        }) {
+            // Split the string into two parts
+            let split_str = subvec[idx].clone();
+            let (left, right) = split_str.split_at(split_word);
+            let left = left.to_string();
+            let right = right[1..].to_string(); // Skip the '\n' char
+
+            // Build first new vec: up to idx, then left part
+            let mut first = subvec[..idx].to_vec();
+            first.push(left);
+            result.push(first);
+
+            // Build second new vec: right part, then rest of subvec after idx
+            let mut second = Vec::new();
+            second.push(right);
+            second.extend_from_slice(&subvec[idx + 1..]);
+            result.push(second);
+        } else {
+            result.push(subvec);
+        }
+    }
+
+    result
 }
 
 impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
@@ -1193,6 +1235,12 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                             .at(loc));
                         }
 
+                        // Just to reproduce logics of writing to file.
+                        // When we write a string that contains '\\', 'n' substring to formatter, new line will be written.
+                        // Without this manipulation the following situation may happen:
+                        // run --override -> run without override -> query result mismatch
+                        let rows = split_rows_at_newline(rows.clone());
+
                         let actual_results = match self.result_mode {
                             Some(ResultMode::ValueWise) => rows
                                 .iter()
@@ -1206,6 +1254,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
                             let output_rows =
                                 rows.iter().map(|strs| strs.iter().join(" ")).collect_vec();
+                            eprintln!("ACTUAL_RESULTS  ='{actual_results:?}'");
+                            eprintln!("EXPECTED_RESULTS='{expected_results:?}'");
                             return Err(TestErrorKind::QueryResultMismatch {
                                 sql,
                                 expected: expected_results.join("\n"),
