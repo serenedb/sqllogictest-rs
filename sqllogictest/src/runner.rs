@@ -365,21 +365,15 @@ impl Display for TestErrorKindDisplay<'_> {
                 sql,
                 expected,
                 actual,
-            } => {
-                let e_len = expected.len();
-                let a_len = actual.len();
-                eprintln!("expected='{expected}'; len={e_len}");
-                eprintln!("actual='{actual}'; len={a_len}");
-                write!(
-                    f,
-                    "query result mismatch:\n[SQL] {sql}\n[Diff] ({}|{})\n{}",
-                    "-expected".bright_red(),
-                    "+actual".bright_green(),
-                    TextDiff::from_lines(expected, actual)
-                        .iter_all_changes()
-                        .format_with("\n", |diff, f| format_diff(&diff, f, true))
-                )
-            }
+            } => write!(
+                f,
+                "query result mismatch:\n[SQL] {sql}\n[Diff] ({}|{})\n{}",
+                "-expected".bright_red(),
+                "+actual".bright_green(),
+                TextDiff::from_lines(expected, actual)
+                    .iter_all_changes()
+                    .format_with("\n", |diff, f| format_diff(&diff, f, true))
+            ),
             TestErrorKind::QueryResultColumnsMismatch {
                 sql,
                 expected,
@@ -641,32 +635,40 @@ fn split_rows_at_newline(v: Vec<Vec<String>>) -> Vec<Vec<String>> {
     let mut result = Vec::new();
 
     for subvec in v {
-        // Search for any string in subvec containing "\n"
-        if let Some((idx, split_word)) = subvec.iter().enumerate().find_map(|(idx, s)| {
-            if let Some(pos) = s.find('\n') {
-                Some((idx, pos))
-            } else {
-                None
-            }
-        }) {
-            // Split the string into two parts
-            let split_str = subvec[idx].clone();
-            let (left, right) = split_str.split_at(split_word);
-            let left = left.to_string();
-            let right = right[1..].to_string(); // Skip the '\n' char
+        let has_newline = subvec.iter().any(|s| s.contains('\n'));
 
-            // Build first new vec: up to idx, then left part
-            let mut first = subvec[..idx].to_vec();
-            first.push(left);
-            result.push(first);
-
-            // Build second new vec: right part, then rest of subvec after idx
-            let mut second = Vec::new();
-            second.push(right);
-            second.extend_from_slice(&subvec[idx + 1..]);
-            result.push(second);
-        } else {
+        if !has_newline {
             result.push(subvec);
+            continue;
+        }
+
+        let mut current_row = Vec::new();
+
+        for s in subvec {
+            if s.contains('\n') {
+                // Split this string by newlines
+                let parts: Vec<&str> = s.split('\n').collect();
+
+                // First part goes to current row
+                current_row.push(parts[0].to_string());
+                result.push(current_row);
+
+                // Middle parts (if any) become complete rows with just that part
+                for part in &parts[1..parts.len() - 1] {
+                    result.push(vec![part.to_string()]);
+                }
+
+                // Last part starts a new row
+                current_row = vec![parts[parts.len() - 1].to_string()];
+            } else {
+                // No newline, add to current row
+                current_row.push(s);
+            }
+        }
+
+        // Push the last row if it's not empty
+        if !current_row.is_empty() {
+            result.push(current_row);
         }
     }
 
@@ -1254,8 +1256,6 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
                             let output_rows =
                                 rows.iter().map(|strs| strs.iter().join(" ")).collect_vec();
-                            eprintln!("ACTUAL_RESULTS  ='{actual_results:?}'");
-                            eprintln!("EXPECTED_RESULTS='{expected_results:?}'");
                             return Err(TestErrorKind::QueryResultMismatch {
                                 sql,
                                 expected: expected_results.join("\n"),
