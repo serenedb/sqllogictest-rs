@@ -671,9 +671,6 @@ fn split_rows_at_newline(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
             result.push(new_row);
         }
     }
-
-    println!("RESULT={result:?}");
-
     result
 }
 
