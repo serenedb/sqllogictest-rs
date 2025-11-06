@@ -258,6 +258,7 @@ fn bool_to_str(value: &bool) -> &'static str {
 }
 
 fn bytea_to_str(value: &[u8]) -> String {
+    // TODO: printable ascii is not compatible with text protocol
     let is_printable_ascii = value.iter().all(|&b| (32..=126).contains(&b) && b != 92);
     if is_printable_ascii {
         String::from_utf8_lossy(value).into_owned()
