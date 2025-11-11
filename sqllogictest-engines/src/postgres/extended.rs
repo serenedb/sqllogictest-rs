@@ -258,6 +258,7 @@ fn bool_to_str(value: &bool) -> &'static str {
 }
 
 fn bytea_to_str(value: &[u8]) -> String {
+    // It assumes that 'BYTEA_OUTPUT' variable is set to 'hex' (default value)
     let mut result = String::with_capacity("\\x".len() + 2 * value.len());
     result.push_str("\\x");
     for &b in value {
