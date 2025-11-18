@@ -324,7 +324,7 @@ pub async fn main() -> Result<()> {
     };
 
     if r#override || format {
-        return update_test_files(all_files, &engine, config, format).await;
+        return update_test_files(all_files, &engine, config, format, jobs.unwrap_or(1)).await;
     }
 
     let mut report = Report::new(junit.clone().unwrap_or_else(|| "sqllogictest".to_string()));
@@ -616,19 +616,29 @@ async fn update_test_files(
     engine: &EngineConfig,
     config: DBConfig,
     format: bool,
+    jobs: usize,
 ) -> Result<()> {
-    for file in files {
-        let mut runner = Runner::new(|| engines::connect(engine, &config));
-        runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
+    tracing::info!("jobs: {jobs}");
+    let mut stream = futures::stream::iter(files)
+        .map(|file| {
+            let mut buffer = vec![];
+            let mut runner = Runner::new(|| engines::connect(engine, &config));
+            runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
 
-        if let Err(e) = update_test_file(&mut io::stdout(), &mut runner, &file, format).await {
-            {
-                println!("{}\n\n{:?}", style("[FAILED]").red().bold(), e);
-                println!();
+            async move {
+                if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, format).await {
+                    writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
+                        .expect("cannot write to buffer");
+                };
+
+                runner.shutdown_async().await;
+                buffer
             }
-        };
+        })
+        .buffer_unordered(jobs);
 
-        runner.shutdown_async().await;
+    while let Some(output) = stream.next().await {
+        io::stdout().write_all(&output)?;
     }
 
     Ok(())
