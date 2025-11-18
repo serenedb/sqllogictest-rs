@@ -655,7 +655,6 @@ async fn update_test_files(
             config.db = db_name.clone();
 
             let failed_dbs = failed_dbs.clone();
-            let keep_db_on_failure = keep_db_on_failure;
             async move {
                 let mut runner = Runner::new(|| engines::connect(engine, &config));
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
