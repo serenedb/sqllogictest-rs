@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, stdout, Read, Seek, SeekFrom, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,6 +23,7 @@ use sqllogictest::{
     default_column_validator, default_normalizer, default_validator, update_record_with_output,
     AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner,
 };
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -324,7 +326,15 @@ pub async fn main() -> Result<()> {
     };
 
     if r#override || format {
-        return update_test_files(all_files, &engine, config, format, jobs.unwrap_or(1)).await;
+        return update_test_files(
+            all_files,
+            &engine,
+            config,
+            format,
+            jobs.unwrap_or(1),
+            keep_db_on_failure,
+        )
+        .await;
     }
 
     let mut report = Report::new(junit.clone().unwrap_or_else(|| "sqllogictest".to_string()));
@@ -482,7 +492,7 @@ async fn run_parallel(
     eprintln!("{}", style("[TEST IN PROGRESS]").blue().bold());
 
     let mut failed_cases = vec![];
-    let mut failed_db: HashSet<String> = HashSet::new();
+    let mut failed_dbs: HashSet<String> = HashSet::new();
 
     let mut connection_refused = false;
     let start = Instant::now();
@@ -505,7 +515,7 @@ async fn run_parallel(
                 }
 
                 failed_cases.push(test_case_name.clone());
-                failed_db.insert(db_name.clone());
+                failed_dbs.insert(db_name.clone());
             }
             RunResult::Skipped | RunResult::Cancelled => {}
         };
@@ -517,7 +527,7 @@ async fn run_parallel(
         eprintln!("Skip dropping databases due to connection refused: {db_names:?}");
     } else {
         for db_name in db_names {
-            if keep_db_on_failure && failed_db.contains(&db_name) {
+            if keep_db_on_failure && failed_dbs.contains(&db_name) {
                 eprintln!(
                     "+ {}",
                     style(format!(
@@ -623,6 +633,7 @@ async fn update_test_files(
     config: DBConfig,
     format: bool,
     jobs: usize,
+    keep_db_on_failure: bool,
 ) -> Result<()> {
     let mut db = engines::connect(engine, &config).await?;
     let test_databases = test_db_names(files)?;
@@ -636,19 +647,26 @@ async fn update_test_files(
         }
     }
 
+    let failed_dbs: Arc<Mutex<HashSet<String>>> = Arc::default();
+
     let mut stream = futures::stream::iter(test_databases)
         .map(|(db_name, file)| {
             let mut config = config.clone();
             config.db = db_name.clone();
 
+            let failed_dbs = failed_dbs.clone();
+            let keep_db_on_failure = keep_db_on_failure;
             async move {
                 let mut runner = Runner::new(|| engines::connect(engine, &config));
-                runner.set_var(well_known::DATABASE.to_owned(), db_name);
+                runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
                 if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, format).await {
                     writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
                         .expect("cannot write to buffer");
+                    if keep_db_on_failure {
+                        failed_dbs.lock().await.insert(db_name);
+                    }
                 };
 
                 runner.shutdown_async().await;
@@ -661,7 +679,20 @@ async fn update_test_files(
         io::stdout().write_all(&output)?;
     }
 
+    let failed_dbs_guard = failed_dbs.lock().await;
+
     for db_name in test_databases_names.iter() {
+        if keep_db_on_failure && failed_dbs_guard.contains(db_name) {
+            eprintln!(
+                "+ {}",
+                style(format!(
+                    "DATABASE {db_name} contains failed cases, kept for debugging"
+                ))
+                .red()
+                .bold()
+            );
+            continue;
+        }
         let query = format!("DROP DATABASE {db_name};");
         eprintln!("+ {query}");
         if let Err(err) = db.run(&query).await {
