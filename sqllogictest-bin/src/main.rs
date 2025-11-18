@@ -1,6 +1,6 @@
 mod engines;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, stdout, Read, Seek, SeekFrom, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -387,6 +387,43 @@ struct RunConfig {
     shutdown_timeout: Option<Duration>,
 }
 
+fn test_db_name(test_case_name: String) -> String {
+    // Because PostgreSQL database names are < 64
+    const MAX_DATABASE_NAME_LEN: usize = 63;
+    const RANDOM_LEN: usize = 8;
+
+    let mut test_case_prefix = test_case_name;
+
+    if test_case_prefix.len() > MAX_DATABASE_NAME_LEN - RANDOM_LEN - 1 {
+        test_case_prefix = test_case_prefix[..MAX_DATABASE_NAME_LEN - RANDOM_LEN - 1].to_string();
+    }
+
+    let random_id: String = rand::distributions::Alphanumeric
+        .sample_string(&mut rand::thread_rng(), RANDOM_LEN)
+        .to_lowercase();
+    format!("{test_case_prefix}_{random_id}")
+}
+
+fn test_db_names(files: Vec<PathBuf>) -> Result<HashMap<String, PathBuf>> {
+    let mut test_databases = HashMap::new();
+    let mut test_cases = HashSet::new();
+    for file in files {
+        let filename = file
+            .to_str()
+            .ok_or_else(|| anyhow!("not a UTF-8 filename"))?;
+        let test_case_name = filename.to_test_case_name();
+
+        eprintln!("+ Discovered Test: {test_case_name}");
+        if !test_cases.insert(test_case_name.clone()) {
+            return Err(anyhow!("duplicated test case found: {}", test_case_name));
+        }
+
+        let db_name = test_db_name(test_case_name);
+        test_databases.insert(db_name, file);
+    }
+    Ok(test_databases)
+}
+
 async fn run_parallel(
     jobs: usize,
     keep_db_on_failure: bool,
@@ -402,41 +439,10 @@ async fn run_parallel(
         shutdown_timeout,
     }: RunConfig,
 ) -> Result<()> {
-    // Because PostgreSQL database names are < 64
-    const MAX_DATABASE_NAME_LEN: usize = 63;
-    const RANDOM_LEN: usize = 8;
-
-    let mut create_databases = BTreeMap::new();
-    let mut test_cases = BTreeSet::new();
-    for file in files {
-        let filename = file
-            .to_str()
-            .ok_or_else(|| anyhow!("not a UTF-8 filename"))?;
-        let test_case_name = filename.to_test_case_name();
-
-        eprintln!("+ Discovered Test: {test_case_name}");
-        if !test_cases.insert(test_case_name.clone()) {
-            return Err(anyhow!("duplicated test case found: {}", test_case_name));
-        }
-
-        let mut test_case_prefix = test_case_name;
-
-        if test_case_prefix.len() > MAX_DATABASE_NAME_LEN - RANDOM_LEN - 1 {
-            test_case_prefix =
-                test_case_prefix[..MAX_DATABASE_NAME_LEN - RANDOM_LEN - 1].to_string();
-        }
-
-        let random_id: String = rand::distributions::Alphanumeric
-            .sample_string(&mut rand::thread_rng(), RANDOM_LEN)
-            .to_lowercase();
-        let db_name = format!("{test_case_prefix}_{random_id}");
-
-        create_databases.insert(db_name, file);
-    }
-
+    let test_databases = test_db_names(files)?;
     let mut db = engines::connect(engine, &config).await?;
 
-    let db_names: Vec<String> = create_databases.keys().cloned().collect();
+    let db_names: Vec<String> = test_databases.keys().cloned().collect();
     for db_name in &db_names {
         let query = format!("CREATE DATABASE {db_name};");
         eprintln!("+ {query}");
@@ -445,7 +451,7 @@ async fn run_parallel(
         }
     }
 
-    let mut stream = futures::stream::iter(create_databases)
+    let mut stream = futures::stream::iter(test_databases)
         .map(|(db_name, filename)| {
             let mut config = config.clone();
             config.db.clone_from(&db_name);
@@ -618,14 +624,28 @@ async fn update_test_files(
     format: bool,
     jobs: usize,
 ) -> Result<()> {
-    tracing::info!("jobs: {jobs}");
-    let mut stream = futures::stream::iter(files)
-        .map(|file| {
-            let mut buffer = vec![];
-            let mut runner = Runner::new(|| engines::connect(engine, &config));
-            runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
+    let mut db = engines::connect(engine, &config).await?;
+    let test_databases = test_db_names(files)?;
+
+    let test_databases_names: Vec<String> = test_databases.keys().cloned().collect();
+    for db_name in test_databases_names.iter() {
+        let query = format!("CREATE DATABASE {db_name};");
+        eprintln!("+ {query}");
+        if let Err(err) = db.run(&query).await {
+            eprintln!("  ignore error: {err}");
+        }
+    }
+
+    let mut stream = futures::stream::iter(test_databases)
+        .map(|(db_name, file)| {
+            let mut config = config.clone();
+            config.db = db_name.clone();
 
             async move {
+                let mut runner = Runner::new(|| engines::connect(engine, &config));
+                runner.set_var(well_known::DATABASE.to_owned(), db_name);
+
+                let mut buffer = vec![];
                 if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, format).await {
                     writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
                         .expect("cannot write to buffer");
@@ -641,6 +661,18 @@ async fn update_test_files(
         io::stdout().write_all(&output)?;
     }
 
+    for db_name in test_databases_names.iter() {
+        let query = format!("DROP DATABASE {db_name};");
+        eprintln!("+ {query}");
+        if let Err(err) = db.run(&query).await {
+            let err = err.to_string();
+            if err.contains("Connection refused") {
+                eprintln!("  Connection refused. The server may be down. Exiting...");
+                break;
+            }
+            eprintln!("  ignore DROP DATABASE error: {err}");
+        }
+    }
     Ok(())
 }
 
