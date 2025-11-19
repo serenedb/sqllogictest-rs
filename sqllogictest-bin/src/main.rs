@@ -1,6 +1,6 @@
 mod engines;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, stdout, Read, Seek, SeekFrom, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -326,15 +326,8 @@ pub async fn main() -> Result<()> {
     };
 
     if r#override || format {
-        return update_test_files(
-            all_files,
-            &engine,
-            config,
-            format,
-            jobs.unwrap_or(1),
-            keep_db_on_failure,
-        )
-        .await;
+        return update_test_files(all_files, &engine, config, format, jobs, keep_db_on_failure)
+            .await;
     }
 
     let mut report = Report::new(junit.clone().unwrap_or_else(|| "sqllogictest".to_string()));
@@ -414,8 +407,8 @@ fn test_db_name(test_case_name: String) -> String {
     format!("{test_case_prefix}_{random_id}")
 }
 
-fn test_db_names(files: Vec<PathBuf>) -> Result<HashMap<String, PathBuf>> {
-    let mut test_databases = HashMap::new();
+fn test_db_names(files: Vec<PathBuf>) -> Result<Vec<(String, PathBuf)>> {
+    let mut test_databases = Vec::new();
     let mut test_cases = HashSet::new();
     for file in files {
         let filename = file
@@ -429,7 +422,7 @@ fn test_db_names(files: Vec<PathBuf>) -> Result<HashMap<String, PathBuf>> {
         }
 
         let db_name = test_db_name(test_case_name);
-        test_databases.insert(db_name, file);
+        test_databases.push((db_name, file));
     }
     Ok(test_databases)
 }
@@ -452,7 +445,11 @@ async fn run_parallel(
     let test_databases = test_db_names(files)?;
     let mut db = engines::connect(engine, &config).await?;
 
-    let db_names: Vec<String> = test_databases.keys().cloned().collect();
+    let db_names: Vec<String> = test_databases
+        .iter()
+        .map(|(db_name, _)| db_name)
+        .cloned()
+        .collect();
     for db_name in &db_names {
         let query = format!("CREATE DATABASE {db_name};");
         eprintln!("+ {query}");
@@ -632,18 +629,31 @@ async fn update_test_files(
     engine: &EngineConfig,
     config: DBConfig,
     format: bool,
-    jobs: usize,
+    jobs: Option<usize>,
     keep_db_on_failure: bool,
 ) -> Result<()> {
     let mut db = engines::connect(engine, &config).await?;
-    let test_databases = test_db_names(files)?;
+    let test_databases = if jobs.is_some() {
+        test_db_names(files)?
+    } else {
+        files
+            .iter()
+            .map(|path| (config.db.clone(), path.clone()))
+            .collect()
+    };
 
-    let test_databases_names: Vec<String> = test_databases.keys().cloned().collect();
-    for db_name in test_databases_names.iter() {
-        let query = format!("CREATE DATABASE {db_name};");
-        eprintln!("+ {query}");
-        if let Err(err) = db.run(&query).await {
-            eprintln!("  ignore error: {err}");
+    let db_names: Vec<String> = test_databases
+        .iter()
+        .map(|(db_name, _)| db_name)
+        .cloned()
+        .collect();
+    if jobs.is_some() {
+        for db_name in &db_names {
+            let query = format!("CREATE DATABASE {db_name};");
+            eprintln!("+ {query}");
+            if let Err(err) = db.run(&query).await {
+                eprintln!("  ignore error: {err}");
+            }
         }
     }
 
@@ -672,35 +682,36 @@ async fn update_test_files(
                 buffer
             }
         })
-        .buffer_unordered(jobs);
+        .buffer_unordered(jobs.unwrap_or(1));
 
     while let Some(output) = stream.next().await {
         io::stdout().write_all(&output)?;
     }
 
-    let failed_dbs_guard = failed_dbs.lock().await;
-
-    for db_name in test_databases_names.iter() {
-        if keep_db_on_failure && failed_dbs_guard.contains(db_name) {
-            eprintln!(
-                "+ {}",
-                style(format!(
-                    "DATABASE {db_name} contains failed cases, kept for debugging"
-                ))
-                .red()
-                .bold()
-            );
-            continue;
-        }
-        let query = format!("DROP DATABASE {db_name};");
-        eprintln!("+ {query}");
-        if let Err(err) = db.run(&query).await {
-            let err = err.to_string();
-            if err.contains("Connection refused") {
-                eprintln!("  Connection refused. The server may be down. Exiting...");
-                break;
+    if jobs.is_some() {
+        let failed_dbs_guard = failed_dbs.lock().await;
+        for db_name in db_names.iter() {
+            if keep_db_on_failure && failed_dbs_guard.contains(db_name) {
+                eprintln!(
+                    "+ {}",
+                    style(format!(
+                        "DATABASE {db_name} contains failed cases, kept for debugging"
+                    ))
+                    .red()
+                    .bold()
+                );
+                continue;
             }
-            eprintln!("  ignore DROP DATABASE error: {err}");
+            let query = format!("DROP DATABASE {db_name};");
+            eprintln!("+ {query}");
+            if let Err(err) = db.run(&query).await {
+                let err = err.to_string();
+                if err.contains("Connection refused") {
+                    eprintln!("  Connection refused. The server may be down. Exiting...");
+                    break;
+                }
+                eprintln!("  ignore DROP DATABASE error: {err}");
+            }
         }
     }
     Ok(())
