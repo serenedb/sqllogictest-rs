@@ -678,7 +678,7 @@ async fn update_test_files(
             async move {
                 let mut runner = Runner::new(|| engines::connect(engine, &config));
                 for label in labels {
-                    runner.add_label(&label);
+                    runner.add_label(label);
                 }
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
