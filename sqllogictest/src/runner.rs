@@ -758,8 +758,6 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 let ret = conn.run(&sql).await;
                 match ret {
                     Ok(out) => match out {
-
-                        // Apply my_escape_func to rows
                         DBOutput::Rows { types, rows } => RecordOutput::Query {
                             types,
                             rows: escape(rows),
