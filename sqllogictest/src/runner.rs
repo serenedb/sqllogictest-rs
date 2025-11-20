@@ -637,6 +637,11 @@ fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
             row.iter_mut()
                 .for_each(|cell| {
                     *cell = cell.replace("\\", "\\\\");
+                    
+                    *cell = cell
+                        .replace("\n", "\\n")
+                        .replace("\r", "\\r")
+                        .replace("\t", "\\t")
                 });
         });
     rows
@@ -974,7 +979,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 RecordOutput::Query {
                     error: None,
                     types,
-                    rows,
+                    rows: escape(rows),
                 }
             }
             Record::Sleep { duration, .. } => {
