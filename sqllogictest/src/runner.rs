@@ -1211,7 +1211,6 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                             .at(loc));
                         }
 
-                        let rows = escape(rows.to_vec());
                         let actual_results = match self.result_mode {
                             Some(ResultMode::ValueWise) => rows
                                 .iter()
