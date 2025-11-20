@@ -632,18 +632,16 @@ pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
 }
 
 fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
-    rows.iter_mut()
-        .for_each(|row| {
-            row.iter_mut()
-                .for_each(|cell| {
-                    *cell = cell.replace("\\", "\\\\");
-                    
-                    *cell = cell
-                        .replace("\n", "\\n")
-                        .replace("\r", "\\r")
-                        .replace("\t", "\\t")
-                });
+    rows.iter_mut().for_each(|row| {
+        row.iter_mut().for_each(|cell| {
+            *cell = cell.replace("\\", "\\\\");
+
+            *cell = cell
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
         });
+    });
     rows
 }
 
