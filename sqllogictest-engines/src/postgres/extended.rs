@@ -125,6 +125,26 @@ impl fmt::Display for JsonPreservedValue {
     }
 }
 
+#[derive(Debug)]
+struct Void {}
+
+impl<'a> FromSql<'a> for Void {
+    fn from_sql(
+        _ty: &Type,
+        _raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Void {})
+    }
+
+    accepts!(VOID);
+}
+
+impl fmt::Display for Void {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        unreachable!("Void type is not printable");
+    }
+}
+
 // It's required to use postgres_array::Array instead of Vec.
 // See: https://github.com/rust-postgres/rust-postgres/issues/1186
 macro_rules! array_process {
@@ -420,6 +440,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::JSONB_ARRAY => {
                         array_process!(row, row_vec, idx, serde_json::Value);
+                    }
+                    Type::VOID => {
+                        single_process!(row, row_vec, idx, Void);
                     }
                     _ => {
                         todo!("Don't support {} type now.", column.type_().name())
