@@ -162,7 +162,11 @@ impl<'a> FromSql<'a> for Char {
 impl fmt::Display for Char {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            0x00..=0x7f => {
+            0x00 => {
+                // Empty string, do nothing
+                Ok(())
+            }
+            0x01..=0x7f => {
                 write!(f, "{}", self.0 as char)
             }
             0x80..=0xff => {
@@ -479,8 +483,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::VOID => {
                         single_process!(row, row_vec, idx, Void);
                     }
-                    // SereneDB's OID type is u64. For now it returns it with u64's oid,
-                    // but may lead to some problems in the future
+                    // SereneDB doesn't return OID type (corresponding OID value). Instead, it returns
+                    // raw u64 type and there are no plans to change this behaviour. Keep this in mind in case
+                    // OID type related problems.
                     Type::OID => {
                         single_process!(row, row_vec, idx, u32);
                     }
