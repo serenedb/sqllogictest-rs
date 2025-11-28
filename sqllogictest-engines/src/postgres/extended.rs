@@ -145,6 +145,33 @@ impl fmt::Display for Void {
     }
 }
 
+#[derive(Debug)]
+struct Char(u8);
+
+impl<'a> FromSql<'a> for Char {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Char(raw[0]))
+    }
+
+    accepts!(CHAR);
+}
+
+impl fmt::Display for Char {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            0x00..=0x7f => {
+                write!(f, "{}", self.0 as char)
+            }
+            0x80..=0xff => {
+                write!(f, "{:o}", self.0)
+            }
+        }
+    }
+}
+
 // It's required to use postgres_array::Array instead of Vec.
 // See: https://github.com/rust-postgres/rust-postgres/issues/1186
 macro_rules! array_process {
@@ -337,6 +364,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
 
             for (idx, column) in row.columns().iter().enumerate() {
                 match column.type_().clone() {
+                    Type::CHAR => {
+                        single_process!(row, row_vec, idx, Char);
+                    }
+                    Type::CHAR_ARRAY => {
+                        array_process!(row, row_vec, idx, Char);
+                    }
                     Type::INT2 => {
                         single_process!(row, row_vec, idx, i16);
                     }
@@ -373,7 +406,6 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::TIME_ARRAY => {
                         array_process!(row, row_vec, idx, NaiveTime);
                     }
-
                     Type::TIMESTAMP => {
                         single_process!(row, row_vec, idx, NaiveDateTime);
                     }
@@ -398,14 +430,13 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::FLOAT8_ARRAY => {
                         array_process!(row, row_vec, idx, f64, float8_to_str);
                     }
-                    Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::CHAR => {
+                    Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME => {
                         single_process!(row, row_vec, idx, &str);
                     }
                     Type::VARCHAR_ARRAY
                     | Type::TEXT_ARRAY
                     | Type::BPCHAR_ARRAY
-                    | Type::NAME_ARRAY
-                    | Type::CHAR_ARRAY => {
+                    | Type::NAME_ARRAY => {
                         array_process!(row, row_vec, idx, &str);
                     }
                     Type::INTERVAL => {
