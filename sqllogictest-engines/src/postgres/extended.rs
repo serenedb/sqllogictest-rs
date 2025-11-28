@@ -398,10 +398,14 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::FLOAT8_ARRAY => {
                         array_process!(row, row_vec, idx, f64, float8_to_str);
                     }
-                    Type::VARCHAR | Type::TEXT | Type::BPCHAR => {
+                    Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::CHAR => {
                         single_process!(row, row_vec, idx, &str);
                     }
-                    Type::VARCHAR_ARRAY | Type::TEXT_ARRAY | Type::BPCHAR_ARRAY => {
+                    Type::VARCHAR_ARRAY
+                    | Type::TEXT_ARRAY
+                    | Type::BPCHAR_ARRAY
+                    | Type::NAME_ARRAY
+                    | Type::CHAR_ARRAY => {
                         array_process!(row, row_vec, idx, &str);
                     }
                     Type::INTERVAL => {
@@ -444,12 +448,25 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::VOID => {
                         single_process!(row, row_vec, idx, Void);
                     }
+                    // SereneDB's OID type is u64. For now it returns it with u64's oid,
+                    // but may lead to some problems in the future
+                    Type::OID => {
+                        single_process!(row, row_vec, idx, u32);
+                    }
+                    Type::OID_ARRAY => {
+                        array_process!(row, row_vec, idx, u32);
+                    }
                     _ => {
                         todo!("Don't support {} type now.", column.type_().name())
                     }
                 }
             }
             output.push(row_vec);
+        }
+
+        // TODO: add column names only with option and rewrite this check after that
+        if output.len() == 1 && output[0].is_empty() {
+            output = vec![];
         }
 
         if output.is_empty() {
