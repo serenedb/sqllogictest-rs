@@ -32,6 +32,12 @@ pub enum RecordOutput<T: ColumnType> {
     /// No output. Occurs when the record is skipped or not a `query`, `statement`, or `system`
     /// command.
     Nothing,
+    StartingLoop {
+        var_name: String,
+        begin: i64,
+        end: i64,
+    },
+    EndLoop,
     /// The output of a `query`.
     Query {
         types: Vec<T>,
@@ -39,7 +45,10 @@ pub enum RecordOutput<T: ColumnType> {
         error: Option<AnyError>,
     },
     /// The output of a `statement`.
-    Statement { count: u64, error: Option<AnyError> },
+    Statement {
+        count: u64,
+        error: Option<AnyError>,
+    },
     /// The output of a `system` command.
     #[non_exhaustive]
     System {
@@ -588,6 +597,7 @@ pub(crate) struct RunnerLocals {
     test_dir: OnceLock<TempDir>,
     /// Runtime variables for substitution.
     variables: BTreeMap<String, String>,
+    // TODO something like LoopContext
 }
 
 impl RunnerLocals {
@@ -600,6 +610,10 @@ impl RunnerLocals {
 
     fn set_var(&mut self, key: String, value: String) {
         self.variables.insert(key, value);
+    }
+
+    fn unset_var(&mut self, key: &str) {
+        self.variables.remove(key);
     }
 
     pub fn get_var(&self, key: &str) -> Option<&String> {
@@ -673,6 +687,11 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     /// Set a local variable for substitution.
     pub fn set_var(&mut self, key: String, value: String) {
         self.locals.set_var(key, value);
+    }
+
+    /// Unset a local variable for substitution.
+    pub fn unset_var(&mut self, key: &str) {
+        self.locals.unset_var(key);
     }
 
     pub fn with_normalizer(&mut self, normalizer: Normalizer) {
@@ -1010,6 +1029,32 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             | Record::Injected(_)
             | Record::Condition(_)
             | Record::Connection(_) => RecordOutput::Nothing,
+            Record::Loop {
+                var_name,
+                begin,
+                end,
+            } => {
+                tracing::info!(
+                    "Loop {} var_name: {}, begin: {}, end: {}, {}",
+                    '{',
+                    var_name,
+                    begin,
+                    end,
+                    '}'
+                );
+
+                self.set_var(var_name.clone(), begin.to_string());
+
+                RecordOutput::StartingLoop {
+                    var_name,
+                    begin,
+                    end,
+                }
+            }
+            Record::EndLoop() => {
+                tracing::info!("Endloop()");
+                RecordOutput::EndLoop
+            }
         }
     }
 
@@ -1054,6 +1099,12 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         match (record, &result) {
             (_, RecordOutput::Nothing) => {}
             // Tolerate the mismatched return type...
+            (Record::Loop { .. }, RecordOutput::StartingLoop { .. }) => {
+                // Do nothing, OK
+            }
+            (Record::EndLoop(), RecordOutput::EndLoop) => {
+                // Do nothing, OK
+            }
             (
                 Record::Statement {
                     sql, expected, loc, ..
@@ -1094,12 +1145,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     .at(loc))
                 }
                 QueryExpect::Results { results, .. } if !results.is_empty() => {
+                    // TODO substitute
+                    let s = self
+                        .may_substitute(sql, true)
+                        .expect("cannot substitute: TODO expect later");
                     return Err(TestErrorKind::QueryResultMismatch {
-                        sql,
+                        sql: s,
                         expected: results.join("\n"),
                         actual: "".to_string(),
                     }
-                    .at(loc))
+                    .at(loc));
                 }
                 QueryExpect::Results { .. } => {}
             },
@@ -1220,8 +1275,13 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
                             let output_rows =
                                 rows.iter().map(|strs| strs.iter().join(" ")).collect_vec();
+                            // TODO substitute sql
+                            let s = self
+                                .may_substitute(sql, true)
+                                .expect("cannot substitute: TODO expect later");
+
                             return Err(TestErrorKind::QueryResultMismatch {
-                                sql,
+                                sql: s,
                                 expected: expected_results.join("\n"),
                                 actual: output_rows.join("\n"),
                             }
