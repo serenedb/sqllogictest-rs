@@ -1009,7 +1009,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 self.hash_threshold = threshold as usize;
                 RecordOutput::Nothing
             }
-            Record::ShowColumnName { loc: _, value } => {
+            Record::ShowColumnNames { loc: _, value } => {
                 self.show_column_names = value;
                 RecordOutput::Nothing
             }

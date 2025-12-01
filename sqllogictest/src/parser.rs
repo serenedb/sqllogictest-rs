@@ -189,7 +189,7 @@ pub enum Record<T: ColumnType> {
         threshold: u64,
     },
     /// Show column names or not. True by default
-    ShowColumnName {
+    ShowColumnNames {
         loc: Location,
         value: bool,
     },
@@ -358,7 +358,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             Record::HashThreshold { loc: _, threshold } => {
                 write!(f, "hash-threshold {threshold}")
             }
-            Record::ShowColumnName { loc: _, value } => {
+            Record::ShowColumnNames { loc: _, value } => {
                 write!(f, "show-column-names {value}")
             }
             Record::Comment(comment) => {
@@ -970,7 +970,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     })?,
                 });
             }
-            ["show-column-names", value] => records.push(Record::ShowColumnName {
+            ["show-column-names", value] => records.push(Record::ShowColumnNames {
                 loc: loc.clone(),
                 value: value
                     .parse::<bool>()
@@ -1317,7 +1317,7 @@ select * from foo;
                     Record::Subtest { loc, .. } => normalize_loc(loc),
                     Record::Halt { loc, .. } => normalize_loc(loc),
                     Record::HashThreshold { loc, .. } => normalize_loc(loc),
-                    Record::ShowColumnName { loc, .. } => normalize_loc(loc),
+                    Record::ShowColumnNames { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match
