@@ -1182,7 +1182,7 @@ mod tests {
     fn test_include_glob() {
         let records =
             parse_file::<DefaultColumnType>("../tests/slt/include/include_1.slt").unwrap();
-        assert_eq!(15, records.len());
+        assert_eq!(17, records.len());
     }
 
     #[test]
