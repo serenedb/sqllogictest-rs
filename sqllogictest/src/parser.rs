@@ -193,7 +193,8 @@ pub enum Record<T: ColumnType> {
         loc: Location,
         value: bool,
     },
-    /// All values in single column.
+    /// Flatten all result values into a single column, instead of preserving the row structure.
+    /// When enabled, the output will be a single column containing all values, regardless of their original row grouping.
     FlatValues {
         loc: Location,
         value: bool,
