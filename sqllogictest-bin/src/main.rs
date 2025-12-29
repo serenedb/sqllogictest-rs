@@ -21,7 +21,7 @@ use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_normalizer, default_validator, update_record_with_output,
-    AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner,
+    AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner, TestError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -77,6 +77,9 @@ struct Opt {
     /// When using `-j`, whether to keep the temporary database when a test case fails.
     #[clap(long, default_value = "false", env = "SLT_KEEP_DB_ON_FAILURE")]
     keep_db_on_failure: bool,
+    /// Show all errors
+    #[clap(long, default_value = "false", env = "SLT_SHOW_ALL_ERRORS")]
+    show_all_errors: bool,
 
     /// Whether to exit immediately when a test case fails.
     #[clap(long, default_value = "false", env = "SLT_FAIL_FAST")]
@@ -235,6 +238,7 @@ pub async fn main() -> Result<()> {
         color,
         jobs,
         keep_db_on_failure,
+        show_all_errors,
         fail_fast,
         junit,
         host,
@@ -362,6 +366,7 @@ pub async fn main() -> Result<()> {
         labels,
         junit: junit.clone(),
         fail_fast,
+        show_all_errors,
         cancel,
         shutdown_timeout: shutdown_timeout_secs.map(Duration::from_secs),
     };
@@ -394,6 +399,7 @@ struct RunConfig {
     labels: Vec<String>,
     junit: Option<String>,
     fail_fast: bool,
+    show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
 }
@@ -446,6 +452,7 @@ async fn run_parallel(
         labels,
         junit,
         fail_fast,
+        show_all_errors,
         cancel,
         shutdown_timeout,
     }: RunConfig,
@@ -482,6 +489,7 @@ async fn run_parallel(
                         &engine,
                         config,
                         &labels,
+                        show_all_errors,
                         cancel,
                         shutdown_timeout,
                     )
@@ -579,6 +587,7 @@ async fn run_serial(
         labels,
         junit,
         fail_fast,
+        show_all_errors,
         cancel,
         shutdown_timeout,
     }: RunConfig,
@@ -588,13 +597,13 @@ async fn run_serial(
 
     for file in files {
         let test_case_name = file.to_string_lossy().to_test_case_name();
-
         let res = connect_and_run_test_file(
             stdout(),
             file,
             engine,
             config.clone(),
             &labels,
+            show_all_errors,
             cancel.clone(),
             shutdown_timeout,
         )
@@ -812,12 +821,14 @@ impl Output for Vec<u8> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run_test_file(
     out: impl Output,
     filename: PathBuf,
     engine: &EngineConfig,
     config: DBConfig,
     labels: &[String],
+    show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
 ) -> RunResult {
@@ -871,7 +882,7 @@ async fn connect_and_run_test_file(
             .unwrap();
             RunResult::Cancelled
         }
-        result = run_test_file(&mut out.0, &mut runner, filename.clone()) => {
+        result = run_test_file(&mut out.0, &mut runner, filename.clone(), show_all_errors) => {
             if let Err(err) = &result {
                 writeln!(
                     out.0,
@@ -911,6 +922,7 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
+    show_all_errors: bool,
 ) -> Result<Duration> {
     let filename = filename.as_ref();
 
@@ -925,6 +937,8 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
 
     begin_times.push(Instant::now());
 
+    let mut errors = vec![];
+    let mut locations = vec![];
     for record in records {
         if let Record::Halt { .. } = record {
             break;
@@ -952,10 +966,27 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
             _ => {}
         }
 
-        runner
-            .run_async(record)
-            .await
-            .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+        let res = runner.run_async(record).await;
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                if show_all_errors {
+                    errors.push(e.kind());
+                    locations.push(e.location());
+                } else {
+                    return Err(e)
+                        .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+                        .context(format!(
+                            "failed to run `{}`",
+                            style(filename.to_string_lossy()).bold()
+                        ));
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        let e = Err(TestError::new_composite(errors, locations));
+        e.map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
             .context(format!(
                 "failed to run `{}`",
                 style(filename.to_string_lossy()).bold()
