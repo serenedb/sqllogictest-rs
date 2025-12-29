@@ -65,6 +65,11 @@ impl Location {
             upper: Some(Arc::new(self.clone())),
         }
     }
+
+    /// Reuse upper field for chain of locations
+    pub fn add_next_location(&mut self, next: Arc<Self>) {
+        self.upper = Some(next);
+    }
 }
 
 /// Configuration for retry behavior
