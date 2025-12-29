@@ -821,6 +821,7 @@ impl Output for Vec<u8> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run_test_file(
     out: impl Output,
     filename: PathBuf,
