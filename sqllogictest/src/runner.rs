@@ -419,7 +419,7 @@ impl Display for TestErrorKindDisplay<'_> {
                 )
             }
             TestErrorKind::CompositeMismatch { kinds } => {
-                write!(f, "Multiple record mismatches ({} errors)\n", kinds.len())?;
+                writeln!(f, "Multiple record mismatches ({} errors)", kinds.len())?;
                 // ("Multiple record mismatches ({} errors)", kinds.len());
                 let mut first = true;
                 for x in kinds {
@@ -429,7 +429,7 @@ impl Display for TestErrorKindDisplay<'_> {
                     first = false;
                     write!(f, "{}", x.display(self.colorize))?;
                 }
-                write!(f, "\n")
+                writeln!(f)
             }
             _ => write!(f, "{}", self.error),
         }
