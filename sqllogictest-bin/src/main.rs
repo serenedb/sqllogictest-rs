@@ -23,9 +23,9 @@ use sqllogictest::{
     default_column_validator, default_normalizer, default_validator, update_record_with_output,
     AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner, TestError,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 #[must_use]
@@ -441,6 +441,22 @@ fn test_db_names(files: Vec<PathBuf>) -> Result<Vec<(String, PathBuf)>> {
     Ok(test_databases)
 }
 
+struct TestJob {
+    db_name: String,
+    filename: PathBuf,
+}
+
+struct TestResultMessage {
+    db_name: String,
+    file: String,
+    result: RunResult,
+}
+
+enum DropMessage {
+    Drop(String),
+    ConnectionRefused,
+}
+
 async fn run_parallel(
     jobs: usize,
     keep_db_on_failure: bool,
@@ -458,69 +474,82 @@ async fn run_parallel(
     }: RunConfig,
 ) -> Result<()> {
     let test_databases = test_db_names(files)?;
-    let mut db = engines::connect(engine, &config).await?;
-
+    let total_tests = test_databases.len();
     let db_names: Vec<String> = test_databases
         .iter()
-        .map(|(db_name, _)| db_name)
-        .cloned()
+        .map(|(db_name, _)| db_name.clone())
         .collect();
-    for db_name in &db_names {
-        let query = format!("CREATE DATABASE {db_name};");
-        eprintln!("+ {query}");
-        if let Err(err) = db.run(&query).await {
-            eprintln!("  ignore error: {err}");
-        }
-    }
 
-    let mut stream = futures::stream::iter(test_databases)
-        .map(|(db_name, filename)| {
-            let mut config = config.clone();
-            config.db.clone_from(&db_name);
-            let file = filename.to_string_lossy().to_string();
-            let engine = engine.clone();
-            let labels = labels.clone();
-            let cancel = cancel.clone();
-            async move {
-                let res = AbortOnDropHandle::new(tokio::spawn(async move {
-                    connect_and_run_test_file(
-                        Vec::new(),
-                        filename,
-                        &engine,
-                        config,
-                        &labels,
-                        show_all_errors,
-                        cancel,
-                        shutdown_timeout,
-                    )
-                    .await
-                }))
-                .await
-                .unwrap();
-                (db_name, file, res)
-            }
-        })
-        .buffer_unordered(jobs);
+    let (job_tx, job_rx) = mpsc::channel::<TestJob>(jobs);
+    let (result_tx, mut result_rx) = mpsc::channel::<TestResultMessage>(jobs);
+    let (drop_tx, drop_rx) = mpsc::channel::<DropMessage>(jobs);
+
+    let labels = Arc::new(labels);
+
+    let worker_handle = {
+        let engine = engine.clone();
+        let config = config.clone();
+        let labels = Arc::clone(&labels);
+        let result_tx = result_tx.clone();
+        tokio::spawn(execution_task(
+            jobs,
+            job_rx,
+            result_tx,
+            engine,
+            config,
+            labels,
+            show_all_errors,
+            cancel.clone(),
+            shutdown_timeout,
+        ))
+    };
+
+    let dropper_handle = {
+        let engine = engine.clone();
+        let config = config.clone();
+        tokio::spawn(drop_task(drop_rx, engine, config))
+    };
+
+    let creator_handle = {
+        let engine = engine.clone();
+        let config = config.clone();
+        tokio::spawn(create_task(test_databases, engine, config, job_tx))
+    };
+
+    drop(result_tx);
 
     eprintln!("{}", style("[TEST IN PROGRESS]").blue().bold());
 
     let mut failed_cases = vec![];
     let mut failed_dbs: HashSet<String> = HashSet::new();
-
     let mut connection_refused = false;
+    let mut connection_refused_notified = false;
+    let mut processed = 0usize;
+
     let start = Instant::now();
 
-    while let Some((db_name, file, res)) = stream.next().await {
+    while processed < total_tests {
+        let Some(message) = result_rx.recv().await else {
+            break;
+        };
+        processed += 1;
+
+        let TestResultMessage {
+            db_name,
+            file,
+            result,
+        } = message;
         let test_case_name = file.to_test_case_name();
-        let case = res.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
+        let case = result.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
         test_suite.add_test_case(case);
 
-        match res {
+        match result {
             RunResult::Ok(_) => {}
             RunResult::Err(e) => {
-                if format!("{:?}", e).contains("Connection refused") {
+                if format!("{:?}", e).contains("Connection refused") && !connection_refused {
                     connection_refused = true;
                     eprintln!("Connection refused. The server may be down.");
+                    eprintln!("Skip dropping databases due to connection refused: {db_names:?}");
                 }
                 if fail_fast || connection_refused {
                     eprintln!("Cancelling remaining tests...");
@@ -532,14 +561,13 @@ async fn run_parallel(
             }
             RunResult::Skipped | RunResult::Cancelled => {}
         };
-    }
 
-    eprintln!("\n Finished in {} ms", start.elapsed().as_millis());
+        if connection_refused && !connection_refused_notified {
+            let _ = drop_tx.send(DropMessage::ConnectionRefused).await;
+            connection_refused_notified = true;
+        }
 
-    if connection_refused {
-        eprintln!("Skip dropping databases due to connection refused: {db_names:?}");
-    } else {
-        for db_name in db_names {
+        if !connection_refused {
             if keep_db_on_failure && failed_dbs.contains(&db_name) {
                 eprintln!(
                     "+ {}",
@@ -549,23 +577,23 @@ async fn run_parallel(
                     .red()
                     .bold()
                 );
-                continue;
-            }
-            let query = format!("DROP DATABASE {db_name};");
-            eprintln!("+ {query}");
-            if let Err(err) = db.run(&query).await {
-                let err = err.to_string();
-                if err.contains("Connection refused") {
-                    eprintln!("  Connection refused. The server may be down. Exiting...");
-                    break;
-                }
-                eprintln!("  ignore DROP DATABASE error: {err}");
+            } else {
+                let _ = drop_tx.send(DropMessage::Drop(db_name.clone())).await;
             }
         }
     }
 
-    // Shutdown the connection for managing temporary databases.
-    db.shutdown().await;
+    eprintln!("\n Finished in {} ms", start.elapsed().as_millis());
+
+    drop(drop_tx);
+
+    creator_handle.await??;
+    worker_handle.await??;
+    dropper_handle.await??;
+
+    if processed < total_tests {
+        return Err(anyhow!("worker pool terminated early"));
+    }
 
     if !failed_cases.is_empty() {
         Err(anyhow!("some test cases failed:\n{:#?}", failed_cases))
@@ -574,6 +602,119 @@ async fn run_parallel(
     } else {
         Ok(())
     }
+}
+
+async fn create_task(
+    tests: Vec<(String, PathBuf)>,
+    engine: EngineConfig,
+    config: DBConfig,
+    job_tx: mpsc::Sender<TestJob>,
+) -> Result<()> {
+    let mut db = engines::connect(&engine, &config).await?;
+
+    for (db_name, filename) in tests {
+        let query = format!("CREATE DATABASE {db_name};");
+        if let Err(err) = db.run(&query).await {
+            eprintln!("({})  ignore error: {err}", query);
+        }
+
+        if job_tx.send(TestJob { db_name, filename }).await.is_err() {
+            break;
+        }
+    }
+
+    db.shutdown().await;
+
+    Ok(())
+}
+
+async fn execution_task(
+    concurrency: usize,
+    mut job_rx: mpsc::Receiver<TestJob>,
+    result_tx: mpsc::Sender<TestResultMessage>,
+    engine: EngineConfig,
+    config: DBConfig,
+    labels: Arc<Vec<String>>,
+    show_all_errors: bool,
+    cancel: CancellationToken,
+    shutdown_timeout: Option<Duration>,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+
+    while let Some(job) = job_rx.recv().await {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let result_tx = result_tx.clone();
+        let engine = engine.clone();
+        let config = config.clone();
+        let labels = Arc::clone(&labels);
+        let cancel = cancel.clone();
+
+        join_set.spawn(async move {
+            let TestJob { db_name, filename } = job;
+            let mut job_config = config;
+            job_config.db = db_name.clone();
+
+            let result = connect_and_run_test_file(
+                Vec::new(),
+                filename.clone(),
+                &engine,
+                job_config,
+                labels.as_ref(),
+                show_all_errors,
+                cancel,
+                shutdown_timeout,
+            )
+            .await;
+
+            let file = filename.to_string_lossy().to_string();
+            let message = TestResultMessage {
+                db_name,
+                file,
+                result,
+            };
+
+            let _ = result_tx.send(message).await;
+            drop(permit);
+        });
+    }
+
+    drop(result_tx);
+
+    while let Some(join_result) = join_set.join_next().await {
+        join_result?;
+    }
+
+    Ok(())
+}
+
+async fn drop_task(
+    mut drop_rx: mpsc::Receiver<DropMessage>,
+    engine: EngineConfig,
+    config: DBConfig,
+) -> Result<()> {
+    let mut db = engines::connect(&engine, &config).await?;
+
+    while let Some(message) = drop_rx.recv().await {
+        match message {
+            DropMessage::ConnectionRefused => {}
+            DropMessage::Drop(db_name) => {
+                let query = format!("DROP DATABASE {db_name};");
+                if let Err(err) = db.run(&query).await {
+                    let err = err.to_string();
+                    if err.contains("Connection refused") {
+                        eprintln!("  Connection refused. The server may be down. Exiting...");
+                        break;
+                    }
+                    eprintln!("({}) ignore DROP DATABASE error: {err}", query);
+                }
+            }
+        }
+    }
+
+    db.shutdown().await;
+
+    Ok(())
 }
 
 // Run test one be one
