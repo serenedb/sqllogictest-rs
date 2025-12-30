@@ -628,6 +628,7 @@ async fn create_task(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execution_task(
     concurrency: usize,
     mut job_rx: mpsc::Receiver<TestJob>,
