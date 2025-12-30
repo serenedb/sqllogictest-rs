@@ -697,7 +697,10 @@ async fn drop_task(
 
     while let Some(message) = drop_rx.recv().await {
         match message {
-            DropMessage::ConnectionRefused => {}
+            DropMessage::ConnectionRefused => {
+                eprintln!("  Connection refused. The server may be down. Exiting...");
+                break;
+            }
             DropMessage::Drop(db_name) => {
                 let query = format!("DROP DATABASE {db_name};");
                 if let Err(err) = db.run(&query).await {
