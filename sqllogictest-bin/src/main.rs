@@ -36,6 +36,19 @@ pub enum Color {
     Never,
 }
 
+/// Mode for updating test files.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum UpdateMode {
+    /// Run tests normally without updating files.
+    Run,
+    /// Update files with actual output, preserving original formatting when content matches.
+    Override,
+    /// Update files with actual output, normalizing formatting even when content matches.
+    Force,
+    /// Reformat files without running queries.
+    Format,
+}
+
 // Env keys for partitioning.
 const PARTITION_ID_ENV_KEY: &str = "SLT_PARTITION_ID";
 const PARTITION_COUNT_ENV_KEY: &str = "SLT_PARTITION_COUNT";
@@ -111,10 +124,15 @@ struct Opt {
     options: Option<String>,
 
     /// Overrides the test files with the actual output of the database.
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = ["force_override", "format"])]
     r#override: bool,
+    /// Overrides the test files with the actual output of the database,
+    /// and normalizes formatting (e.g., converts spaces to tabs and despite <slt:ignore>) even when
+    /// the logical content matches.
+    #[clap(long, conflicts_with_all = ["override", "format"])]
+    force_override: bool,
     /// Reformats the test files.
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = ["override", "force_override"])]
     format: bool,
 
     /// Add a label for conditions.
@@ -248,6 +266,7 @@ pub async fn main() -> Result<()> {
         pass,
         options,
         r#override,
+        force_override,
         format,
         labels,
         partition_count,
@@ -329,12 +348,22 @@ pub async fn main() -> Result<()> {
         options,
     };
 
-    if r#override || format {
+    let update_mode = if format {
+        UpdateMode::Format
+    } else if force_override {
+        UpdateMode::Force
+    } else if r#override {
+        UpdateMode::Override
+    } else {
+        UpdateMode::Run
+    };
+
+    if update_mode != UpdateMode::Run {
         return update_test_files(
             all_files,
             &engine,
             config,
-            format,
+            update_mode,
             jobs,
             keep_db_on_failure,
             labels,
@@ -785,12 +814,11 @@ async fn run_serial(
     }
 }
 
-/// * `format` - If true, will not run sqls, only formats the file.
 async fn update_test_files(
     files: Vec<PathBuf>,
     engine: &EngineConfig,
     config: DBConfig,
-    format: bool,
+    update_mode: UpdateMode,
     jobs: Option<usize>,
     keep_db_on_failure: bool,
     labels: Vec<String>,
@@ -837,7 +865,8 @@ async fn update_test_files(
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
-                if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, format).await {
+                if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, update_mode).await
+                {
                     writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
                         .expect("cannot write to buffer");
                     if keep_db_on_failure {
@@ -1192,7 +1221,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
-    format: bool,
+    update_mode: UpdateMode,
 ) -> Result<()> {
     let filename = filename.as_ref();
     let records = tokio::task::block_in_place(|| {
@@ -1324,7 +1353,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
                     writeln!(outfile, "{record}")?;
                     continue;
                 }
-                update_record(outfile, runner, record, format)
+                update_record(outfile, runner, record, update_mode)
                     .await
                     .context(format!("failed to run `{}`", style(filename).bold()))?;
             }
@@ -1355,14 +1384,16 @@ async fn update_record<M: MakeConnection>(
     outfile: &mut File,
     runner: &mut Runner<M::Conn, M>,
     record: Record<<M::Conn as AsyncDB>::ColumnType>,
-    format: bool,
+    update_mode: UpdateMode,
 ) -> Result<()> {
     assert!(!matches!(record, Record::Injected(_)));
 
-    if format {
+    if update_mode == UpdateMode::Format {
         writeln!(outfile, "{record}")?;
         return Ok(());
     }
+
+    let normalize_formatting = update_mode == UpdateMode::Force;
 
     let record_output = runner.apply_record(record.clone()).await;
     match update_record_with_output(
@@ -1372,6 +1403,7 @@ async fn update_record<M: MakeConnection>(
         default_validator,
         default_normalizer,
         default_column_validator,
+        normalize_formatting,
     ) {
         Some(new_record) => {
             writeln!(outfile, "{new_record}")?;

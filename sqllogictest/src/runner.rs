@@ -1668,6 +1668,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         validator,
                         normalizer,
                         column_type_validator,
+                        false,
                     )
                     .unwrap_or(record);
                     writeln!(outfile, "{record}")?;
@@ -1711,6 +1712,7 @@ pub fn update_record_with_output<T: ColumnType>(
     validator: Validator,
     normalizer: Normalizer,
     column_type_validator: ColumnTypeValidator<T>,
+    force_override: bool,
 ) -> Option<Record<T>> {
     match (record.clone(), record_output) {
         (_, RecordOutput::Nothing) => None,
@@ -1854,11 +1856,16 @@ pub fn update_record_with_output<T: ColumnType>(
             }
             (None, expected) => {
                 let results = match &expected {
-                    // If validation is successful, we respect the original file's expected results.
+                    // If validation succeeds and formatting normalization is not forced, preserve original.
                     QueryExpect::Results {
                         results: expected_results,
                         ..
-                    } if validator(normalizer, rows, expected_results) => expected_results.clone(),
+                    } 
+
+                    if validator(normalizer, rows, expected_results) && !force_override => {
+                        expected_results.clone()
+                    }
+                    // Otherwise, regenerate with proper formatting.
                     _ => rows.iter().map(|cols| cols.join(col_separator)).collect(),
                 };
                 let types = match &expected {
@@ -2354,6 +2361,7 @@ Caused by:
                 default_validator,
                 default_normalizer,
                 strict_column_validator,
+                false,
             );
 
             assert_eq!(
