@@ -24,9 +24,13 @@ pub struct Location {
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.file, self.line)?;
-        if let Some(upper) = &self.upper {
-            write!(f, "\nat {upper}")?;
+
+        let mut upper = self.upper.as_ref();
+        while let Some(location) = upper {
+            write!(f, "\nat {}:{}", location.file, location.line)?;
+            upper = location.upper.as_ref();
         }
+
         Ok(())
     }
 }
