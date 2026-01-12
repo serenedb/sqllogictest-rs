@@ -361,8 +361,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 Control::Substitution(s) => write!(f, "control substitution {}", s.as_str()),
             },
             Record::Condition(cond) => match cond {
-                Condition::OnlyIf { label } => write!(f, "onlyif {label}"),
-                Condition::SkipIf { label } => write!(f, "skipif {label}"),
+                Condition::OnlyIf { label, comments } => {
+                    write!(f, "onlyif {label} {}", comments.join(" "))
+                }
+                Condition::SkipIf { label, comments } => {
+                    write!(f, "skipif {label} {}", comments.join(" "))
+                }
             },
             Record::Connection(conn) => {
                 if let Connection::Named(conn) = conn {
@@ -558,17 +562,23 @@ pub enum Injected {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Condition {
     /// The statement or query is evaluated only if the label is seen.
-    OnlyIf { label: String },
+    OnlyIf {
+        label: String,
+        comments: Vec<String>,
+    },
     /// The statement or query is not evaluated if the label is seen.
-    SkipIf { label: String },
+    SkipIf {
+        label: String,
+        comments: Vec<String>,
+    },
 }
 
 impl Condition {
     /// Evaluate condition on given `label`, returns whether to skip this record.
     pub(crate) fn should_skip<'a>(&'a self, labels: impl IntoIterator<Item = &'a str>) -> bool {
         match self {
-            Condition::OnlyIf { label } => !labels.into_iter().contains(&label.as_str()),
-            Condition::SkipIf { label } => labels.into_iter().contains(&label.as_str()),
+            Condition::OnlyIf { label, .. } => !labels.into_iter().contains(&label.as_str()),
+            Condition::SkipIf { label, .. } => labels.into_iter().contains(&label.as_str()),
         }
     }
 }
@@ -788,16 +798,18 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     loc,
                 });
             }
-            ["skipif", label, _rest @ ..] => {
+            ["skipif", label, rest @ ..] => {
                 let cond = Condition::SkipIf {
                     label: label.to_string(),
+                    comments: rest.iter().map(|s| s.to_string()).collect(),
                 };
                 conditions.push(cond.clone());
                 records.push(Record::Condition(cond));
             }
-            ["onlyif", label, _rest @ ..] => {
+            ["onlyif", label, rest @ ..] => {
                 let cond = Condition::OnlyIf {
                     label: label.to_string(),
+                    comments: rest.iter().map(|s| s.to_string()).collect(),
                 };
                 conditions.push(cond.clone());
                 records.push(Record::Condition(cond));
