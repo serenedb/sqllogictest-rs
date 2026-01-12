@@ -362,10 +362,18 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             },
             Record::Condition(cond) => match cond {
                 Condition::OnlyIf { label, comments } => {
-                    write!(f, "onlyif {label} {}", comments.join(" "))
+                    write!(f, "onlyif {label}")?;
+                    if !comments.is_empty() {
+                        write!(f, " {}", comments.join(" "))?;
+                    }
+                    Ok(())
                 }
                 Condition::SkipIf { label, comments } => {
-                    write!(f, "skipif {label} {}", comments.join(" "))
+                    write!(f, "skipif {label}")?;
+                    if !comments.is_empty() {
+                        write!(f, " {}", comments.join(" "))?;
+                    }
+                    Ok(())
                 }
             },
             Record::Connection(conn) => {

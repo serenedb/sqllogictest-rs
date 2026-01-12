@@ -545,10 +545,13 @@ pub fn default_validator(
         let actual_snapshot = actual_rows.join("\n");
         let fragments: Vec<&str> = expected_snapshot.split(IGNORE_MARKER).collect();
         let mut pos = 0;
-        let mut allow_trailling_data = false;
-        for frag in fragments {
+        let mut allow_trailing_data = false;
+        for (i, frag) in fragments.iter().enumerate() {
             if frag.is_empty() {
-                allow_trailling_data = true;
+                // If it's the last fragment, trailing data is allowed
+                if i == fragments.len() - 1 {
+                    allow_trailing_data = true;
+                }
                 continue;
             }
             if let Some(idx) = actual_snapshot[pos..].find(frag) {
@@ -563,7 +566,7 @@ pub fn default_validator(
                 return false;
             }
         }
-        if pos < actual_snapshot.len() && !allow_trailling_data {
+        if pos < actual_snapshot.len() && !allow_trailing_data {
             tracing::error!(
                 "extra data found after last expected fragment:\nremaining: {}",
                 &actual_snapshot[pos..]
@@ -1776,14 +1779,28 @@ pub fn update_record_with_output<T: ColumnType>(
                 retry,
             },
             RecordOutput::Statement { error: None, count },
-        ) => Some(Record::Statement {
-            sql,
-            loc,
-            conditions,
-            connection,
-            expected: StatementExpect::Count(*count),
-            retry,
-        }),
+        ) => {
+            if *count > 0 {
+                tracing::warn!(
+                    "DB returned StatementComplete({}) for a Query record; preserving Query with empty results",
+                    count
+                );
+            }
+            Some(Record::Query {
+                sql,
+                loc,
+                conditions,
+                connection,
+                expected: QueryExpect::Results {
+                    results: Vec::new(),
+                    types: Vec::new(),
+                    sort_mode: None,
+                    result_mode: None,
+                    label: None,
+                },
+                retry,
+            })
+        }
         // statement, statement
         (
             Record::Statement {
