@@ -2243,18 +2243,25 @@ Caused by:
     }
 
     #[test]
-    fn test_query_statement_output() {
+    fn test_query_no_results_output() {
         TestCase {
             // input has no query results
             input: "query III\n\
                     select * from foo;\n\
                     ----",
 
-            // Model a run that produced a statement output
-            record_output: statement_output(3),
+            // Model a run that produced a query with no results, but scheme is still correct
+            record_output: query_output(
+                &[],
+                vec![
+                    DefaultColumnType::Integer,
+                    DefaultColumnType::Integer,
+                    DefaultColumnType::Integer,
+                ],
+            ),
 
             expected: Some(
-                "statement count 3\n\
+                "query III\n\
                  select * from foo;",
             ),
         }
