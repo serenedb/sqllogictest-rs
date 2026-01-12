@@ -507,6 +507,12 @@ pub fn default_normalizer(s: &String) -> String {
     s.trim().split_ascii_whitespace().join("\t")
 }
 
+/// Just trim. We expected strict format with tab-separated columns.
+#[allow(clippy::ptr_arg)]
+pub fn trim_normalizer(s: &String) -> String {
+    s.trim().to_string()
+}
+
 /// Validator will be used by [`Runner`] to validate the output.
 ///
 /// # Default
@@ -687,7 +693,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     pub fn new(make_conn: M) -> Self {
         Runner {
             validator: default_validator,
-            normalizer: default_normalizer,
+            normalizer: trim_normalizer,
             column_type_validator: default_column_validator,
             partitioner: Arc::new(default_partitioner),
             substitution_on: false,
@@ -1860,9 +1866,7 @@ pub fn update_record_with_output<T: ColumnType>(
                     QueryExpect::Results {
                         results: expected_results,
                         ..
-                    } 
-
-                    if validator(normalizer, rows, expected_results) && !force_override => {
+                    } if validator(normalizer, rows, expected_results) && !force_override => {
                         expected_results.clone()
                     }
                     // Otherwise, regenerate with proper formatting.

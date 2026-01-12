@@ -20,7 +20,7 @@ use rand::distributions::DistString;
 use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
-    default_column_validator, default_normalizer, default_validator, update_record_with_output,
+    default_column_validator, default_validator, trim_normalizer, update_record_with_output,
     AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner, TestError,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -1401,7 +1401,7 @@ async fn update_record<M: MakeConnection>(
         &record_output,
         "\t",
         default_validator,
-        default_normalizer,
+        trim_normalizer,
         default_column_validator,
         normalize_formatting,
     ) {
