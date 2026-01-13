@@ -506,10 +506,6 @@ async fn run_parallel(
 ) -> Result<()> {
     let test_databases = test_db_names(files)?;
     let total_tests = test_databases.len();
-    let db_names: Vec<String> = test_databases
-        .iter()
-        .map(|(db_name, _)| db_name.clone())
-        .collect();
 
     let (job_tx, job_rx) = mpsc::channel::<TestJob>(jobs);
     let (result_tx, mut result_rx) = mpsc::channel::<TestResultMessage>(jobs);
@@ -580,7 +576,6 @@ async fn run_parallel(
                 if format!("{:?}", e).contains("Connection refused") && !connection_refused {
                     connection_refused = true;
                     eprintln!("Connection refused. The server may be down.");
-                    eprintln!("Skip dropping databases due to connection refused: {db_names:?}");
                 }
                 if fail_fast || connection_refused {
                     eprintln!("Cancelling remaining tests...");
@@ -725,6 +720,9 @@ async fn drop_task(
     engine: EngineConfig,
     config: DBConfig,
 ) -> Result<()> {
+    const MAX_RETRIES: usize = 1;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+
     let mut db = engines::connect(&engine, &config).await?;
 
     while let Some(message) = drop_rx.recv().await {
@@ -734,22 +732,75 @@ async fn drop_task(
                 break;
             }
             DropMessage::Drop(db_name) => {
-                let query = format!("DROP DATABASE {db_name};");
-                if let Err(err) = db.run(&query).await {
-                    let err = err.to_string();
-                    if err.contains("Connection refused") {
-                        eprintln!("  Connection refused. The server may be down. Exiting...");
+                match drop_database_with_retry(
+                    &mut db,
+                    &db_name,
+                    &engine,
+                    &config,
+                    MAX_RETRIES,
+                    RETRY_DELAY,
+                )
+                .await
+                {
+                    Ok(Some(new_db)) => db = new_db,
+                    Ok(None) => {} // Success, no reconnection needed
+                    Err(e) => {
+                        eprintln!("  {e}");
                         break;
                     }
-                    eprintln!("({}) ignore DROP DATABASE error: {err}", query);
                 }
             }
         }
     }
 
     db.shutdown().await;
-
     Ok(())
+}
+
+/// Attempts to drop a database with retry logic for connection failures.
+/// Returns Ok(Some(new_db)) if reconnection occurred, Ok(None) if successful without reconnection,
+/// or Err if max retries exceeded.
+async fn drop_database_with_retry(
+    db: &mut engines::Engines,
+    db_name: &str,
+    engine: &EngineConfig,
+    config: &DBConfig,
+    max_retries: usize,
+    retry_delay: Duration,
+) -> Result<Option<engines::Engines>> {
+    let query = format!("DROP DATABASE {db_name};");
+
+    for attempt in 0..=max_retries {
+        match db.run(&query).await {
+            Ok(_) => return Ok(None),
+            Err(err) => {
+                let err_str = err.to_string();
+
+                if !err_str.contains("refused") && !err_str.contains("closed") {
+                    eprintln!("({query}) ignore DROP DATABASE error: {err_str}");
+                    return Ok(None);
+                }
+
+                if attempt < max_retries {
+                    eprintln!("  {err_str}. Retrying ({}/{})", attempt + 1, max_retries);
+                    tokio::time::sleep(retry_delay).await;
+
+                    match engines::connect(engine, config).await {
+                        Ok(new_db) => return Ok(Some(new_db)),
+                        Err(reconnect_err) => {
+                            eprintln!("  Failed to reconnect: {reconnect_err}");
+                        }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "Max retries reached. The server may be down. Last error: {err_str}"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 // Run test one be one
