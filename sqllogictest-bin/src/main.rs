@@ -772,7 +772,12 @@ async fn drop_database_with_retry(
 
     for attempt in 1..=total_attempts {
         match db.run(&query).await {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                if attempt > 1 {
+                    eprintln!("  Succeed");
+                }
+                return Ok(());
+            }
             Err(err) => {
                 eprintln!("({query}) error: {err}");
 
