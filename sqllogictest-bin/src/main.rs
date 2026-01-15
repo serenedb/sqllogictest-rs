@@ -757,7 +757,8 @@ async fn drop_task(
     Ok(())
 }
 
-/// Attempts to drop a database with retry logic for connection failures.
+/// Attempts to drop a database with retry logic.
+/// Uses `DROP DATABASE IF EXISTS` for idempotency and retries on any error.
 /// Returns Ok(Some(new_db)) if reconnection occurred, Ok(None) if successful without reconnection,
 /// or Err if max retries exceeded.
 async fn drop_database_with_retry(
@@ -768,21 +769,16 @@ async fn drop_database_with_retry(
     max_retries: usize,
     retry_delay: Duration,
 ) -> Result<Option<engines::Engines>> {
-    let query = format!("DROP DATABASE {db_name};");
+    let query = format!("DROP DATABASE IF EXISTS {db_name};");
 
     for attempt in 0..=max_retries {
         match db.run(&query).await {
             Ok(_) => return Ok(None),
             Err(err) => {
-                let err_str = err.to_string();
-
-                if !err_str.contains("refused") && !err_str.contains("closed") {
-                    eprintln!("({query}) ignore DROP DATABASE error: {err_str}");
-                    return Ok(None);
-                }
+                eprintln!("({query}) error: {err}");
 
                 if attempt < max_retries {
-                    eprintln!("  {err_str}. Retrying ({}/{})", attempt + 1, max_retries);
+                    eprintln!("  Retrying ({}/{})...", attempt + 1, max_retries);
                     tokio::time::sleep(retry_delay).await;
 
                     match engines::connect(engine, config).await {
@@ -793,7 +789,7 @@ async fn drop_database_with_retry(
                     }
                 } else {
                     return Err(anyhow!(
-                        "Max retries reached. The server may be down. Last error: {err_str}"
+                        "Max retries reached. Failed to drop database. Last error: {err}"
                     ));
                 }
             }
