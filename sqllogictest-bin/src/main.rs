@@ -742,8 +742,7 @@ async fn drop_task(
                 )
                 .await
                 {
-                    Ok(Some(new_db)) => db = new_db,
-                    Ok(None) => {} // Success, no reconnection needed
+                    Ok(()) => {} // Success, maybe reconnected
                     Err(e) => {
                         eprintln!("  {e}");
                         break;
@@ -759,8 +758,7 @@ async fn drop_task(
 
 /// Attempts to drop a database with retry logic.
 /// Uses `DROP DATABASE IF EXISTS` for idempotency and retries on any error.
-/// Returns Ok(Some(new_db)) if reconnection occurred, Ok(None) if successful without reconnection,
-/// or Err if max retries exceeded.
+/// Reconnects to the database before each retry. Fails fast if reconnection fails.
 async fn drop_database_with_retry(
     db: &mut engines::Engines,
     db_name: &str,
@@ -768,35 +766,42 @@ async fn drop_database_with_retry(
     config: &DBConfig,
     max_retries: usize,
     retry_delay: Duration,
-) -> Result<Option<engines::Engines>> {
+) -> Result<()> {
     let query = format!("DROP DATABASE IF EXISTS {db_name};");
+    let total_attempts = max_retries + 1;
 
-    for attempt in 0..=max_retries {
+    for attempt in 1..=total_attempts {
         match db.run(&query).await {
-            Ok(_) => return Ok(None),
+            Ok(_) => return Ok(()),
             Err(err) => {
                 eprintln!("({query}) error: {err}");
 
-                if attempt < max_retries {
-                    eprintln!("  Retrying ({}/{})...", attempt + 1, max_retries);
+                if attempt < total_attempts {
+                    eprintln!(
+                        "  Retrying with new connection ({}/{})...",
+                        attempt, max_retries
+                    );
                     tokio::time::sleep(retry_delay).await;
 
                     match engines::connect(engine, config).await {
-                        Ok(new_db) => return Ok(Some(new_db)),
-                        Err(reconnect_err) => {
-                            eprintln!("  Failed to reconnect: {reconnect_err}");
+                        Ok(new_db) => {
+                            *db = new_db;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Just try again to reconnect
                         }
                     }
                 } else {
                     return Err(anyhow!(
-                        "Max retries reached. Failed to drop database. Last error: {err}"
+                        "Failed to drop database {db_name} after {max_retries} retries"
                     ));
                 }
             }
         }
     }
 
-    Ok(None)
+    unreachable!("Loop should always return via Ok or Err branches")
 }
 
 // Run test one be one
