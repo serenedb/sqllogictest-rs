@@ -76,13 +76,50 @@ impl Location {
     }
 }
 
+
+/// Retry attempts configuration
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryAttempts {
+    /// Direct numeric value
+    Count(usize),
+    /// Environment variable name to read from (includes '$' prefix)
+    EnvVar(String),
+}
+
+impl std::fmt::Display for RetryAttempts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryAttempts::Count(n) => write!(f, "{}", n),
+            RetryAttempts::EnvVar(var) => write!(f, "{}", var),
+        }
+    }
+}
+
+/// Retry backoff configuration
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryBackoff {
+    /// Direct duration value
+    Duration(Duration),
+    /// Environment variable name to read from (includes '$' prefix)
+    EnvVar(String),
+}
+
+impl std::fmt::Display for RetryBackoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryBackoff::Duration(d) => write!(f, "{}", humantime::format_duration(*d)),
+            RetryBackoff::EnvVar(var) => write!(f, "{}", var),
+        }
+    }
+}
+
 /// Configuration for retry behavior
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryConfig {
     /// Number of retry attempts
-    pub attempts: usize,
+    pub attempts: RetryAttempts,
     /// Duration to wait between retries
-    pub backoff: Duration,
+    pub backoff: RetryBackoff,
 }
 
 /// Expectation for a statement.
@@ -256,7 +293,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                         f,
                         " retry {} backoff {}",
                         retry.attempts,
-                        humantime::format_duration(retry.backoff)
+                        retry.backoff
                     )?;
                 }
                 writeln!(f)?;
@@ -305,7 +342,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                         f,
                         " retry {} backoff {}",
                         retry.attempts,
-                        humantime::format_duration(retry.backoff)
+                        retry.backoff
                     )?;
                 }
                 writeln!(f)?;
@@ -338,7 +375,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                         f,
                         " retry {} backoff {}",
                         retry.attempts,
-                        humantime::format_duration(retry.backoff)
+                        retry.backoff
                     )?;
                 }
                 if let Some(stdout) = stdout {
@@ -1149,23 +1186,31 @@ fn parse_retry_config(tokens: &[&str]) -> Result<Option<RetryConfig>, ParseError
         None => return Ok(None),
     }
 
-    // Parse number of attempts
+    // Parse number of attempts (can be numeric or environment variable)
     let attempts = match iter.next() {
-        Some(attempts_str) => attempts_str
-            .parse::<usize>()
-            .map_err(|_| ParseErrorKind::InvalidNumber(attempts_str.to_string()))?,
+        Some(attempts_str) => {
+            if attempts_str.starts_with('$') {
+                // Environment variable reference (store with '$' prefix)
+                RetryAttempts::EnvVar(attempts_str.to_string())
+            } else {
+                // Try to parse as numeric value
+                let count = attempts_str
+                    .parse::<usize>()
+                    .map_err(|_| ParseErrorKind::InvalidNumber(attempts_str.to_string()))?;
+                if count == 0 {
+                    return Err(ParseErrorKind::InvalidRetryConfig(
+                        "attempt must be greater than 0".to_string(),
+                    ));
+                }
+                RetryAttempts::Count(count)
+            }
+        }
         None => {
             return Err(ParseErrorKind::InvalidRetryConfig(
-                "expected a positive number of attempts".to_string(),
+                "expected a positive number of attempts or environment variable".to_string(),
             ))
         }
     };
-
-    if attempts == 0 {
-        return Err(ParseErrorKind::InvalidRetryConfig(
-            "attempt must be greater than 0".to_string(),
-        ));
-    }
 
     // Expect "backoff" keyword
     match iter.next() {
@@ -1178,18 +1223,25 @@ fn parse_retry_config(tokens: &[&str]) -> Result<Option<RetryConfig>, ParseError
         }
     }
 
-    // Parse backoff duration
-    let duration_str = match iter.next() {
+    // Parse backoff duration (can be duration or environment variable)
+    let backoff_str = match iter.next() {
         Some(s) => s,
         None => {
             return Err(ParseErrorKind::InvalidRetryConfig(
-                "expected backoff duration".to_string(),
+                "expected backoff duration or environment variable".to_string(),
             ))
         }
     };
 
-    let backoff = humantime::parse_duration(duration_str)
-        .map_err(|_| ParseErrorKind::InvalidDuration(duration_str.to_string()))?;
+    let backoff = if backoff_str.starts_with('$') {
+        // Environment variable reference (store with '$' prefix)
+        RetryBackoff::EnvVar(backoff_str.to_string())
+    } else {
+        // Parse as duration
+        let duration = humantime::parse_duration(backoff_str)
+            .map_err(|_| ParseErrorKind::InvalidDuration(backoff_str.to_string()))?;
+        RetryBackoff::Duration(duration)
+    };
 
     // No more tokens should be present
     if iter.next().is_some() {
