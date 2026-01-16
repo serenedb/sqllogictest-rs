@@ -76,7 +76,6 @@ impl Location {
     }
 }
 
-
 /// Retry attempts configuration
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryAttempts {
@@ -289,12 +288,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     StatementExpect::Error(err) => err.fmt_inline(f)?,
                 }
                 if let Some(retry) = retry {
-                    write!(
-                        f,
-                        " retry {} backoff {}",
-                        retry.attempts,
-                        retry.backoff
-                    )?;
+                    write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
                 writeln!(f)?;
                 // statement always end with a blank line
@@ -338,12 +332,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     }
                 }
                 if let Some(retry) = retry {
-                    write!(
-                        f,
-                        " retry {} backoff {}",
-                        retry.attempts,
-                        retry.backoff
-                    )?;
+                    write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
                 writeln!(f)?;
                 writeln!(f, "{sql}")?;
@@ -371,12 +360,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             } => {
                 writeln!(f, "system ok\n{command}")?;
                 if let Some(retry) = retry {
-                    write!(
-                        f,
-                        " retry {} backoff {}",
-                        retry.attempts,
-                        retry.backoff
-                    )?;
+                    write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
                 if let Some(stdout) = stdout {
                     writeln!(f, "----\n{}\n", stdout.trim())?;
