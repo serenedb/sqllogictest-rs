@@ -343,10 +343,20 @@ pub async fn main() -> Result<()> {
             .iter()
             .map(|p| glob::Pattern::new(p).expect("invalid exclude pattern"))
             .collect();
+
+        let before = all_files.len();
         all_files.retain(|path| {
             let path_str = path.to_str().unwrap_or("");
             !exclude_patterns.iter().any(|pattern| pattern.matches(path_str))
         });
+        let after = all_files.len();
+        let excluded = before.saturating_sub(after);
+        if excluded > 0 {
+            eprintln!(
+                "Excluded {excluded} out of {before} test files based on exclude patterns: {}",
+                exclude.join(\", \"),
+            );
+        }
     }
 
     let config = DBConfig {
