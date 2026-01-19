@@ -48,6 +48,11 @@ struct Opt {
     #[clap(required = true, num_args = 1..)]
     files: Vec<String>,
 
+    /// Glob pattern(s) to exclude from test files.
+    /// For example: `--exclude "*medium*" --exclude "*large*"`
+    #[clap(long)]
+    exclude: Vec<String>,
+
     /// The database engine name, used by the record conditions.
     #[clap(short, long, value_enum, default_value = "postgres")]
     engine: EngineType,
@@ -242,6 +247,7 @@ pub async fn main() -> Result<()> {
     let matches = cli.get_matches();
     let Opt {
         files,
+        exclude,
         engine,
         external_engine_command_template,
         color,
@@ -330,6 +336,17 @@ pub async fn main() -> Result<()> {
         }
 
         all_files.extend(files);
+    }
+
+    if !exclude.is_empty() {
+        let exclude_patterns: Vec<glob::Pattern> = exclude
+            .iter()
+            .map(|p| glob::Pattern::new(p).expect("invalid exclude pattern"))
+            .collect();
+        all_files.retain(|path| {
+            let path_str = path.to_str().unwrap_or("");
+            !exclude_patterns.iter().any(|pattern| pattern.matches(path_str))
+        });
     }
 
     let config = DBConfig {
