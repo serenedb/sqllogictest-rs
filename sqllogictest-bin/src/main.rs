@@ -341,8 +341,11 @@ pub async fn main() -> Result<()> {
     if !exclude.is_empty() {
         let exclude_patterns: Vec<glob::Pattern> = exclude
             .iter()
-            .map(|p| glob::Pattern::new(p).expect("invalid exclude pattern"))
-            .collect();
+            .map(|p| {
+                glob::Pattern::new(p)
+                    .with_context(|| format!("invalid exclude pattern: {p}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let before = all_files.len();
         all_files.retain(|path| {
