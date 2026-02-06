@@ -317,11 +317,11 @@ pub async fn main() -> Result<()> {
             .context("failed to read glob pattern")?
             .try_collect()?;
 
+        // Skip directories
+        files.retain(|path| !path.is_dir());
+
         // Test against partitioner only if there are multiple files matched, e.g., expanded from an `*`.
         if files.len() > 1 {
-            // Skip directories
-            files.retain(|path| !path.is_dir());
-
             if let Some(partitioner) = &partitioner {
                 let len = files.len();
                 files.retain(|path| partitioner.matches(path.to_str().unwrap()));
