@@ -1229,6 +1229,15 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
             ))?;
     }
 
+    runner
+        .flush_nowait()
+        .await
+        .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+        .context(format!(
+            "failed to run `{}`",
+            style(filename.to_string_lossy()).bold()
+        ))?;
+
     let duration = begin_times[0].elapsed();
 
     finish_test_file(

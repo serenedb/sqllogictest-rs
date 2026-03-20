@@ -70,6 +70,12 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
         self.get(ConnectionName::Default).await?.run(sql).await
     }
 
+    /// Create a new detached connection not tracked in the pool.
+    /// Used for nowait queries that need an independent connection.
+    pub async fn make_detached(&mut self) -> Result<D, D::Error> {
+        self.make_conn.make().await
+    }
+
     /// Shutdown all connections.
     pub async fn shutdown_all(&mut self) {
         join_all(self.conns.values_mut().map(|conn| conn.shutdown())).await;

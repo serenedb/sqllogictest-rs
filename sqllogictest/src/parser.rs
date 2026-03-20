@@ -179,6 +179,8 @@ pub enum Record<T: ColumnType> {
         /// The SQL command.
         sql: String,
         expected: StatementExpect,
+        /// If true, do not wait for the statement to complete before proceeding.
+        nowait: bool,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
     },
@@ -191,6 +193,8 @@ pub enum Record<T: ColumnType> {
         /// The SQL command.
         sql: String,
         expected: QueryExpect<T>,
+        /// If true, do not wait for the query to complete before proceeding.
+        nowait: bool,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
     },
@@ -252,6 +256,10 @@ pub enum Record<T: ColumnType> {
     Newline,
     /// Internally injected record which should not occur in the test file.
     Injected(Injected),
+    NoWait {
+        loc: Location,
+        value: bool,
+    },
 }
 
 impl<T: ColumnType> Record<T> {
@@ -279,6 +287,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 connection: _,
                 sql,
                 expected,
+                nowait: _,
                 retry,
             } => {
                 write!(f, "statement ")?;
@@ -305,6 +314,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 connection: _,
                 sql,
                 expected,
+                nowait: _,
                 retry,
             } => {
                 write!(f, "query")?;
@@ -419,6 +429,13 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     write!(f, "\n#{}", line.trim_end())?;
                 }
                 Ok(())
+            }
+            Record::NoWait { loc: _, value } => {
+                if *value {
+                    write!(f, "nowait")
+                } else {
+                    Ok(())
+                }
             }
             Record::Newline => Ok(()), // Display doesn't end with newline
             Record::Injected(p) => panic!("unexpected injected record: {p:?}"),
@@ -778,6 +795,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
     let mut records = vec![];
     let mut conditions = vec![];
     let mut connection = Connection::Default;
+    let mut nowait = false;
     let mut comments = vec![];
 
     while let Some((num, line)) = lines.next() {
@@ -848,6 +866,10 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 connection = conn.clone();
                 records.push(Record::Connection(conn));
             }
+            ["nowait"] => {
+                nowait = true;
+                records.push(Record::NoWait { loc, value: true });
+            }
             ["statement", res @ ..] => {
                 let (mut expected, res) = match res {
                     ["ok", retry @ ..] => (StatementExpect::Ok, retry),
@@ -894,6 +916,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     connection: std::mem::take(&mut connection),
                     sql,
                     expected,
+                    nowait: std::mem::replace(&mut nowait, false),
                     retry,
                 });
             }
@@ -981,6 +1004,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     connection: std::mem::take(&mut connection),
                     sql,
                     expected,
+                    nowait: std::mem::replace(&mut nowait, false),
                     retry,
                 });
             }
@@ -1345,6 +1369,7 @@ select * from foo;
                 connection: Connection::Default,
                 sql: "select * from foo;".to_string(),
                 expected: QueryExpect::empty_results(),
+                nowait: false,
                 retry: None,
             }]
         );
@@ -1408,6 +1433,7 @@ select * from foo;
                     | Record::Comment(_)
                     | Record::Control(_)
                     | Record::Newline
+                    | Record::NoWait { .. }
                     | Record::Injected(_) => {}
                 };
                 record

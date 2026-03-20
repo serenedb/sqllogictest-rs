@@ -680,10 +680,13 @@ pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
     hash_threshold: usize,
     show_column_names: bool,
     flat_values: bool,
+    no_wait: bool,
     /// Labels for condition `skipif` and `onlyif`.
     labels: HashSet<String>,
     /// Local variables/context for the runner.
     locals: RunnerLocals,
+    /// Pending nowait records: (original record for validation, detached connection, substituted sql).
+    pending: Vec<(Record<D::ColumnType>, D, String)>,
 }
 
 fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -716,9 +719,11 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             hash_threshold: 0,
             show_column_names: true,
             flat_values: false,
+            no_wait: false,
             labels: HashSet::new(),
             conn: Connections::new(make_conn),
             locals: RunnerLocals::default(),
+            pending: Vec::new(),
         }
     }
 
@@ -759,6 +764,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         record: Record<D::ColumnType>,
     ) -> RecordOutput<D::ColumnType> {
         tracing::debug!(?record, "testing");
+        // Clone upfront so nowait path can store the full original record (including `expected`).
+        let record_clone = record.clone();
         /// Returns whether we should skip this record, according to given `conditions`.
         fn should_skip(
             labels: &HashSet<String>,
@@ -781,6 +788,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 conditions,
                 connection,
                 sql,
+                nowait,
 
                 // compare result in run_async
                 expected: _,
@@ -796,6 +804,24 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         }
                     }
                 };
+
+                if nowait || self.no_wait {
+                    // Fire and forget: create a detached connection and store for later validation.
+                    let new_conn = match self.conn.make_detached().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return RecordOutput::Statement {
+                                count: 0,
+                                error: Some(Arc::new(e)),
+                            }
+                        }
+                    };
+                    if should_skip(&self.labels, new_conn.engine_name(), &conditions) {
+                        return RecordOutput::Nothing;
+                    }
+                    self.pending.push((record_clone, new_conn, sql));
+                    return RecordOutput::Nothing;
+                }
 
                 let conn = match self.conn.get(connection).await {
                     Ok(conn) => conn,
@@ -930,6 +956,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 conditions,
                 connection,
                 sql,
+                nowait,
 
                 // compare result in run_async
                 expected,
@@ -946,6 +973,25 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         }
                     }
                 };
+
+                if nowait || self.no_wait {
+                    // Fire and forget: create a detached connection and store for later validation.
+                    let new_conn = match self.conn.make_detached().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return RecordOutput::Query {
+                                error: Some(Arc::new(e)),
+                                types: vec![],
+                                rows: vec![],
+                            }
+                        }
+                    };
+                    if should_skip(&self.labels, new_conn.engine_name(), &conditions) {
+                        return RecordOutput::Nothing;
+                    }
+                    self.pending.push((record_clone, new_conn, sql));
+                    return RecordOutput::Nothing;
+                }
 
                 let conn = match self.conn.get(connection).await {
                     Ok(conn) => conn,
@@ -1090,6 +1136,10 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
             Record::Halt { loc: _ } => {
                 tracing::error!("halt record encountered. It's likely a bug of the runtime.");
+                RecordOutput::Nothing
+            }
+            Record::NoWait { loc: _, value } => {
+                self.no_wait = value;
                 RecordOutput::Nothing
             }
             Record::Include { .. }
@@ -1255,6 +1305,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     conditions: _,
                     sql,
                     expected,
+                    nowait: _,
                     retry: _,
                 },
                 RecordOutput::Statement { count, error },
@@ -1304,6 +1355,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     connection: _,
                     sql,
                     expected,
+                    nowait: _,
                     retry: _,
                 },
                 RecordOutput::Query { types, rows, error },
@@ -1427,6 +1479,192 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         futures::executor::block_on(self.run_async(record))
     }
 
+    /// Run all pending nowait records and validate their results.
+    ///
+    /// Pending queries are run concurrently on their dedicated connections, then validated
+    /// against their expected results. Called automatically at the end of `run_multi_async`.
+    pub async fn flush_nowait(&mut self) -> Result<(), TestError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+
+        let show_column_names = self.show_column_names;
+        let flat_values = self.flat_values;
+
+        // Run all pending queries concurrently on their dedicated connections.
+        let futs: Vec<_> = pending
+            .into_iter()
+            .map(|(record, mut conn, sql)| async move {
+                let output = match conn.run(&sql).await {
+                    Ok(DBOutput::Rows { types, mut rows }) => {
+                        let mut column_names_present = true;
+                        if !show_column_names {
+                            rows = rows[1..].into();
+                            column_names_present = false;
+                        }
+                        if column_names_present && flat_values {
+                            rows = rows[1..].into();
+                        }
+                        RecordOutput::Query {
+                            types,
+                            rows: escape(rows),
+                            error: None,
+                        }
+                    }
+                    Ok(DBOutput::StatementComplete(count)) => {
+                        RecordOutput::Statement { count, error: None }
+                    }
+                    Err(e) => RecordOutput::Query {
+                        error: Some(Arc::new(e)),
+                        types: vec![],
+                        rows: vec![],
+                    },
+                };
+                (record, output)
+            })
+            .collect();
+
+        let results = futures::future::join_all(futs).await;
+
+        for (record, output) in results {
+            self.validate_pending_output(record, &output)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate the output of a pending nowait record against its expected result.
+    fn validate_pending_output(
+        &self,
+        record: Record<D::ColumnType>,
+        result: &RecordOutput<D::ColumnType>,
+    ) -> Result<(), TestError> {
+        match (record, result) {
+            (_, RecordOutput::Nothing) => {}
+            (
+                Record::Statement {
+                    loc,
+                    sql,
+                    expected,
+                    ..
+                },
+                RecordOutput::Statement { count, error },
+            ) => match (error, expected) {
+                (None, StatementExpect::Error(_)) => {
+                    return Err(TestErrorKind::Ok {
+                        sql,
+                        kind: RecordKind::Statement,
+                    }
+                    .at(loc))
+                }
+                (None, StatementExpect::Count(expected_count)) => {
+                    if expected_count != *count {
+                        return Err(TestErrorKind::StatementResultMismatch {
+                            sql,
+                            expected: expected_count,
+                            actual: format!("affected {count} rows"),
+                        }
+                        .at(loc));
+                    }
+                }
+                (None, StatementExpect::Ok) => {}
+                (Some(e), StatementExpect::Error(expected_error)) => {
+                    if !expected_error.is_match(&e.to_string()) {
+                        return Err(TestErrorKind::ErrorMismatch {
+                            sql,
+                            err: Arc::clone(e),
+                            expected_err: expected_error.to_string(),
+                            kind: RecordKind::Statement,
+                        }
+                        .at(loc));
+                    }
+                }
+                (Some(e), StatementExpect::Count(_) | StatementExpect::Ok) => {
+                    return Err(TestErrorKind::Fail {
+                        sql,
+                        err: Arc::clone(e),
+                        kind: RecordKind::Statement,
+                    }
+                    .at(loc));
+                }
+            },
+            (
+                Record::Query {
+                    loc,
+                    sql,
+                    expected,
+                    ..
+                },
+                RecordOutput::Query { types, rows, error },
+            ) => match (error, expected) {
+                (None, QueryExpect::Error(_)) => {
+                    return Err(TestErrorKind::Ok {
+                        sql,
+                        kind: RecordKind::Query,
+                    }
+                    .at(loc))
+                }
+                (Some(e), QueryExpect::Error(expected_error)) => {
+                    if !expected_error.is_match(&e.to_string()) {
+                        return Err(TestErrorKind::ErrorMismatch {
+                            sql,
+                            err: Arc::clone(e),
+                            expected_err: expected_error.to_string(),
+                            kind: RecordKind::Query,
+                        }
+                        .at(loc));
+                    }
+                }
+                (Some(e), QueryExpect::Results { .. }) => {
+                    return Err(TestErrorKind::Fail {
+                        sql,
+                        err: Arc::clone(e),
+                        kind: RecordKind::Query,
+                    }
+                    .at(loc))
+                }
+                (
+                    None,
+                    QueryExpect::Results {
+                        types: expected_types,
+                        results: expected_results,
+                        ..
+                    },
+                ) => {
+                    if !(self.column_type_validator)(types, &expected_types) {
+                        return Err(TestErrorKind::QueryResultColumnsMismatch {
+                            sql,
+                            expected: expected_types.iter().map(|c| c.to_char()).join(""),
+                            actual: types.iter().map(|c| c.to_char()).join(""),
+                        }
+                        .at(loc));
+                    }
+                    let actual_results = match self.result_mode {
+                        Some(ResultMode::ValueWise) => rows
+                            .iter()
+                            .flat_map(|strs| strs.iter())
+                            .map(|str| vec![str.to_string()])
+                            .collect_vec(),
+                        _ => rows.clone(),
+                    };
+                    if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
+                        let output_rows =
+                            rows.iter().map(|strs| strs.iter().join("\t")).collect_vec();
+                        return Err(TestErrorKind::QueryResultMismatch {
+                            sql,
+                            expected: expected_results.join("\n"),
+                            actual: output_rows.join("\n"),
+                        }
+                        .at(loc));
+                    }
+                }
+            },
+            _ => unreachable!("unexpected record/output combination in flush_nowait"),
+        }
+        Ok(())
+    }
+
     /// Run multiple records.
     ///
     /// The runner will stop early once a halt record is seen.
@@ -1442,6 +1680,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
             self.run_async(record).await?;
         }
+        self.flush_nowait().await?;
         Ok(())
     }
 
@@ -1551,8 +1790,10 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 hash_threshold: self.hash_threshold,
                 show_column_names: self.show_column_names,
                 flat_values: self.flat_values,
+                no_wait: self.no_wait,
                 labels: self.labels.clone(),
                 locals,
+                pending: Vec::new(),
             };
 
             tasks.push(async move {
@@ -1818,6 +2059,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 conditions,
                 connection,
                 expected: mut expected @ (StatementExpect::Ok | StatementExpect::Count(_)),
+                nowait,
                 retry,
             },
             RecordOutput::Query {
@@ -1841,6 +2083,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 conditions,
                 connection,
                 expected,
+                nowait,
                 retry,
             })
         }
@@ -1852,6 +2095,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 conditions,
                 connection,
                 expected: _,
+                nowait,
                 retry,
             },
             RecordOutput::Statement { error: None, count },
@@ -1874,6 +2118,7 @@ pub fn update_record_with_output<T: ColumnType>(
                     result_mode: None,
                     label: None,
                 },
+                nowait,
                 retry,
             })
         }
@@ -1885,6 +2130,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 sql,
                 expected,
+                nowait,
                 retry,
             },
             RecordOutput::Statement { count, error },
@@ -1908,6 +2154,7 @@ pub fn update_record_with_output<T: ColumnType>(
                             loc,
                             conditions: new_conditions,
                             connection,
+                            nowait,
                             retry,
                         });
                     }
@@ -1921,6 +2168,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         StatementExpect::Count(_) => StatementExpect::Count(*count),
                         StatementExpect::Error(_) | StatementExpect::Ok => StatementExpect::Ok,
                     },
+                    nowait,
                     retry,
                 })
             }
@@ -1948,6 +2196,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         loc,
                         conditions: new_conditions,
                         connection,
+                        nowait,
                         retry,
                     })
                 } else {
@@ -1965,6 +2214,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         loc,
                         conditions,
                         connection,
+                        nowait,
                         retry,
                     })
                 }
@@ -1978,6 +2228,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 sql,
                 expected,
+                nowait,
                 retry,
             },
             RecordOutput::Query { types, rows, error },
@@ -2006,6 +2257,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         loc,
                         conditions: new_conditions,
                         connection,
+                        nowait,
                         retry,
                     })
                 } else {
@@ -2023,6 +2275,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         loc,
                         conditions,
                         connection,
+                        nowait,
                         retry,
                     })
                 }
@@ -2057,6 +2310,7 @@ pub fn update_record_with_output<T: ColumnType>(
                             loc,
                             conditions: new_conditions,
                             connection,
+                            nowait,
                             retry,
                         });
                     }
@@ -2106,6 +2360,7 @@ pub fn update_record_with_output<T: ColumnType>(
                             label: None,
                         },
                     },
+                    nowait,
                     retry,
                 })
             }
