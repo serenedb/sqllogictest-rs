@@ -1,0 +1,9 @@
+# Test that multiple statements in a single simple query return all results
+
+query T
+select * from multi_statement_query
+----
+?column?
+1
+?column?
+213123

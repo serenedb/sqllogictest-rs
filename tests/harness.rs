@@ -85,6 +85,17 @@ impl sqllogictest::DB for FakeDB {
                 ],
             });
         }
+        if sql == "select * from multi_statement_query" {
+            return Ok(DBOutput::Rows {
+                types: vec![DefaultColumnType::Any],
+                rows: vec![
+                    vec!["?column?".to_string()],
+                    vec!["1".to_string()],
+                    vec!["?column?".to_string()],
+                    vec!["213123".to_string()],
+                ],
+            });
+        }
         if sql.starts_with("create") {
             return Ok(DBOutput::StatementComplete(0));
         }
