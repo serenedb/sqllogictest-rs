@@ -434,7 +434,7 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::FLOAT8_ARRAY => {
                         array_process!(row, row_vec, idx, f64, float8_to_str);
                     }
-                    Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::REGTYPE => {
+                    Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::REGTYPE | Type::REGCLASS => {
                         single_process!(row, row_vec, idx, &str);
                     }
                     Type::VARCHAR_ARRAY
