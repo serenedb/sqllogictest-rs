@@ -42,7 +42,7 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
                 }
                 tokio_postgres::SimpleQueryMessage::CommandComplete(cnt_) => {
                     cnt = cnt_;
-                    break;
+                    continue;
                 }
                 tokio_postgres::SimpleQueryMessage::RowDescription(column_names) => {
                     if column_names.is_empty() {
