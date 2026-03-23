@@ -1,0 +1,9 @@
+show-column-names false
+
+# Test that multiple statements in a single simple query return all results
+
+query T
+select * from multi_statement_query
+----
+1
+213123
