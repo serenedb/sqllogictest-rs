@@ -640,6 +640,7 @@ async fn create_task(
     config: DBConfig,
     job_tx: mpsc::Sender<TestJob>,
 ) -> Result<()> {
+    log::error!("engines::connect1");
     let mut db = engines::connect(&engine, &config, SslMode::Disable, None).await?;
 
     for (db_name, filename) in tests {
@@ -726,7 +727,7 @@ async fn drop_task(
 ) -> Result<()> {
     const MAX_RETRIES: usize = 1;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
-
+    log::error!("engines::connect2");
     let mut db = engines::connect(&engine, &config, SslMode::Disable, None).await?;
 
     while let Some(message) = drop_rx.recv().await {
@@ -791,7 +792,7 @@ async fn drop_database_with_retry(
                         attempt, max_retries
                     );
                     tokio::time::sleep(retry_delay).await;
-
+                    log::error!("engines::connect3");
                     match engines::connect(engine, config, SslMode::Disable, None).await {
                         Ok(new_db) => {
                             *db = new_db;
@@ -886,6 +887,7 @@ async fn update_test_files(
     keep_db_on_failure: bool,
     labels: Vec<String>,
 ) -> Result<()> {
+    log::error!("engines::connect4");
     let mut db = engines::connect(engine, &config, SslMode::Disable, None).await?;
     let test_databases = if jobs.is_some() {
         test_db_names(files)?
@@ -921,7 +923,8 @@ async fn update_test_files(
             let failed_dbs = failed_dbs.clone();
             let labels = &labels;
             async move {
-                let mut runner = Runner::new(|_ssl_mode, _port| engines::connect(engine, &config, SslMode::Disable, None));
+                log::error!("engines::connect5");
+                let mut runner = Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
                 for label in labels {
                     runner.add_label(label);
                 }
@@ -1096,8 +1099,8 @@ async fn connect_and_run_test_file(
 
     // Hold until the current test is finished or cancelled.
     let _running = RUNNING_TESTS.read().await;
-
-    let mut runner = Runner::new(|_ssl_mode, _port| engines::connect(engine, &config, SslMode::Disable, None));
+    log::error!("engines::connect6");
+    let mut runner = Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
     for label in labels {
         runner.add_label(label);
     }

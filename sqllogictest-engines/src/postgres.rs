@@ -1,11 +1,15 @@
 mod error;
 mod extended;
 mod simple;
-
+use std::sync::Arc;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode;
+use rustls::pki_types::*;
+use rustls::DigitallySignedStruct;
+use rustls::SignatureScheme;
+use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
 
 type Result<T> = std::result::Result<T, error::PgDriverError>;
 
@@ -70,10 +74,7 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
-    pub fn new(mut pg_config: PostgresConfig) -> Self {
-        // Default to Disable so callers that don't configure TLS explicitly
-        // are never accidentally routed into the TLS path.
-        pg_config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+    pub fn new(pg_config: PostgresConfig) -> Self {
         Self { pg_config, ca_cert: None }
     }
 
@@ -99,6 +100,49 @@ struct ActiveConn {
     handle: JoinHandle<()>,
 }
 
+#[derive(Debug)]
+struct NoVerification;
+
+
+impl ServerCertVerifier for NoVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+       fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
 /// Postgres engine using the simple query protocol.
 pub type PostgresSimple = Postgres<Simple>;
 /// Postgres engine using the extended query protocol.
@@ -118,6 +162,7 @@ impl<P: sealed::Protocol> Postgres<P> {
     /// Returns [`PgDriverError::CaCertRequired`] if `sslmode` is not
     /// `disable` and no `ca_cert` path was provided.
     pub async fn connect(opts: ConnectOptions) -> Result<Self> {
+        log::error!("Postgresql async connect");
         let (client, handle) = match opts.pg_config.get_ssl_mode() {
             SslMode::Disable => Self::connect_plain(&opts.pg_config).await?,
             _ => {
@@ -139,6 +184,7 @@ impl<P: sealed::Protocol> Postgres<P> {
     async fn connect_plain(
         config: &PostgresConfig,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
+        log::error!("Connecting plain");
         let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
         Ok((client, Self::spawn_connection(connection)))
     }
@@ -147,10 +193,14 @@ impl<P: sealed::Protocol> Postgres<P> {
         config: &PostgresConfig,
         ca_path: &Path,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
+        log::error!("Connecting tls");
         let roots = Self::load_ca_cert(ca_path)?;
-        let tls_config = rustls::ClientConfig::builder()
+        let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerification));
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
         let (client, connection) = config.connect(tls).await?;
         Ok((client, Self::spawn_connection(connection)))

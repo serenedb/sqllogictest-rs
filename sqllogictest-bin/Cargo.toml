@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 sqllogictest = { path = "../sqllogictest", version = "0.28" }
 sqllogictest-engines = { path = "../sqllogictest-engines", version = "0.28" }
-
+log = {workspace = true}
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

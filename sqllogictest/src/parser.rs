@@ -634,7 +634,7 @@ pub enum SslMode {
 }
 
 impl SslMode {
-    fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "disable" => Some(Self::Disable),
             "prefer"  => Some(Self::Prefer),
@@ -643,7 +643,7 @@ impl SslMode {
         }
     }
 
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Disable => "disable",
             Self::Prefer  => "prefer",
@@ -917,7 +917,8 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                         })
                     })
                     .transpose()?;
-
+                let ssl_mode_str = ssl_mode.as_str();
+                log::error!("Spawning custom connection {name} {ssl_mode_str}");        
                 let conn = Connection::new(name, ssl_mode, port);
                 connection = conn.clone();
                 records.push(Record::Connection(conn));

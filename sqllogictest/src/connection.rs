@@ -69,6 +69,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
         let conn = match self.conns.entry(name) {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => {
+                log::error!("Making custom connection {}", ssl_mode.as_str());
                 let conn = self.make_conn.make(ssl_mode, port).await?;
                 v.insert(conn)
             }
