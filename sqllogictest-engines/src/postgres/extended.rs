@@ -11,9 +11,8 @@ use postgres_types::{accepts, FromSql, ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
-use crate::postgres::error::PgDriverError;
-
 use super::{Extended, Postgres, Result};
+use crate::postgres::error::PgDriverError;
 
 // Inspired by postgres_type::Array implementation of Display trait
 fn print_array<T: std::fmt::Display>(
@@ -33,7 +32,8 @@ fn print_array<T: std::fmt::Display>(
 // * double quotes
 // * backslashes
 // * space
-// It'is used (although it's simple protocol specific) to not duplicate tests for simple and extended protocols.
+// It'is used (although it's simple protocol specific) to not duplicate tests for simple and
+// extended protocols.
 pub fn array_item_need_escape_and_quote(data: &str) -> bool {
     if data.is_empty() || data.eq_ignore_ascii_case("null") {
         return true;
@@ -483,8 +483,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::VOID => {
                         single_process!(row, row_vec, idx, Void);
                     }
-                    // SereneDB doesn't return OID type (corresponding OID value). Instead, it returns
-                    // raw u64 type and there are no plans to change this behaviour. Keep this in mind in case
+                    // SereneDB doesn't return OID type (corresponding OID value). Instead, it
+                    // returns raw u64 type and there are no plans to change
+                    // this behaviour. Keep this in mind in case
                     // OID type related problems.
                     Type::OID => {
                         single_process!(row, row_vec, idx, u32);

@@ -239,7 +239,8 @@ pub enum Record<T: ColumnType> {
         value: bool,
     },
     /// Flatten all result values into a single column, instead of preserving the row structure.
-    /// When enabled, the output will be a single column containing all values, regardless of their original row grouping.
+    /// When enabled, the output will be a single column containing all values, regardless of their
+    /// original row grouping.
     FlatValues {
         loc: Location,
         value: bool,
@@ -898,7 +899,8 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
                             // `statement error retry <num> backoff <duration>`
-                            // To keep syntax simple, let's assume the error message must be multiline.
+                            // To keep syntax simple, let's assume the error message must be
+                            // multiline.
                             (StatementExpect::Error(ExpectedError::Empty), res)
                         } else {
                             let error = ExpectedError::parse_inline_tokens(res)
@@ -946,7 +948,8 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
                             // `query error retry <num> backoff <duration>`
-                            // To keep syntax simple, let's assume the error message must be multiline.
+                            // To keep syntax simple, let's assume
+                            // the error message must be multiline.
                             (QueryExpect::Error(ExpectedError::Empty), res)
                         } else {
                             let error = ExpectedError::parse_inline_tokens(res)
@@ -1073,6 +1076,18 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     })?,
                 });
             }
+            ["show-column-names", value, _rest @ ..] => records.push(Record::ShowColumnNames {
+                loc: loc.clone(),
+                value: value
+                    .parse::<bool>()
+                    .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
+            }),
+            ["flat-values", value, _rest @ ..] => records.push(Record::FlatValues {
+                loc: loc.clone(),
+                value: value
+                    .parse::<bool>()
+                    .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
+            }),
             ["let", rest @ ..] => {
                 // Parse: let var1, var2, ... followed by SQL
                 // Join the rest of the tokens and parse the variable list
@@ -1112,18 +1127,6 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                 });
             }
-            ["show-column-names", value, _rest @ ..] => records.push(Record::ShowColumnNames {
-                loc: loc.clone(),
-                value: value
-                    .parse::<bool>()
-                    .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
-            }),
-            ["flat-values", value, _rest @ ..] => records.push(Record::FlatValues {
-                loc: loc.clone(),
-                value: value
-                    .parse::<bool>()
-                    .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
-            }),
             _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
         }
     }
@@ -1170,9 +1173,7 @@ fn parse_file_inner<T: ColumnType>(loc: Location) -> Result<Vec<Record<T>>, Pars
                     included_file.clone(),
                 )));
                 records.extend(parse_file_inner(loc.include(&included_file))?);
-                records.push(Record::Injected(Injected::EndInclude(
-                    included_file.to_string(),
-                )));
+                records.push(Record::Injected(Injected::EndInclude(included_file)));
             }
         }
     }
@@ -1516,9 +1517,9 @@ select * from foo;
                     Record::Subtest { loc, .. } => normalize_loc(loc),
                     Record::Halt { loc, .. } => normalize_loc(loc),
                     Record::HashThreshold { loc, .. } => normalize_loc(loc),
-                    Record::Let { loc, .. } => normalize_loc(loc),
                     Record::ShowColumnNames { loc, .. } => normalize_loc(loc),
                     Record::FlatValues { loc, .. } => normalize_loc(loc),
+                    Record::Let { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match

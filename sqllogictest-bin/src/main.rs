@@ -115,8 +115,8 @@ struct Opt {
     #[clap(long, conflicts_with_all = ["force_override", "format", "skip_failed"])]
     r#override: bool,
     /// Overrides the test files with the actual output of the database,
-    /// and normalizes formatting (e.g., converts spaces to tabs and despite <slt:ignore>) even when
-    /// the logical content matches.
+    /// and normalizes formatting (e.g., converts spaces to tabs and despite <slt:ignore>) even
+    /// when the logical content matches.
     #[clap(long, conflicts_with_all = ["override", "format", "skip_failed"])]
     force_override: bool,
     /// Reformats the test files.
@@ -319,7 +319,7 @@ pub async fn main() -> Result<()> {
     let mut all_files = Vec::new();
 
     let re = skip
-        .map(|s| Regex::new(&s))
+        .map(|s| Regex::new(&s).map_err(Box::new))
         .transpose()
         .context("invalid regex")?;
 
@@ -328,6 +328,8 @@ pub async fn main() -> Result<()> {
             .context("failed to read glob pattern")?
             .try_collect()?;
 
+        // Skip directories
+        files.retain(|path| !path.is_dir());
         if let Some(re) = &re {
             files.retain(|path| {
                 !re.is_match(&path.to_string_lossy())
@@ -335,11 +337,9 @@ pub async fn main() -> Result<()> {
                     .unwrap()
             });
         }
-    
-        // Skip directories
-        files.retain(|path| !path.is_dir());
 
-        // Test against partitioner only if there are multiple files matched, e.g., expanded from an `*`.
+        // Test against partitioner only if there are multiple files matched,
+        // e.g., expanded from an `*`.
         if files.len() > 1 {
             if let Some(partitioner) = &partitioner {
                 let len = files.len();

@@ -4,9 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
-use crate::postgres::error::PgDriverError;
-
 use super::{Postgres, Result, Simple};
+use crate::postgres::error::PgDriverError;
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Simple> {

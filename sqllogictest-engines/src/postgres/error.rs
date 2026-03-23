@@ -20,3 +20,9 @@ impl From<tokio_postgres::Error> for PgDriverError {
 }
 
 impl std::error::Error for PgDriverError {}
+
+impl PgDriverError {
+    pub fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
+        self.0.code()
+    }
+}

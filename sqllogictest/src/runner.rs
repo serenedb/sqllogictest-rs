@@ -378,12 +378,12 @@ pub enum TestErrorKind {
         expected: String,
         actual: String,
     },
-    #[error("let failed: {err}\n[SQL] {sql}")]
-    LetFail { sql: String, err: LetError },
     #[error("Multiple record mismatches ({} errors)\n", kinds.len())]
     CompositeMismatch { kinds: Vec<TestErrorKind> },
     #[error("retry configuration substitution failed: {variable}\n{err}")]
     RetrySubstitutionFailure { variable: String, err: AnyError },
+    #[error("let failed: {err}\n[SQL] {sql}")]
+    LetFail { sql: String, err: LetError },
 }
 
 impl From<ParseError> for TestError {
@@ -591,7 +591,8 @@ pub fn default_validator(
     // If ignore marker present, perform fragment-based matching on the full snapshot.
     if contains_ignore_marker {
         // If ignore marker present, perform fragment-based matching on the full snapshot.
-        // The actual results might contain \n, and may not be a normal "row", which is not suitable to normalize.
+        // The actual results might contain \n, and may not be a normal "row", which is not suitable
+        // to normalize.
         let expected_results = expected;
         let actual_rows = actual
             .iter()
@@ -2204,7 +2205,8 @@ pub fn update_record_with_output<T: ColumnType>(
 
                 // Otherwise, update results normally
                 let results = match &expected {
-                    // If validation succeeds and formatting normalization is not forced, preserve original.
+                    // If validation succeeds and formatting normalization is not forced, preserve
+                    // original.
                     QueryExpect::Results {
                         results: expected_results,
                         ..
