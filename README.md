@@ -86,11 +86,12 @@ Seq Scan on t  (cost=<slt:ignore> rows=<slt:ignore> width=<slt:ignore>)
    Filter: (x > 1)  
 ```
 
-### Extension: Run a query/statement that should fail with the expacted error message
+### Extension: Run a query/statement that should fail with the expected error message
 
 The syntax:
 - Do not check the error message: `[statement|query] error`
 - Single line error message (regexp match): `[statement|query] error <regex>`
+- Match SQLSTATE (exact match): `[statement|query] error (<SQLSTATE>)`
 - Multiline error message (exact match): Use `----`.
 
 ```text
@@ -98,6 +99,11 @@ The syntax:
 # message contains 'Multiple object drop not supported'
 statement error Multiple object drop not supported
 DROP VIEW foo, bar;
+
+# Ensure that the statement errors and that the SQLSTATE is exactly the expected one.
+# (This requires the engine to expose the SQLSTATE via `DB::error_sql_state` / `AsyncDB::error_sql_state`.)
+statement error (42P01)
+SELECT * FROM non_existent_table;
 
 # The output error message must be the exact match of the expected one to pass the test,
 # except for the leading and trailing whitespaces.
@@ -212,6 +218,35 @@ echo "foo" > "$__TEST_DIR__/foo.txt"
 > `system` commands don't support the advanced substitution features of the [subst](https://docs.rs/subst/latest/subst/) crate,
 > and excaping is also not needed.
 > Environment variables are supported by the shell, and special variables are still supported by plain string substitution.
+
+### Extension: Bind query results to variables with `let`
+
+The `let` record allows you to execute a SQL query and bind the results to variables for use in subsequent queries.
+This is useful when you need to capture dynamic values (like auto-generated IDs) from the database.
+
+```text
+control substitution on
+
+# Execute a query that returns exactly 1 row with 1 column, bind result to 'id'
+let id
+SELECT id FROM users WHERE name = 'alice'
+
+# Multiple variables can be bound from a single query
+let user_id, user_name, user_email
+SELECT id, name, email FROM users WHERE id = 1
+
+# Use the bound variable in subsequent queries
+query TTT
+SELECT $user_id, $user_name, $user_email
+----
+1 alice alice@example.com
+```
+
+**Requirements:**
+- The query must return exactly **1 row**.
+- The number of columns must match the number of variables.
+- `let` requires `control substitution on` to be enabled for variable usage, but the `let` statement itself will execute regardless.
+
 
 ## Used by
 
