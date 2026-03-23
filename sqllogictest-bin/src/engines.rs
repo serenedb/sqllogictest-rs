@@ -79,17 +79,6 @@ impl From<&DBConfig> for PostgresConfig {
     }
 }
 
-/// Converts a [`DBConfig`] into [`ConnectOptions`] with no TLS.
-///
-/// TLS (including custom CA certs) is not configured here — this path is used
-/// for standard test runs where the database does not require SSL. For TLS
-/// connections, construct [`ConnectOptions`] directly with [`ConnectOptions::with_ca_cert`].
-impl From<&DBConfig> for ConnectOptions {
-    fn from(config: &DBConfig) -> Self {
-        ConnectOptions::new(PostgresConfig::from(config))
-    }
-}
-
 
 fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port: Option<u16>) -> ConnectOptions {
     let mut pg_config = PostgresConfig::from(config);
@@ -108,8 +97,20 @@ fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port: Option<u16>) ->
             pg_config.options(options);
         }
     }
+    log::error!("make_connect_opts {}", ssl_mode.as_str());
     pg_config.ssl_mode(to_pg_ssl_mode(ssl_mode));
     ConnectOptions::new(pg_config)
+}
+
+/// Converts a [`DBConfig`] into [`ConnectOptions`] with no TLS.
+///
+/// TLS (including custom CA certs) is not configured here — this path is used
+/// for standard test runs where the database does not require SSL. For TLS
+/// connections, construct [`ConnectOptions`] directly with [`ConnectOptions::with_ca_cert`].
+impl From<&DBConfig> for ConnectOptions {
+    fn from(config: &DBConfig) -> Self {
+        make_connect_opts(config, SslMode::Disable, None)
+    }
 }
 
 pub(crate) async fn connect(
