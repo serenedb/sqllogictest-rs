@@ -22,6 +22,7 @@ use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_validator, trim_normalizer, update_record_with_output,
     AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner, TestError, UpdateMode,
+    SslMode,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -639,7 +640,7 @@ async fn create_task(
     config: DBConfig,
     job_tx: mpsc::Sender<TestJob>,
 ) -> Result<()> {
-    let mut db = engines::connect(&engine, &config).await?;
+    let mut db = engines::connect(&engine, &config, SslMode::Disable, None).await?;
 
     for (db_name, filename) in tests {
         let query = format!("CREATE DATABASE {db_name};");
@@ -726,7 +727,7 @@ async fn drop_task(
     const MAX_RETRIES: usize = 1;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-    let mut db = engines::connect(&engine, &config).await?;
+    let mut db = engines::connect(&engine, &config, SslMode::Disable, None).await?;
 
     while let Some(message) = drop_rx.recv().await {
         match message {
@@ -791,7 +792,7 @@ async fn drop_database_with_retry(
                     );
                     tokio::time::sleep(retry_delay).await;
 
-                    match engines::connect(engine, config).await {
+                    match engines::connect(engine, config, SslMode::Disable, None).await {
                         Ok(new_db) => {
                             *db = new_db;
                             continue;
@@ -885,7 +886,7 @@ async fn update_test_files(
     keep_db_on_failure: bool,
     labels: Vec<String>,
 ) -> Result<()> {
-    let mut db = engines::connect(engine, &config).await?;
+    let mut db = engines::connect(engine, &config, SslMode::Disable, None).await?;
     let test_databases = if jobs.is_some() {
         test_db_names(files)?
     } else {
@@ -920,7 +921,7 @@ async fn update_test_files(
             let failed_dbs = failed_dbs.clone();
             let labels = &labels;
             async move {
-                let mut runner = Runner::new(|| engines::connect(engine, &config));
+                let mut runner = Runner::new(|_ssl_mode, _port| engines::connect(engine, &config, SslMode::Disable, None));
                 for label in labels {
                     runner.add_label(label);
                 }
@@ -1096,7 +1097,7 @@ async fn connect_and_run_test_file(
     // Hold until the current test is finished or cancelled.
     let _running = RUNNING_TESTS.read().await;
 
-    let mut runner = Runner::new(|| engines::connect(engine, &config));
+    let mut runner = Runner::new(|_ssl_mode, _port| engines::connect(engine, &config, SslMode::Disable, None));
     for label in labels {
         runner.add_label(label);
     }
