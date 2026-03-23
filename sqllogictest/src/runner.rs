@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 use crate::parser::*;
 use crate::substitution::Substitution;
-use crate::{ColumnType, Connections, MakeConnection};
+use crate::{ColumnType, Connections, MakeConnection, SslMode};
 
 /// Type-erased error type.
 type AnyError = Arc<dyn std::error::Error + Send + Sync>;
@@ -1648,7 +1648,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         &mut self,
         glob: &str,
         hosts: Vec<String>,
-        conn_builder: fn(String, String) -> Fut,
+        conn_builder: fn(String, String, SslMode, Option<u16>) -> Fut,
         jobs: usize,
     ) -> Result<(), ParallelTestError>
     where
@@ -1679,8 +1679,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             locals.set_var("__DATABASE__".to_owned(), db_name.clone());
 
             let mut tester = Runner {
-                conn: Connections::new(move || {
-                    conn_builder(target.clone(), db_name.clone()).map(Ok)
+                conn: Connections::new(move |ssl_mode: SslMode, port: Option<u16>| {
+                    conn_builder(target.clone(), db_name.clone(), ssl_mode, port).map(Ok)
                 }),
                 validator: self.validator,
                 normalizer: self.normalizer,
@@ -1719,7 +1719,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         &mut self,
         glob: &str,
         hosts: Vec<String>,
-        conn_builder: fn(String, String) -> Fut,
+        conn_builder: fn(String, String, SslMode, Option<u16>) -> Fut,
         jobs: usize,
     ) -> Result<(), ParallelTestError>
     where

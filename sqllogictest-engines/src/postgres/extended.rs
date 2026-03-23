@@ -292,7 +292,7 @@ macro_rules! array_process {
                     match v {
                         Some(v) => {
                             let sql = format!("select ($1::{})::varchar", stringify!($ty_name));
-                            let tmp_rows = $self.client().query(&sql, &[&v]).await.unwrap();
+                            let tmp_rows = $self.client()?.query(&sql, &[&v]).await.unwrap();
                             let value: &str = tmp_rows.get(0).unwrap().get(0);
                             assert!(value.len() > 0);
                             data.push(Some(value.to_string()));
@@ -351,7 +351,7 @@ macro_rules! single_process {
         match value {
             Some(value) => {
                 let sql = format!("select ($1::{})::varchar", stringify!($ty_name));
-                let tmp_rows = $self.client().query(&sql, &[&value]).await.unwrap();
+                let tmp_rows = $self.client()?.query(&sql, &[&value]).await.unwrap();
                 let value: &str = tmp_rows.get(0).unwrap().get(0);
                 assert!(value.len() > 0);
                 $row_vec.push(placeholder_if_empty(value.to_string()));
@@ -413,9 +413,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>> {
         let mut output = vec![];
 
-        let stmt = self.client().prepare(sql).await?;
+        let stmt = self.client()?.prepare(sql).await?;
         let rows = self
-            .client()
+            .client()?
             .query_raw(&stmt, std::iter::empty::<&(dyn ToSql + Sync)>())
             .await?;
 
