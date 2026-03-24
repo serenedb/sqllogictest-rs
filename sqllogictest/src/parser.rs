@@ -410,7 +410,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 }
             },
             Record::Connection(conn) => {
-                if let Connection::Named { name, ssl_mode, port } = conn {
+                if let Connection::Named {
+                    name,
+                    ssl_mode,
+                    port,
+                } = conn
+                {
                     write!(f, "connection {name}")?;
                     // Only emit sslmode when non-default so existing .slt files
                     // round-trip without change.
@@ -680,21 +685,20 @@ impl SslMode {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "disable" => Some(Self::Disable),
-            "prefer"  => Some(Self::Prefer),
+            "prefer" => Some(Self::Prefer),
             "require" => Some(Self::Require),
-            _         => None,
+            _ => None,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Disable => "disable",
-            Self::Prefer  => "prefer",
+            Self::Prefer => "prefer",
             Self::Require => "require",
         }
     }
 }
-
 
 #[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
 pub enum DBPort {
@@ -707,15 +711,15 @@ impl DBPort {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "plain" => Some(Self::Plain),
-            "ssl"  => Some(Self::Ssl),
-            _         => None,
+            "ssl" => Some(Self::Ssl),
+            _ => None,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Plain => "plain",
-            Self::Ssl  => "ssl",
+            Self::Ssl => "ssl",
         }
     }
 }

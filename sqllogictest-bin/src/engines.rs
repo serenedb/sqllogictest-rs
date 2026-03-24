@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::ValueEnum;
+use sqllogictest::parser::{DBPort, SslMode};
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 use sqllogictest_engines::external::ExternalDriver;
 use sqllogictest_engines::mysql::{MySql, MySqlConfig};
+use sqllogictest_engines::postgres::to_pg_ssl_mode;
 use sqllogictest_engines::postgres::{PostgresConfig, PostgresExtended, PostgresSimple};
 use tokio::process::Command;
-use sqllogictest_engines::postgres::to_pg_ssl_mode;
-use sqllogictest::parser::{SslMode, DBPort};
 
 use super::{DBConfig, Result};
 
@@ -47,9 +47,17 @@ impl From<&DBConfig> for MySqlConfig {
     }
 }
 
-fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port_override: DBPort) -> PostgresConfig {
+fn make_connect_opts(
+    config: &DBConfig,
+    ssl_mode: SslMode,
+    port_override: DBPort,
+) -> PostgresConfig {
     let (host, port) = config.random_addr();
-    let port = if port_override == DBPort::Ssl && config.ssl_port != 0  { config.ssl_port } else {port};
+    let port = if port_override == DBPort::Ssl && config.ssl_port != 0 {
+        config.ssl_port
+    } else {
+        port
+    };
 
     let mut pg_config = PostgresConfig::new();
     pg_config

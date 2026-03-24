@@ -22,8 +22,8 @@ use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_validator, trim_normalizer, update_record_with_output,
-    AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner, TestError, UpdateMode,
-    SslMode, DBPort,
+    AsyncDB, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode, TestError,
+    UpdateMode,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -666,7 +666,6 @@ async fn create_task(
     config: DBConfig,
     job_tx: mpsc::Sender<TestJob>,
 ) -> Result<()> {
-
     let mut db = engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain).await?;
 
     for (db_name, filename) in tests {
@@ -946,7 +945,8 @@ async fn update_test_files(
             let failed_dbs = failed_dbs.clone();
             let labels = &labels;
             async move {
-                let mut runner = Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
+                let mut runner =
+                    Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
                 for label in labels {
                     runner.add_label(label);
                 }
@@ -1121,7 +1121,8 @@ async fn connect_and_run_test_file(
 
     // Hold until the current test is finished or cancelled.
     let _running = RUNNING_TESTS.read().await;
-    let mut runner = Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
+    let mut runner =
+        Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
     for label in labels {
         runner.add_label(label);
     }

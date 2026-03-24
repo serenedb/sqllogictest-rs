@@ -1,14 +1,14 @@
 mod error;
 mod extended;
 mod simple;
-use std::sync::Arc;
-use std::marker::PhantomData;
-use tokio::task::JoinHandle;
-use tokio_postgres::config::SslMode;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::*;
 use rustls::DigitallySignedStruct;
 use rustls::SignatureScheme;
-use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
+use std::marker::PhantomData;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tokio_postgres::config::SslMode;
 
 type Result<T> = std::result::Result<T, error::PgDriverError>;
 
@@ -26,7 +26,7 @@ impl sealed::Protocol for Extended {}
 pub fn to_pg_ssl_mode(mode: sqllogictest::SslMode) -> tokio_postgres::config::SslMode {
     match mode {
         sqllogictest::SslMode::Disable => tokio_postgres::config::SslMode::Disable,
-        sqllogictest::SslMode::Prefer  => tokio_postgres::config::SslMode::Prefer,
+        sqllogictest::SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
         sqllogictest::SslMode::Require => tokio_postgres::config::SslMode::Require,
     }
 }
@@ -48,7 +48,6 @@ struct ActiveConn {
 #[derive(Debug)]
 struct NoVerification;
 
-
 impl ServerCertVerifier for NoVerification {
     fn verify_server_cert(
         &self,
@@ -61,7 +60,7 @@ impl ServerCertVerifier for NoVerification {
         Ok(ServerCertVerified::assertion())
     }
 
-       fn verify_tls12_signature(
+    fn verify_tls12_signature(
         &self,
         _message: &[u8],
         _cert: &CertificateDer<'_>,
@@ -96,13 +95,10 @@ pub type PostgresExtended = Postgres<Extended>;
 pub type PostgresConfig = tokio_postgres::Config;
 
 impl<P: sealed::Protocol> Postgres<P> {
-
     pub async fn connect(opts: PostgresConfig) -> Result<Self> {
         let (client, handle) = match opts.get_ssl_mode() {
             SslMode::Disable => Self::connect_plain(&opts).await?,
-            _ => {
-                Self::connect_tls(&opts).await?
-            }
+            _ => Self::connect_tls(&opts).await?,
         };
         Ok(Self {
             conn: Some(ActiveConn { client, handle }),
@@ -115,15 +111,17 @@ impl<P: sealed::Protocol> Postgres<P> {
     async fn connect_plain(
         config: &PostgresConfig,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
-          let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+        let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
         Ok((client, Self::spawn_connection(connection)))
     }
 
     async fn connect_tls(
         config: &PostgresConfig,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
-        let tls_config = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerification))
-        .with_no_client_auth();
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerification))
+            .with_no_client_auth();
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
         let (client, connection) = config.connect(tls).await?;
         Ok((client, Self::spawn_connection(connection)))

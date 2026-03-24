@@ -4,7 +4,7 @@ use std::future::IntoFuture;
 use futures::future::join_all;
 use futures::Future;
 
-use crate::{AsyncDB, Connection as ConnectionName, DBOutput, SslMode, DBPort};
+use crate::{AsyncDB, Connection as ConnectionName, DBOutput, DBPort, SslMode};
 
 /// Trait for making connections to an [`AsyncDB`].
 ///
