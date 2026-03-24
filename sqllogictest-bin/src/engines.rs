@@ -70,7 +70,7 @@ fn make_connect_opts(
         pg_config.options(options);
     }
     pg_config.ssl_mode(to_pg_ssl_mode(ssl_mode));
-    return pg_config;
+    pg_config
 }
 
 impl From<&DBConfig> for PostgresConfig {
