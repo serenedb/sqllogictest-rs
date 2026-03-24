@@ -817,7 +817,6 @@ async fn drop_database_with_retry(
                         attempt, max_retries
                     );
                     tokio::time::sleep(retry_delay).await;
-                    log::error!("engines::connect3");
                     match engines::connect(engine, config, SslMode::Disable, DBPort::Plain).await {
                         Ok(new_db) => {
                             *db = new_db;
