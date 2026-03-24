@@ -22,7 +22,8 @@ use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_validator, trim_normalizer, update_record_with_output,
-    AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner, TestError, UpdateMode,
+    AsyncDB, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode, TestError,
+    UpdateMode,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -98,6 +99,9 @@ struct Opt {
     /// If multiple addresses are specified, one will be chosen randomly per session.
     #[clap(short, long, default_value = "5432", env = "SLT_PORT")]
     port: Vec<u16>,
+    /// The database server port for encrypted connections.
+    #[clap(long, default_value = "0", env = "SLT_PORT_SSL")]
+    ssl_port: u16,
     /// The database name to connect.
     #[clap(short, long, default_value = "postgres", env = "SLT_DB")]
     db: String,
@@ -163,6 +167,8 @@ struct Opt {
 struct DBConfig {
     /// The database server host and port. Will randomly choose one if multiple are given.
     addrs: Vec<(String, u16)>,
+    // For now single port for encrypted connections.
+    ssl_port: u16,
     /// The database name to connect.
     db: String,
     /// The database username.
@@ -257,6 +263,7 @@ pub async fn main() -> Result<()> {
         junit,
         host,
         port,
+        ssl_port,
         db,
         user,
         pass,
@@ -356,6 +363,7 @@ pub async fn main() -> Result<()> {
 
     let config = DBConfig {
         addrs,
+        ssl_port,
         db,
         user,
         pass,
@@ -658,7 +666,7 @@ async fn create_task(
     config: DBConfig,
     job_tx: mpsc::Sender<TestJob>,
 ) -> Result<()> {
-    let mut db = engines::connect(&engine, &config).await?;
+    let mut db = engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain).await?;
 
     for (db_name, filename) in tests {
         let query = format!("CREATE DATABASE {db_name};");
@@ -744,8 +752,7 @@ async fn drop_task(
 ) -> Result<()> {
     const MAX_RETRIES: usize = 1;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
-
-    let mut db = engines::connect(&engine, &config).await?;
+    let mut db = engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain).await?;
 
     while let Some(message) = drop_rx.recv().await {
         match message {
@@ -809,8 +816,7 @@ async fn drop_database_with_retry(
                         attempt, max_retries
                     );
                     tokio::time::sleep(retry_delay).await;
-
-                    match engines::connect(engine, config).await {
+                    match engines::connect(engine, config, SslMode::Disable, DBPort::Plain).await {
                         Ok(new_db) => {
                             *db = new_db;
                             continue;
@@ -904,7 +910,7 @@ async fn update_test_files(
     keep_db_on_failure: bool,
     labels: Vec<String>,
 ) -> Result<()> {
-    let mut db = engines::connect(engine, &config).await?;
+    let mut db = engines::connect(engine, &config, SslMode::Disable, DBPort::Plain).await?;
     let test_databases = if jobs.is_some() {
         test_db_names(files)?
     } else {
@@ -939,7 +945,8 @@ async fn update_test_files(
             let failed_dbs = failed_dbs.clone();
             let labels = &labels;
             async move {
-                let mut runner = Runner::new(|| engines::connect(engine, &config));
+                let mut runner =
+                    Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
                 for label in labels {
                     runner.add_label(label);
                 }
@@ -1114,8 +1121,8 @@ async fn connect_and_run_test_file(
 
     // Hold until the current test is finished or cancelled.
     let _running = RUNNING_TESTS.read().await;
-
-    let mut runner = Runner::new(|| engines::connect(engine, &config));
+    let mut runner =
+        Runner::new(|ssl_mode, port| engines::connect(engine, &config, ssl_mode, port));
     for label in labels {
         runner.add_label(label);
     }

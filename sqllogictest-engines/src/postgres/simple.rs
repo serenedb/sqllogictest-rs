@@ -4,8 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
-use super::{Postgres, Result, Simple};
 use crate::postgres::error::PgDriverError;
+
+use super::{Postgres, Result, Simple};
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Simple> {
@@ -21,7 +22,7 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
         // and we have to follow the format given by the specific database (pg).
         // For example, postgres will output `t` as true and `f` as false,
         // thus we have to write `t`/`f` in the expected results.
-        let rows = self.client().simple_query(sql).await?;
+        let rows = self.client()?.simple_query(sql).await?;
         let mut cnt = 0;
         for row in rows {
             let mut row_vec = vec![];

@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::ValueEnum;
+use sqllogictest::parser::{DBPort, SslMode};
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 use sqllogictest_engines::external::ExternalDriver;
 use sqllogictest_engines::mysql::{MySql, MySqlConfig};
+use sqllogictest_engines::postgres::to_pg_ssl_mode;
 use sqllogictest_engines::postgres::{PostgresConfig, PostgresExtended, PostgresSimple};
 use tokio::process::Command;
 
@@ -41,33 +43,47 @@ impl From<&DBConfig> for MySqlConfig {
             "mysql://{}:{}@{}:{}/{}",
             config.user, config.pass, host, port, config.db
         );
-
         MySqlConfig::from_url(&database_url).unwrap()
     }
 }
 
+fn make_connect_opts(
+    config: &DBConfig,
+    ssl_mode: SslMode,
+    port_override: DBPort,
+) -> PostgresConfig {
+    let (host, port) = config.random_addr();
+    let port = if port_override == DBPort::Ssl && config.ssl_port != 0 {
+        config.ssl_port
+    } else {
+        port
+    };
+
+    let mut pg_config = PostgresConfig::new();
+    pg_config
+        .host(host)
+        .port(port)
+        .dbname(&config.db)
+        .user(&config.user)
+        .password(&config.pass);
+    if let Some(options) = &config.options {
+        pg_config.options(options);
+    }
+    pg_config.ssl_mode(to_pg_ssl_mode(ssl_mode));
+    pg_config
+}
+
 impl From<&DBConfig> for PostgresConfig {
     fn from(config: &DBConfig) -> Self {
-        let (host, port) = config.random_addr();
-
-        let mut pg_config = PostgresConfig::new();
-        pg_config
-            .host(host)
-            .port(port)
-            .dbname(&config.db)
-            .user(&config.user)
-            .password(&config.pass);
-        if let Some(options) = &config.options {
-            pg_config.options(options);
-        }
-
-        pg_config
+        make_connect_opts(config, SslMode::Disable, DBPort::Plain)
     }
 }
 
 pub(crate) async fn connect(
     engine: &EngineConfig,
     config: &DBConfig,
+    ssl_mode: SslMode,
+    port: DBPort,
 ) -> Result<Engines, EnginesError> {
     Ok(match engine {
         EngineConfig::MySql => Engines::MySql(
@@ -76,12 +92,12 @@ pub(crate) async fn connect(
                 .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::Postgres => Engines::Postgres(
-            PostgresSimple::connect(config.into())
+            PostgresSimple::connect(make_connect_opts(config, ssl_mode, port))
                 .await
                 .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::PostgresExtended => Engines::PostgresExtended(
-            PostgresExtended::connect(config.into())
+            PostgresExtended::connect(make_connect_opts(config, ssl_mode, port))
                 .await
                 .map_err(EnginesError::without_state)?,
         ),

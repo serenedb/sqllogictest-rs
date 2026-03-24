@@ -410,8 +410,22 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 }
             },
             Record::Connection(conn) => {
-                if let Connection::Named(conn) = conn {
-                    write!(f, "connection {}", conn)?;
+                if let Connection::Named {
+                    name,
+                    ssl_mode,
+                    port,
+                } = conn
+                {
+                    write!(f, "connection {name}")?;
+                    // Only emit sslmode when non-default so existing .slt files
+                    // round-trip without change.
+                    if !matches!(ssl_mode, SslMode::Disable) {
+                        write!(f, " sslmode={}", ssl_mode.as_str())?;
+                    }
+                    // Only emit port when explicitly set.
+                    if !matches!(port, DBPort::Plain) {
+                        write!(f, " port={}", port.as_str())?;
+                    }
                 }
                 Ok(())
             }
@@ -655,21 +669,86 @@ impl Condition {
     }
 }
 
+/// SSL mode for a named connection.
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
+pub enum SslMode {
+    /// No TLS. This is the default.
+    #[default]
+    Disable,
+    /// Attempt TLS, fall back to plain if unavailable.
+    Prefer,
+    /// Require TLS; fail if unavailable.
+    Require,
+}
+
+impl SslMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "disable" => Some(Self::Disable),
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
+pub enum DBPort {
+    #[default]
+    Plain,
+    Ssl,
+}
+
+impl DBPort {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "plain" => Some(Self::Plain),
+            "ssl" => Some(Self::Ssl),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Ssl => "ssl",
+        }
+    }
+}
+
 /// The connection to use for the following statement.
 #[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Connection {
     /// The default connection if not specified or if the name is "default".
     #[default]
     Default,
-    /// A named connection.
-    Named(String),
+    /// A named connection with an optional SSL mode and port override.
+    Named {
+        name: String,
+        /// SSL mode for this connection. Defaults to [`SslMode::Disable`].
+        ssl_mode: SslMode,
+        /// Port to use
+        port: DBPort,
+    },
 }
 
 impl Connection {
-    fn new(name: impl AsRef<str>) -> Self {
+    fn new(name: impl AsRef<str>, ssl_mode: SslMode, port: DBPort) -> Self {
         match name.as_ref() {
             "default" => Self::Default,
-            name => Self::Named(name.to_owned()),
+            name => Self::Named {
+                name: name.to_owned(),
+                ssl_mode,
+                port,
+            },
         }
     }
 }
@@ -888,8 +967,35 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 conditions.push(cond.clone());
                 records.push(Record::Condition(cond));
             }
-            ["connection", name, _rest @ ..] => {
-                let conn = Connection::new(name);
+            ["connection", name, rest @ ..] => {
+                let ssl_mode = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("sslmode="))
+                    .map(|val| {
+                        SslMode::parse(val).ok_or_else(|| {
+                            ParseErrorKind::InvalidControl(format!(
+                                "unknown sslmode value: {val:?}, expected disable | prefer | require"
+                            ))
+                            .at(loc.clone())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let port = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("port="))
+                    .map(|val| {
+                        DBPort::parse(val).ok_or_else(|| {
+                            ParseErrorKind::InvalidControl(format!(
+                                "unknown port value: {val:?}, expected plain | ssl"
+                            ))
+                            .at(loc.clone())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let conn = Connection::new(name, ssl_mode, port);
                 connection = conn.clone();
                 records.push(Record::Connection(conn));
             }

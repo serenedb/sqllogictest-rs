@@ -40,3 +40,5 @@ tokio = { workspace = true, features = [
 ] }
 tokio-postgres = { workspace = true }
 tokio-util = { workspace = true, features = ["codec"] }
+tokio-postgres-rustls   = { workspace = true }
+rustls                  = { workspace = true }
