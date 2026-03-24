@@ -3,7 +3,6 @@ mod extended;
 mod simple;
 use std::sync::Arc;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode;
 use rustls::pki_types::*;
@@ -57,17 +56,11 @@ pub fn to_pg_ssl_mode(mode: sqllogictest::SslMode) -> tokio_postgres::config::Ss
 pub struct ConnectOptions {
     /// Core tokio_postgres connection config.
     pub pg_config: PostgresConfig,
-
-    /// Path to the PEM-encoded CA certificate the server must be signed by.
-    /// When `None` and TLS is required, falls back to [`TEST_CA_CERT_PATH`].
-    /// No other CA is trusted — the server certificate must chain to exactly
-    /// this certificate.
-    pub ca_cert: Option<PathBuf>,
 }
 
 impl ConnectOptions {
     pub fn new(pg_config: PostgresConfig) -> Self {
-        Self { pg_config, ca_cert: None }
+        Self { pg_config}
     }
 }
 
@@ -171,7 +164,7 @@ impl<P: sealed::Protocol> Postgres<P> {
     async fn connect_tls(
         config: &PostgresConfig,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
-        let mut tls_config = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerification))
+        let tls_config = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerification))
         .with_no_client_auth();
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
         let (client, connection) = config.connect(tls).await?;

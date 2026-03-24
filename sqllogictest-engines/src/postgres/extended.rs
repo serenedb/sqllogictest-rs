@@ -12,7 +12,6 @@ use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
 use super::{Extended, Postgres, Result};
-use crate::postgres::error::PgDriverError;
 
 // Inspired by postgres_type::Array implementation of Display trait
 fn print_array<T: std::fmt::Display>(
