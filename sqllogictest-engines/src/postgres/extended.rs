@@ -11,8 +11,6 @@ use postgres_types::{accepts, FromSql, ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
-use crate::postgres::error::PgDriverError;
-
 use super::{Extended, Postgres, Result};
 use crate::postgres::error::PgDriverError;
 

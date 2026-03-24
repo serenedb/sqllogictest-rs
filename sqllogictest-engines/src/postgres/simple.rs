@@ -7,7 +7,7 @@ use sqllogictest::{DBOutput, DefaultColumnType};
 use crate::postgres::error::PgDriverError;
 
 use super::{Postgres, Result, Simple};
-use crate::postgres::error::PgDriverError;
+
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Simple> {
