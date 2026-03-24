@@ -10,7 +10,7 @@ use sqllogictest_engines::postgres::{PostgresConfig, PostgresExtended, PostgresS
 use tokio::process::Command;
 use sqllogictest_engines::postgres::ConnectOptions;
 use sqllogictest_engines::postgres::to_pg_ssl_mode;
-use sqllogictest::parser::{SslMode};
+use sqllogictest::parser::{SslMode, DBPort};
 
 use super::{DBConfig, Result};
 
@@ -51,12 +51,9 @@ impl From<&DBConfig> for MySqlConfig {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/// Builds a [`PostgresConfig`] from a [`DBConfig`], with an optional port override.
-/// When `port_override` is `Some`, all addresses use that port instead of the
-/// one stored in `DBConfig`.
-fn pg_config_from(config: &DBConfig, port_override: Option<u16>) -> PostgresConfig {
+fn pg_config_from(config: &DBConfig, port_override: DBPort) -> PostgresConfig {
     let (host, port) = config.random_addr();
-    let port = port_override.unwrap_or(port);
+    let port = if port_override == DBPort::Ssl && config.ssl_port != 0  { config.ssl_port } else {port};
 
     let mut pg_config = PostgresConfig::new();
     pg_config
@@ -75,21 +72,21 @@ fn pg_config_from(config: &DBConfig, port_override: Option<u16>) -> PostgresConf
 
 impl From<&DBConfig> for PostgresConfig {
     fn from(config: &DBConfig) -> Self {
-        pg_config_from(config, None)
+        pg_config_from(config, DBPort::Plain)
     }
 }
 
 
-fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port: Option<u16>) -> ConnectOptions {
+fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port: DBPort) -> ConnectOptions {
     let mut pg_config = PostgresConfig::from(config);
-    if let Some(p) = port {
+    if port == DBPort::Ssl && config.ssl_port != 0 {
         // tokio_postgres::Config doesn't allow mutating ports after construction,
         // so rebuild with the overridden port.
         let (host, _) = config.random_addr();
         pg_config = PostgresConfig::new();
         pg_config
             .host(host)
-            .port(p)
+            .port(config.ssl_port)
             .dbname(&config.db)
             .user(&config.user)
             .password(&config.pass);
@@ -97,7 +94,6 @@ fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port: Option<u16>) ->
             pg_config.options(options);
         }
     }
-    log::error!("make_connect_opts {}", ssl_mode.as_str());
     pg_config.ssl_mode(to_pg_ssl_mode(ssl_mode));
     ConnectOptions::new(pg_config)
 }
@@ -109,7 +105,7 @@ fn make_connect_opts(config: &DBConfig, ssl_mode: SslMode, port: Option<u16>) ->
 /// connections, construct [`ConnectOptions`] directly with [`ConnectOptions::with_ca_cert`].
 impl From<&DBConfig> for ConnectOptions {
     fn from(config: &DBConfig) -> Self {
-        make_connect_opts(config, SslMode::Disable, None)
+        make_connect_opts(config, SslMode::Disable, DBPort::Plain)
     }
 }
 
@@ -117,7 +113,7 @@ pub(crate) async fn connect(
     engine: &EngineConfig,
     config: &DBConfig,
     ssl_mode: SslMode,
-    port: Option<u16>,
+    port: DBPort,
 ) -> Result<Engines, EnginesError> {
     Ok(match engine {
         EngineConfig::MySql => Engines::MySql(

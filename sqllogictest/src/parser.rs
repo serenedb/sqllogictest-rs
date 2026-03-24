@@ -418,8 +418,8 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                         write!(f, " sslmode={}", ssl_mode.as_str())?;
                     }
                     // Only emit port when explicitly set.
-                    if let Some(port) = port {
-                        write!(f, " port={port}")?;
+                    if !matches!(port, DBPort::Plain) {
+                        write!(f, " port={}", port.as_str())?;
                     }
                 }
                 Ok(())
@@ -695,6 +695,31 @@ impl SslMode {
     }
 }
 
+
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
+pub enum DBPort {
+    #[default]
+    Plain,
+    Ssl,
+}
+
+impl DBPort {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "plain" => Some(Self::Plain),
+            "ssl"  => Some(Self::Ssl),
+            _         => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Ssl  => "ssl",
+        }
+    }
+}
+
 /// The connection to use for the following statement.
 #[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Connection {
@@ -706,13 +731,13 @@ pub enum Connection {
         name: String,
         /// SSL mode for this connection. Defaults to [`SslMode::Disable`].
         ssl_mode: SslMode,
-        /// When `Some`, overrides the port from the runner's [`DBConfig`].
-        port: Option<u16>,
+        /// Port to use
+        port: DBPort,
     },
 }
 
 impl Connection {
-    fn new(name: impl AsRef<str>, ssl_mode: SslMode, port: Option<u16>) -> Self {
+    fn new(name: impl AsRef<str>, ssl_mode: SslMode, port: DBPort) -> Self {
         match name.as_ref() {
             "default" => Self::Default,
             name => Self::Named {
@@ -957,13 +982,15 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     .iter()
                     .find_map(|token| token.strip_prefix("port="))
                     .map(|val| {
-                        val.parse::<u16>().map_err(|_| {
-                            ParseErrorKind::InvalidNumber(val.to_string()).at(loc.clone())
+                        DBPort::from_str(val).ok_or_else(|| {
+                            ParseErrorKind::InvalidControl(format!(
+                                "unknown port value: {val:?}, expected plain | ssl"
+                            ))
+                            .at(loc.clone())
                         })
                     })
-                    .transpose()?;
-                let ssl_mode_str = ssl_mode.as_str();
-                log::error!("Spawning custom connection {name} {ssl_mode_str}");        
+                    .transpose()?
+                    .unwrap_or_default();
                 let conn = Connection::new(name, ssl_mode, port);
                 connection = conn.clone();
                 records.push(Record::Connection(conn));

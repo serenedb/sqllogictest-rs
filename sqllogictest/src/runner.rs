@@ -1648,7 +1648,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         &mut self,
         glob: &str,
         hosts: Vec<String>,
-        conn_builder: fn(String, String, SslMode, Option<u16>) -> Fut,
+        conn_builder: fn(String, String, SslMode, DBPort) -> Fut,
         jobs: usize,
     ) -> Result<(), ParallelTestError>
     where
@@ -1679,7 +1679,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             locals.set_var("__DATABASE__".to_owned(), db_name.clone());
 
             let mut tester = Runner {
-                conn: Connections::new(move |ssl_mode: SslMode, port: Option<u16>| {
+                conn: Connections::new(move |ssl_mode: SslMode, port: DBPort| {
                     conn_builder(target.clone(), db_name.clone(), ssl_mode, port).map(Ok)
                 }),
                 validator: self.validator,
@@ -1719,7 +1719,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         &mut self,
         glob: &str,
         hosts: Vec<String>,
-        conn_builder: fn(String, String, SslMode, Option<u16>) -> Fut,
+        conn_builder: fn(String, String, SslMode, DBPort) -> Fut,
         jobs: usize,
     ) -> Result<(), ParallelTestError>
     where
