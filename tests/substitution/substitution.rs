@@ -1,5 +1,6 @@
 use rusty_fork::rusty_fork_test;
-use sqllogictest::{substitution::well_known, DBOutput, DefaultColumnType};
+use sqllogictest::substitution::well_known;
+use sqllogictest::{DBOutput, DefaultColumnType};
 
 pub struct FakeDB;
 

@@ -13,9 +13,9 @@ name = "sqllogictest"
 path = "src/main.rs"
 
 [dependencies]
-sqllogictest = { path = "../sqllogictest", version = "0.28" }
-sqllogictest-engines = { path = "../sqllogictest-engines", version = "0.28" }
-log = {workspace = true}
+sqllogictest = { path = "../sqllogictest", version = "0.29" }
+sqllogictest-engines = { path = "../sqllogictest-engines", version = "0.29" }
+
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
@@ -24,6 +24,7 @@ console = { workspace = true }
 easy-ext = { workspace = true }
 fs-err = { workspace = true }
 futures = { workspace = true, default-features = false }
+fancy-regex = { workspace = true }
 glob = { workspace = true }
 itertools = { workspace = true }
 quick-junit = { workspace = true }
