@@ -34,14 +34,6 @@ pub fn to_pg_ssl_mode(mode: sqllogictest::SslMode) -> tokio_postgres::config::Ss
 
 // ── ConnectOptions ─────────────────────────────────────────────────────────
 
-/// Path to the self-signed CA certificate used for TLS in tests.
-/// Resolved at runtime from the `RESOURCES` environment variable.
-fn test_ca_cert_path() -> PathBuf {
-    let resources = std::env::var("RESOURCES")
-        .expect("RESOURCES environment variable must be set");
-    PathBuf::from(resources).join("ca.pem")
-}
-
 /// All options needed to establish a Postgres connection.
 ///
 /// # Examples
@@ -76,13 +68,6 @@ pub struct ConnectOptions {
 impl ConnectOptions {
     pub fn new(pg_config: PostgresConfig) -> Self {
         Self { pg_config, ca_cert: None }
-    }
-
-    /// Overrides the CA certificate path. Useful when the test CA is not in
-    /// the default location. Has no effect when `sslmode=disable`.
-    pub fn with_ca_cert(mut self, path: impl AsRef<Path>) -> Self {
-        self.ca_cert = Some(path.as_ref().to_path_buf());
-        self
     }
 }
 
@@ -165,11 +150,7 @@ impl<P: sealed::Protocol> Postgres<P> {
         let (client, handle) = match opts.pg_config.get_ssl_mode() {
             SslMode::Disable => Self::connect_plain(&opts.pg_config).await?,
             _ => {
-                // Use the explicitly provided CA path, or fall back to the
-                // path derived from the RESOURCES environment variable.
-                let default_ca = test_ca_cert_path();
-                let ca_path = opts.ca_cert.as_deref().unwrap_or(&default_ca);
-                Self::connect_tls(&opts.pg_config, ca_path).await?
+                Self::connect_tls(&opts.pg_config).await?
             }
         };
         Ok(Self {
@@ -189,42 +170,12 @@ impl<P: sealed::Protocol> Postgres<P> {
 
     async fn connect_tls(
         config: &PostgresConfig,
-        ca_path: &Path,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
-        let roots = Self::load_ca_cert(ca_path)?;
-        let mut tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        tls_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerification));
+        let mut tls_config = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerification))
+        .with_no_client_auth();
         let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
         let (client, connection) = config.connect(tls).await?;
         Ok((client, Self::spawn_connection(connection)))
-    }
-
-    /// Builds a root store containing *only* the provided PEM CA certificate.
-    /// No platform roots are loaded — the server must present a certificate
-    /// signed by exactly this CA.
-    fn load_ca_cert(ca_path: &Path) -> Result<rustls::RootCertStore> {
-        let pem = std::fs::read(ca_path)
-            .map_err(|e| error::PgDriverError::ca_cert_read(ca_path, &e))?;
-
-        let mut cursor = std::io::Cursor::new(pem);
-        let certs = rustls_pemfile::certs(&mut cursor)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| error::PgDriverError::ca_cert_parse(ca_path, &e))?;
-
-        if certs.is_empty() {
-            return Err(error::PgDriverError::ca_cert_empty(ca_path));
-        }
-
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in certs {
-            roots.add(cert)
-                .map_err(|e| error::PgDriverError::ca_cert_invalid(ca_path, &e))?;
-        }
-        Ok(roots)
     }
 
     fn spawn_connection<C>(connection: C) -> JoinHandle<()>
