@@ -682,7 +682,7 @@ pub enum SslMode {
 }
 
 impl SslMode {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "disable" => Some(Self::Disable),
             "prefer" => Some(Self::Prefer),
@@ -708,7 +708,7 @@ pub enum DBPort {
 }
 
 impl DBPort {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "plain" => Some(Self::Plain),
             "ssl" => Some(Self::Ssl),
@@ -972,7 +972,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     .iter()
                     .find_map(|token| token.strip_prefix("sslmode="))
                     .map(|val| {
-                        SslMode::from_str(val).ok_or_else(|| {
+                        SslMode::parse(val).ok_or_else(|| {
                             ParseErrorKind::InvalidControl(format!(
                                 "unknown sslmode value: {val:?}, expected disable | prefer | require"
                             ))
@@ -986,7 +986,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     .iter()
                     .find_map(|token| token.strip_prefix("port="))
                     .map(|val| {
-                        DBPort::from_str(val).ok_or_else(|| {
+                        DBPort::parse(val).ok_or_else(|| {
                             ParseErrorKind::InvalidControl(format!(
                                 "unknown port value: {val:?}, expected plain | ssl"
                             ))
