@@ -162,7 +162,6 @@ impl<P: sealed::Protocol> Postgres<P> {
     /// Returns [`PgDriverError::CaCertRequired`] if `sslmode` is not
     /// `disable` and no `ca_cert` path was provided.
     pub async fn connect(opts: ConnectOptions) -> Result<Self> {
-        log::error!("Postgresql async connect");
         let (client, handle) = match opts.pg_config.get_ssl_mode() {
             SslMode::Disable => Self::connect_plain(&opts.pg_config).await?,
             _ => {
@@ -184,8 +183,7 @@ impl<P: sealed::Protocol> Postgres<P> {
     async fn connect_plain(
         config: &PostgresConfig,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
-        log::error!("Connecting plain");
-        let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
+          let (client, connection) = config.connect(tokio_postgres::NoTls).await?;
         Ok((client, Self::spawn_connection(connection)))
     }
 
@@ -193,7 +191,6 @@ impl<P: sealed::Protocol> Postgres<P> {
         config: &PostgresConfig,
         ca_path: &Path,
     ) -> Result<(tokio_postgres::Client, JoinHandle<()>)> {
-        log::error!("Connecting tls");
         let roots = Self::load_ca_cert(ca_path)?;
         let mut tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)

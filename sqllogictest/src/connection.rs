@@ -4,7 +4,7 @@ use std::future::IntoFuture;
 use futures::future::join_all;
 use futures::Future;
 
-use crate::{AsyncDB, Connection as ConnectionName, DBOutput, SslMode};
+use crate::{AsyncDB, Connection as ConnectionName, DBOutput, SslMode, DBPort};
 
 /// Trait for making connections to an [`AsyncDB`].
 ///
@@ -18,7 +18,7 @@ pub trait MakeConnection {
 
     /// Creates a new connection to the database using the given [`SslMode`]
     /// and optional port override.
-    fn make(&mut self, ssl_mode: SslMode, port: Option<u16>) -> Self::MakeFuture;
+    fn make(&mut self, ssl_mode: SslMode, port: DBPort) -> Self::MakeFuture;
 }
 
 /// Make connections directly from a closure returning a future.
@@ -27,13 +27,13 @@ pub trait MakeConnection {
 /// can configure TLS and routing per connection.
 impl<D: AsyncDB, F, Fut> MakeConnection for F
 where
-    F: FnMut(SslMode, Option<u16>) -> Fut,
+    F: FnMut(SslMode, DBPort) -> Fut,
     Fut: IntoFuture<Output = Result<D, D::Error>>,
 {
     type Conn = D;
     type MakeFuture = Fut::IntoFuture;
 
-    fn make(&mut self, ssl_mode: SslMode, port: Option<u16>) -> Self::MakeFuture {
+    fn make(&mut self, ssl_mode: SslMode, port: DBPort) -> Self::MakeFuture {
         self(ssl_mode, port).into_future()
     }
 }
@@ -62,14 +62,13 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
 
         // Extract ssl_mode and port before moving `name` into the entry API.
         let (ssl_mode, port) = match &name {
-            ConnectionName::Named { ssl_mode, port, .. } => (ssl_mode.clone(), *port),
-            ConnectionName::Default => (SslMode::Disable, None),
+            ConnectionName::Named { ssl_mode, port, .. } => (ssl_mode.clone(), port.clone()),
+            ConnectionName::Default => (SslMode::Disable, DBPort::Plain),
         };
 
         let conn = match self.conns.entry(name) {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => {
-                log::error!("Making custom connection {}", ssl_mode.as_str());
                 let conn = self.make_conn.make(ssl_mode, port).await?;
                 v.insert(conn)
             }
