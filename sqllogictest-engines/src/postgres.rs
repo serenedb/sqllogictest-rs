@@ -31,39 +31,6 @@ pub fn to_pg_ssl_mode(mode: sqllogictest::SslMode) -> tokio_postgres::config::Ss
     }
 }
 
-// ── ConnectOptions ─────────────────────────────────────────────────────────
-
-/// All options needed to establish a Postgres connection.
-///
-/// # Examples
-///
-/// Plain connection (no TLS):
-/// ```rust
-/// let opts = ConnectOptions::new(config); // sslmode=disable
-/// ```
-///
-/// TLS using the built-in test CA certificate:
-/// ```rust
-/// let opts = ConnectOptions::new(config.ssl_mode(SslMode::Require));
-/// // ca.pem is loaded automatically from resources/ca.pem
-/// ```
-///
-/// TLS with a custom CA certificate path (overrides the default):
-/// ```rust
-/// let opts = ConnectOptions::new(config.ssl_mode(SslMode::Require))
-///     .with_ca_cert("/custom/path/ca.pem");
-/// ```
-pub struct ConnectOptions {
-    /// Core tokio_postgres connection config.
-    pub pg_config: PostgresConfig,
-}
-
-impl ConnectOptions {
-    pub fn new(pg_config: PostgresConfig) -> Self {
-        Self { pg_config}
-    }
-}
-
 // ── Postgres<P> ────────────────────────────────────────────────────────────
 
 /// Generic Postgres engine based on the client from [`tokio_postgres`].
@@ -129,21 +96,12 @@ pub type PostgresExtended = Postgres<Extended>;
 pub type PostgresConfig = tokio_postgres::Config;
 
 impl<P: sealed::Protocol> Postgres<P> {
-    /// Connects using the given [`ConnectOptions`].
-    ///
-    /// | sslmode   | `ca_cert` required? | behaviour                        |
-    /// |-----------|---------------------|----------------------------------|
-    /// | `disable` | no (ignored)        | plain TCP, no TLS                |
-    /// | `prefer`  | yes                 | TLS with strict CA verification  |
-    /// | `require` | yes                 | TLS mandatory, strict CA         |
-    ///
-    /// Returns [`PgDriverError::CaCertRequired`] if `sslmode` is not
-    /// `disable` and no `ca_cert` path was provided.
-    pub async fn connect(opts: ConnectOptions) -> Result<Self> {
-        let (client, handle) = match opts.pg_config.get_ssl_mode() {
-            SslMode::Disable => Self::connect_plain(&opts.pg_config).await?,
+
+    pub async fn connect(opts: PostgresConfig) -> Result<Self> {
+        let (client, handle) = match opts.get_ssl_mode() {
+            SslMode::Disable => Self::connect_plain(&opts).await?,
             _ => {
-                Self::connect_tls(&opts.pg_config).await?
+                Self::connect_tls(&opts).await?
             }
         };
         Ok(Self {
