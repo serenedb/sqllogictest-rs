@@ -25,6 +25,17 @@ use crate::{ColumnType, Connections, MakeConnection, SslMode};
 /// Type-erased error type.
 type AnyError = Arc<dyn std::error::Error + Send + Sync>;
 
+/// Internal result type for query execution.
+enum QueryResult<T: ColumnType> {
+    Rows {
+        types: Vec<T>,
+        rows: Vec<Vec<String>>,
+    },
+    StatementComplete(u64),
+    Skipped,
+    Err(AnyError),
+}
+
 /// Output of a record.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -46,6 +57,25 @@ pub enum RecordOutput<T: ColumnType> {
         stdout: Option<String>,
         error: Option<AnyError>,
     },
+    /// The output of a `let` record.
+    #[non_exhaustive]
+    Let {
+        /// The values from the query result (if successful).
+        values: Vec<String>,
+        error: Option<LetError>,
+    },
+}
+
+/// Error type for `let` record execution.
+#[derive(thiserror::Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum LetError {
+    #[error("{0}")]
+    Fail(AnyError),
+    #[error("expected 1 row, got {actual}")]
+    RowCountMismatch { actual: usize },
+    #[error("expected {expected} columns, got {actual}")]
+    ColumnCountMismatch { expected: usize, actual: usize },
 }
 
 #[non_exhaustive]
@@ -98,6 +128,11 @@ pub trait AsyncDB {
     async fn run_command(mut command: Command) -> std::io::Result<std::process::Output> {
         command.output()
     }
+
+    /// Extract the SQL state from the error.
+    fn error_sql_state(_err: &Self::Error) -> Option<String> {
+        None
+    }
 }
 
 /// The database to be tested.
@@ -116,6 +151,11 @@ pub trait DB {
     /// Engine name of current database.
     fn engine_name(&self) -> &str {
         ""
+    }
+
+    /// Extract the SQL state from the error.
+    fn error_sql_state(_err: &Self::Error) -> Option<String> {
+        None
     }
 }
 
@@ -139,6 +179,10 @@ where
     fn engine_name(&self) -> &str {
         D::engine_name(self)
     }
+
+    fn error_sql_state(err: &Self::Error) -> Option<String> {
+        D::error_sql_state(err)
+    }
 }
 
 /// The error type for running sqllogictest.
@@ -147,7 +191,7 @@ where
 #[derive(thiserror::Error, Clone)]
 #[error("{kind}\nat {loc}\n")]
 pub struct TestError {
-    kind: TestErrorKind,
+    kind: Box<TestErrorKind>,
     loc: Location,
 }
 
@@ -172,7 +216,7 @@ impl TestError {
         }
 
         TestError {
-            kind: TestErrorKind::CompositeMismatch { kinds: reasons },
+            kind: Box::new(TestErrorKind::CompositeMismatch { kinds: reasons }),
             loc: Arc::as_ref(chain.as_ref().expect("Locations are not empty")).clone(),
         }
     }
@@ -248,7 +292,7 @@ impl std::fmt::Debug for TestError {
 impl TestError {
     /// Returns the corresponding [`TestErrorKind`] for this error.
     pub fn kind(&self) -> TestErrorKind {
-        self.kind.clone()
+        *self.kind.clone()
     }
 
     /// Returns the location from which the error originated.
@@ -300,12 +344,14 @@ pub enum TestErrorKind {
         actual_stdout: String,
     },
     // Remember to also update [`TestErrorKindDisplay`] if this message is changed.
-    #[error("{kind} is expected to fail with error:\n\t{expected_err}\nbut got error:\n\t{err}\n[SQL] {sql}")]
+    #[error("{kind} is expected to fail with error:\n\t{expected_err}\nbut got error:\n\t{}{err}\n[SQL] {sql}", .actual_sqlstate.as_ref().map(|s| format!("(sqlstate {s}) ")).unwrap_or_default())]
     ErrorMismatch {
         sql: String,
         err: AnyError,
         expected_err: String,
         kind: RecordKind,
+        /// The actual SQL state when the expected error was a SqlState type
+        actual_sqlstate: Option<String>,
     },
     #[error("statement is expected to affect {expected} rows, but actually {actual}\n[SQL] {sql}")]
     StatementResultMismatch {
@@ -336,12 +382,14 @@ pub enum TestErrorKind {
     CompositeMismatch { kinds: Vec<TestErrorKind> },
     #[error("retry configuration substitution failed: {variable}\n{err}")]
     RetrySubstitutionFailure { variable: String, err: AnyError },
+    #[error("let failed: {err}\n[SQL] {sql}")]
+    LetFail { sql: String, err: LetError },
 }
 
 impl From<ParseError> for TestError {
     fn from(e: ParseError) -> Self {
         TestError {
-            kind: TestErrorKind::ParseError(e.kind()),
+            kind: TestErrorKind::ParseError(e.kind()).into(),
             loc: e.location(),
         }
     }
@@ -349,7 +397,10 @@ impl From<ParseError> for TestError {
 
 impl TestErrorKind {
     fn at(self, loc: Location) -> TestError {
-        TestError { kind: self, loc }
+        TestError {
+            kind: self.into(),
+            loc,
+        }
     }
 
     pub fn display(&self, colorize: bool) -> TestErrorKindDisplay<'_> {
@@ -377,12 +428,16 @@ impl Display for TestErrorKindDisplay<'_> {
                 err,
                 expected_err,
                 kind,
-            } => write!(
-                f,
-                "{kind} is expected to fail with error:\n\t{}\nbut got error:\n\t{}\n[SQL] {sql}",
-                expected_err.bright_green(),
-                err.bright_red(),
-            ),
+                actual_sqlstate,
+            } => {
+                write!(
+                    f,
+                    "{kind} is expected to fail with error:\n\t{}\nbut got error:\n\t{}{}\n[SQL] {sql}",
+                    expected_err.bright_green(),
+                    actual_sqlstate.as_ref().map(|s| format!("(sqlstate {s}) ")).unwrap_or_default(),
+                    err.bright_red(),
+                )
+            }
             TestErrorKind::QueryResultMismatch {
                 sql,
                 expected,
@@ -536,7 +591,8 @@ pub fn default_validator(
     // If ignore marker present, perform fragment-based matching on the full snapshot.
     if contains_ignore_marker {
         // If ignore marker present, perform fragment-based matching on the full snapshot.
-        // The actual results might contain \n, and may not be a normal "row", which is not suitable to normalize.
+        // The actual results might contain \n, and may not be a normal "row", which is not suitable
+        // to normalize.
         let expected_results = expected;
         let actual_rows = actual
             .iter()
@@ -754,6 +810,35 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         self.hash_threshold = hash_threshold;
     }
 
+    /// Helper to run a SQL query with common setup (substitution, connection, skip check).
+    async fn run_query_inner(
+        &mut self,
+        sql: &str,
+        connection: Connection,
+        conditions: &[Condition],
+        should_skip: &impl Fn(&HashSet<String>, &str, &[Condition]) -> bool,
+    ) -> QueryResult<D::ColumnType> {
+        let sql = match self.may_substitute(sql.to_string(), true) {
+            Ok(sql) => sql,
+            Err(error) => return QueryResult::Err(error),
+        };
+
+        let conn = match self.conn.get(connection).await {
+            Ok(conn) => conn,
+            Err(e) => return QueryResult::Err(Arc::new(e)),
+        };
+
+        if should_skip(&self.labels, conn.engine_name(), conditions) {
+            return QueryResult::Skipped;
+        }
+
+        match conn.run(&sql).await {
+            Ok(DBOutput::Rows { types, rows }) => QueryResult::Rows { types, rows },
+            Ok(DBOutput::StatementComplete(count)) => QueryResult::StatementComplete(count),
+            Err(e) => QueryResult::Err(Arc::new(e)),
+        }
+    }
+
     pub async fn apply_record(
         &mut self,
         record: Record<D::ColumnType>,
@@ -936,41 +1021,18 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 loc: _,
                 retry: _,
             } => {
-                let sql = match self.may_substitute(sql, true) {
-                    Ok(sql) => sql,
-                    Err(error) => {
-                        return RecordOutput::Query {
-                            error: Some(error),
-                            types: vec![],
-                            rows: vec![],
-                        }
+                let (types, mut rows) = match self
+                    .run_query_inner(&sql, connection, &conditions, &should_skip)
+                    .await
+                {
+                    QueryResult::Rows { types, rows } => (types, rows),
+                    QueryResult::StatementComplete(count) => {
+                        return RecordOutput::Statement { count, error: None };
                     }
-                };
-
-                let conn = match self.conn.get(connection).await {
-                    Ok(conn) => conn,
-                    Err(e) => {
+                    QueryResult::Skipped => return RecordOutput::Nothing,
+                    QueryResult::Err(e) => {
                         return RecordOutput::Query {
-                            error: Some(Arc::new(e)),
-                            types: vec![],
-                            rows: vec![],
-                        }
-                    }
-                };
-                if should_skip(&self.labels, conn.engine_name(), &conditions) {
-                    return RecordOutput::Nothing;
-                }
-
-                let (types, mut rows) = match conn.run(&sql).await {
-                    Ok(out) => match out {
-                        DBOutput::Rows { types, rows } => (types, rows),
-                        DBOutput::StatementComplete(count) => {
-                            return RecordOutput::Statement { count, error: None };
-                        }
-                    },
-                    Err(e) => {
-                        return RecordOutput::Query {
-                            error: Some(Arc::new(e)),
+                            error: Some(e),
                             types: vec![],
                             rows: vec![],
                         };
@@ -1091,6 +1153,67 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             Record::Halt { loc: _ } => {
                 tracing::error!("halt record encountered. It's likely a bug of the runtime.");
                 RecordOutput::Nothing
+            }
+            Record::Let {
+                conditions,
+                connection,
+                variables,
+                sql,
+                loc: _,
+            } => {
+                let rows = match self
+                    .run_query_inner(&sql, connection, &conditions, &should_skip)
+                    .await
+                {
+                    QueryResult::Rows { rows, .. } => rows,
+                    QueryResult::StatementComplete(_) => {
+                        #[derive(thiserror::Error, Debug)]
+                        #[error("expected query result, got statement completion")]
+                        struct NotAQueryError;
+
+                        return RecordOutput::Let {
+                            values: vec![],
+                            error: Some(LetError::Fail(Arc::new(NotAQueryError))),
+                        };
+                    }
+                    QueryResult::Skipped => return RecordOutput::Nothing,
+                    QueryResult::Err(e) => {
+                        return RecordOutput::Let {
+                            values: vec![],
+                            error: Some(LetError::Fail(e)),
+                        };
+                    }
+                };
+
+                // Check row count: must be exactly 1
+                if rows.len() != 1 {
+                    return RecordOutput::Let {
+                        values: vec![],
+                        error: Some(LetError::RowCountMismatch { actual: rows.len() }),
+                    };
+                }
+
+                let row = &rows[0];
+                // Check column count: must match variable count
+                if row.len() != variables.len() {
+                    return RecordOutput::Let {
+                        values: vec![],
+                        error: Some(LetError::ColumnCountMismatch {
+                            expected: variables.len(),
+                            actual: row.len(),
+                        }),
+                    };
+                }
+
+                // Set variables in locals
+                for (var, value) in variables.iter().zip(row.iter()) {
+                    self.locals.set_var(var.clone(), value.clone());
+                }
+
+                RecordOutput::Let {
+                    values: row.clone(),
+                    error: None,
+                }
             }
             Record::Include { .. }
             | Record::Newline
@@ -1278,12 +1401,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 }
                 (None, StatementExpect::Ok) => {}
                 (Some(e), StatementExpect::Error(expected_error)) => {
-                    if !expected_error.is_match(&e.to_string()) {
+                    let sqlstate = e
+                        .downcast_ref::<D::Error>()
+                        .and_then(|concrete_err| D::error_sql_state(concrete_err));
+                    if !expected_error.is_match(&e.to_string(), sqlstate.as_deref()) {
                         return Err(TestErrorKind::ErrorMismatch {
                             sql,
                             err: Arc::clone(e),
                             expected_err: expected_error.to_string(),
                             kind: RecordKind::Statement,
+                            actual_sqlstate: sqlstate,
                         }
                         .at(loc));
                     }
@@ -1317,12 +1444,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         .at(loc));
                     }
                     (Some(e), QueryExpect::Error(expected_error)) => {
-                        if !expected_error.is_match(&e.to_string()) {
+                        let sqlstate = e
+                            .downcast_ref::<D::Error>()
+                            .and_then(|concrete_err| D::error_sql_state(concrete_err));
+                        if !expected_error.is_match(&e.to_string(), sqlstate.as_deref()) {
                             return Err(TestErrorKind::ErrorMismatch {
                                 sql,
                                 err: Arc::clone(e),
                                 expected_err: expected_error.to_string(),
                                 kind: RecordKind::Query,
+                                actual_sqlstate: sqlstate,
                             }
                             .at(loc));
                         }
@@ -1410,6 +1541,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         }
                     }
                 }
+            }
+            (Record::Let { loc, sql, .. }, RecordOutput::Let { error, .. }) => {
+                if let Some(err) = error {
+                    return Err(TestErrorKind::LetFail {
+                        sql,
+                        err: err.clone(),
+                    }
+                    .at(loc));
+                }
+                // Variables are already set in apply_record
             }
             _ => unreachable!(),
         }
@@ -1926,7 +2067,7 @@ pub fn update_record_with_output<T: ColumnType>(
             }
             // Error match
             (Some(e), StatementExpect::Error(expected_error))
-                if expected_error.is_match(&e.to_string()) =>
+                if expected_error.is_match(&e.to_string(), None) =>
             {
                 None
             }
@@ -1984,7 +2125,7 @@ pub fn update_record_with_output<T: ColumnType>(
         ) => match (error, expected) {
             // Error match
             (Some(e), QueryExpect::Error(expected_error))
-                if expected_error.is_match(&e.to_string()) =>
+                if expected_error.is_match(&e.to_string(), None) =>
             {
                 None
             }
@@ -2064,7 +2205,8 @@ pub fn update_record_with_output<T: ColumnType>(
 
                 // Otherwise, update results normally
                 let results = match &expected {
-                    // If validation succeeds and formatting normalization is not forced, preserve original.
+                    // If validation succeeds and formatting normalization is not forced, preserve
+                    // original.
                     QueryExpect::Results {
                         results: expected_results,
                         ..

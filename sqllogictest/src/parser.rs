@@ -239,7 +239,8 @@ pub enum Record<T: ColumnType> {
         value: bool,
     },
     /// Flatten all result values into a single column, instead of preserving the row structure.
-    /// When enabled, the output will be a single column containing all values, regardless of their original row grouping.
+    /// When enabled, the output will be a single column containing all values, regardless of their
+    /// original row grouping.
     FlatValues {
         loc: Location,
         value: bool,
@@ -252,6 +253,17 @@ pub enum Record<T: ColumnType> {
     Newline,
     /// Internally injected record which should not occur in the test file.
     Injected(Injected),
+    /// A let record binds SQL query results to variables.
+    /// The query must return exactly 1 row with N columns matching the N variable names.
+    Let {
+        loc: Location,
+        conditions: Vec<Condition>,
+        connection: Connection,
+        /// Variable names to bind the results to.
+        variables: Vec<String>,
+        /// The SQL query to execute.
+        sql: String,
+    },
 }
 
 impl<T: ColumnType> Record<T> {
@@ -431,6 +443,15 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             }
             Record::Newline => Ok(()), // Display doesn't end with newline
             Record::Injected(p) => panic!("unexpected injected record: {p:?}"),
+            Record::Let {
+                loc: _,
+                conditions: _,
+                connection: _,
+                variables,
+                sql,
+            } => {
+                write!(f, "let {}\n{sql}\n", variables.join(", "))
+            }
         }
     }
 }
@@ -451,12 +472,29 @@ pub enum ExpectedError {
     /// The actual error message that's exactly the same as the expected one is considered as a
     /// match.
     Multiline(String),
+    /// An expected SQL state code.
+    ///
+    /// The actual SQL state that matches the expected one is considered as a match.
+    SqlState(String),
 }
 
 impl ExpectedError {
     /// Parses an inline regex variant from tokens.
     fn parse_inline_tokens(tokens: &[&str]) -> Result<Self, ParseErrorKind> {
-        Self::new_inline(tokens.join(" "))
+        let joined = tokens.join(" ");
+
+        // Check if this is a SQLSTATE error pattern: error(<SQLSTATE>).
+        // SQLSTATE is exactly 5 characters: digits and uppercase letters (SQL standard).
+        if let Some(captures) = regex::Regex::new(r"^\(([0-9A-Z]{5})\)$")
+            .unwrap()
+            .captures(&joined)
+        {
+            if let Some(sqlstate) = captures.get(1) {
+                return Ok(Self::SqlState(sqlstate.as_str().to_string()));
+            }
+        }
+
+        Self::new_inline(joined)
     }
 
     /// Creates an inline expected error message from a regex string.
@@ -480,8 +518,10 @@ impl ExpectedError {
     /// Unparses the expected message after `statement`.
     fn fmt_inline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "error")?;
-        if let Self::Inline(regex) = self {
-            write!(f, " {regex}")?;
+        match self {
+            Self::Inline(regex) => write!(f, " {regex}")?,
+            Self::SqlState(sqlstate) => write!(f, " ({sqlstate})")?,
+            Self::Empty | Self::Multiline(_) => {}
         }
         Ok(())
     }
@@ -497,11 +537,12 @@ impl ExpectedError {
     }
 
     /// Returns whether the given error message matches the expected one.
-    pub fn is_match(&self, err: &str) -> bool {
+    pub fn is_match(&self, err: &str, sqlstate: Option<&str>) -> bool {
         match self {
             Self::Empty => true,
             Self::Inline(regex) => regex.is_match(err),
             Self::Multiline(results) => results.trim() == err.trim(),
+            Self::SqlState(expected_state) => sqlstate.is_some_and(|state| state == expected_state),
         }
     }
 
@@ -534,6 +575,7 @@ impl std::fmt::Display for ExpectedError {
             ExpectedError::Empty => write!(f, "(any)"),
             ExpectedError::Inline(regex) => write!(f, "(regex) {}", regex),
             ExpectedError::Multiline(results) => write!(f, "(multiline) {}", results.trim()),
+            ExpectedError::SqlState(sqlstate) => write!(f, "(sqlstate) {}", sqlstate),
         }
     }
 }
@@ -544,6 +586,7 @@ impl PartialEq for ExpectedError {
             (Self::Empty, Self::Empty) => true,
             (Self::Inline(l0), Self::Inline(r0)) => l0.as_str() == r0.as_str(),
             (Self::Multiline(l0), Self::Multiline(r0)) => l0 == r0,
+            (Self::SqlState(l0), Self::SqlState(r0)) => l0 == r0,
             _ => false,
         }
     }
@@ -826,6 +869,8 @@ pub enum ParseErrorKind {
     EmptyIncludeFile(String),
     #[error("no such file")]
     FileNotFound,
+    #[error("invalid variable name: {0:?}")]
+    InvalidVariableName(String),
 }
 
 impl ParseErrorKind {
@@ -956,7 +1001,8 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
                             // `statement error retry <num> backoff <duration>`
-                            // To keep syntax simple, let's assume the error message must be multiline.
+                            // To keep syntax simple, let's assume the error message must be
+                            // multiline.
                             (StatementExpect::Error(ExpectedError::Empty), res)
                         } else {
                             let error = ExpectedError::parse_inline_tokens(res)
@@ -1004,7 +1050,8 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
                             // `query error retry <num> backoff <duration>`
-                            // To keep syntax simple, let's assume the error message must be multiline.
+                            // To keep syntax simple, let's assume
+                            // the error message must be multiline.
                             (QueryExpect::Error(ExpectedError::Empty), res)
                         } else {
                             let error = ExpectedError::parse_inline_tokens(res)
@@ -1143,6 +1190,45 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     .parse::<bool>()
                     .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
             }),
+            ["let", rest @ ..] => {
+                // Parse: let var1, var2, ... followed by SQL
+                // Join the rest of the tokens and parse the variable list
+                let rest_str = rest.join(" ");
+                let rest_str = rest_str.trim();
+
+                if rest_str.is_empty() {
+                    return Err(ParseErrorKind::InvalidLine(line.into()).at(loc));
+                }
+
+                // Extract variable names separated by commas
+                let variables: Vec<String> = rest_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if variables.is_empty() {
+                    return Err(ParseErrorKind::InvalidLine(line.into()).at(loc));
+                }
+
+                // Validate variable names (must be valid identifiers)
+                for var in &variables {
+                    if !is_valid_variable_name(var) {
+                        return Err(ParseErrorKind::InvalidVariableName(var.clone()).at(loc));
+                    }
+                }
+
+                // Parse the SQL body (following lines until empty line)
+                let (sql, _has_results) = parse_lines(&mut lines, &loc, None)?;
+
+                records.push(Record::Let {
+                    loc,
+                    conditions: std::mem::take(&mut conditions),
+                    connection: std::mem::take(&mut connection),
+                    variables,
+                    sql,
+                });
+            }
             _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
         }
     }
@@ -1194,6 +1280,21 @@ fn parse_file_inner<T: ColumnType>(loc: Location) -> Result<Vec<Record<T>>, Pars
         }
     }
     Ok(records)
+}
+
+/// Check if a variable name is valid.
+/// A valid variable name starts with a letter or underscore, and contains only alphanumeric
+/// characters and underscores.
+fn is_valid_variable_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Parse one or more lines until empty line or a delimiter.
@@ -1452,6 +1553,25 @@ select * from foo;
         );
     }
 
+    #[test]
+    fn test_expected_error_sqlstate_format() {
+        assert!(matches!(
+            ExpectedError::parse_inline_tokens(&["(42P01)"]).unwrap(),
+            ExpectedError::SqlState(s) if s == "42P01"
+        ));
+        assert!(matches!(
+            ExpectedError::parse_inline_tokens(&["(HY000)"]).unwrap(),
+            ExpectedError::SqlState(s) if s == "HY000"
+        ));
+
+        for non_sqlstate in ["(42p01)", "(42P0)", "(42P011)", "(12_45)", "(12-45)"] {
+            assert!(matches!(
+                ExpectedError::parse_inline_tokens(&[non_sqlstate]).unwrap(),
+                ExpectedError::Inline(_)
+            ));
+        }
+    }
+
     /// Verifies Display impl is consistent with parsing by ensuring
     /// roundtrip parse(unparse(parse())) is consistent
     #[track_caller]
@@ -1501,6 +1621,7 @@ select * from foo;
                     Record::HashThreshold { loc, .. } => normalize_loc(loc),
                     Record::ShowColumnNames { loc, .. } => normalize_loc(loc),
                     Record::FlatValues { loc, .. } => normalize_loc(loc),
+                    Record::Let { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match
@@ -1553,5 +1674,104 @@ select * from foo;
     #[test]
     fn test_query_retry() {
         parse_roundtrip::<DefaultColumnType>("../tests/no_run/query_retry.slt")
+    }
+
+    #[test]
+    fn test_let_parsing() {
+        let script = "\
+let id
+SELECT 1
+";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Let { variables, sql, .. } => {
+                assert_eq!(variables, &["id".to_string()]);
+                assert_eq!(sql, "SELECT 1");
+            }
+            _ => panic!("expected Let record"),
+        }
+    }
+
+    #[test]
+    fn test_let_parsing_multiple_vars() {
+        let script = "\
+let id, name, value
+SELECT 1, 'hello', 42
+";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Let { variables, sql, .. } => {
+                assert_eq!(
+                    variables,
+                    &["id".to_string(), "name".to_string(), "value".to_string()]
+                );
+                assert_eq!(sql, "SELECT 1, 'hello', 42");
+            }
+            _ => panic!("expected Let record"),
+        }
+    }
+
+    #[test]
+    fn test_let_parsing_roundtrip() {
+        let script = "\
+let id
+SELECT 1
+";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        let unparsed = records[0].to_string();
+        let reparsed = parse::<DefaultColumnType>(&unparsed).unwrap();
+        assert_eq!(records.len(), reparsed.len());
+        match (&records[0], &reparsed[0]) {
+            (
+                Record::Let {
+                    variables: v1,
+                    sql: s1,
+                    ..
+                },
+                Record::Let {
+                    variables: v2,
+                    sql: s2,
+                    ..
+                },
+            ) => {
+                assert_eq!(v1, v2);
+                assert_eq!(s1, s2);
+            }
+            _ => panic!("expected Let records"),
+        }
+    }
+
+    #[test]
+    fn test_let_parsing_error_empty_vars() {
+        let script = "\
+let
+SELECT 1
+";
+        let err = parse::<DefaultColumnType>(script).unwrap_err();
+        assert!(matches!(err.kind(), ParseErrorKind::InvalidLine(_)));
+    }
+
+    #[test]
+    fn test_let_parsing_error_invalid_var_name() {
+        let script = "\
+let 123invalid
+SELECT 1
+";
+        let err = parse::<DefaultColumnType>(script).unwrap_err();
+        assert!(matches!(err.kind(), ParseErrorKind::InvalidVariableName(_)));
+    }
+
+    #[test]
+    fn test_is_valid_variable_name() {
+        assert!(is_valid_variable_name("foo"));
+        assert!(is_valid_variable_name("_bar"));
+        assert!(is_valid_variable_name("foo123"));
+        assert!(is_valid_variable_name("__TEST_DIR__"));
+        assert!(!is_valid_variable_name(""));
+        assert!(!is_valid_variable_name("123"));
+        assert!(!is_valid_variable_name("foo-bar"));
+        assert!(!is_valid_variable_name("foo bar"));
     }
 }

@@ -7,6 +7,7 @@ use sqllogictest::{DBOutput, DefaultColumnType};
 use crate::postgres::error::PgDriverError;
 
 use super::{Postgres, Result, Simple};
+use crate::postgres::error::PgDriverError;
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Simple> {
@@ -43,7 +44,7 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
                 }
                 tokio_postgres::SimpleQueryMessage::CommandComplete(cnt_) => {
                     cnt = cnt_;
-                    break;
+                    continue;
                 }
                 tokio_postgres::SimpleQueryMessage::RowDescription(column_names) => {
                     if column_names.is_empty() {
@@ -84,5 +85,9 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
 
     async fn run_command(command: Command) -> std::io::Result<std::process::Output> {
         tokio::process::Command::from(command).output().await
+    }
+
+    fn error_sql_state(err: &Self::Error) -> Option<String> {
+        err.code().map(|s| s.code().to_owned())
     }
 }

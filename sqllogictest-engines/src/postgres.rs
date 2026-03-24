@@ -136,16 +136,6 @@ pub type PostgresExtended = Postgres<Extended>;
 pub type PostgresConfig = tokio_postgres::Config;
 
 impl<P: sealed::Protocol> Postgres<P> {
-    /// Connects using the given [`ConnectOptions`].
-    ///
-    /// | sslmode   | `ca_cert` required? | behaviour                        |
-    /// |-----------|---------------------|----------------------------------|
-    /// | `disable` | no (ignored)        | plain TCP, no TLS                |
-    /// | `prefer`  | yes                 | TLS with strict CA verification  |
-    /// | `require` | yes                 | TLS mandatory, strict CA         |
-    ///
-    /// Returns [`PgDriverError::CaCertRequired`] if `sslmode` is not
-    /// `disable` and no `ca_cert` path was provided.
     pub async fn connect(opts: ConnectOptions) -> Result<Self> {
         let (client, handle) = match opts.pg_config.get_ssl_mode() {
             SslMode::Disable => Self::connect_plain(&opts.pg_config).await?,

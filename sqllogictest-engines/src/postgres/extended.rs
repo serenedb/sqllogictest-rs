@@ -14,6 +14,7 @@ use sqllogictest::{DBOutput, DefaultColumnType};
 use crate::postgres::error::PgDriverError;
 
 use super::{Extended, Postgres, Result};
+use crate::postgres::error::PgDriverError;
 
 // Inspired by postgres_type::Array implementation of Display trait
 fn print_array<T: std::fmt::Display>(
@@ -33,7 +34,8 @@ fn print_array<T: std::fmt::Display>(
 // * double quotes
 // * backslashes
 // * space
-// It'is used (although it's simple protocol specific) to not duplicate tests for simple and extended protocols.
+// It'is used (although it's simple protocol specific) to not duplicate tests for simple and
+// extended protocols.
 pub fn array_item_need_escape_and_quote(data: &str) -> bool {
     if data.is_empty() || data.eq_ignore_ascii_case("null") {
         return true;
@@ -173,6 +175,69 @@ impl fmt::Display for Char {
                 write!(f, "{:o}", self.0)
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct Regtype(String);
+
+impl<'a> FromSql<'a> for Regtype {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let oid = <u32 as FromSql>::from_sql(ty, raw)?;
+        let name = match oid {
+            16 => "boolean",
+            17 => "bytea",
+            18 => "character",
+            20 => "bigint",
+            21 => "smallint",
+            23 => "integer",
+            25 => "text",
+            114 => "json",
+            700 => "real",
+            701 => "double precision",
+            705 => "unknown",
+            1043 => "character varying",
+            1082 => "date",
+            1114 => "timestamp without time zone",
+            1184 => "timestamp with time zone",
+            1186 => "interval",
+            1700 => "numeric",
+            2205 => "regclass",
+            2206 => "regtype",
+            2950 => "uuid",
+            3802 => "jsonb",
+            // Array types
+            199 => "json[]",
+            1000 => "boolean[]",
+            1001 => "bytea[]",
+            1002 => "character[]",
+            1005 => "smallint[]",
+            1007 => "integer[]",
+            1009 => "text[]",
+            1015 => "character varying[]",
+            1016 => "bigint[]",
+            1021 => "real[]",
+            1022 => "double precision[]",
+            1115 => "timestamp without time zone[]",
+            1182 => "date[]",
+            1185 => "timestamp with time zone[]",
+            1187 => "interval[]",
+            1231 => "numeric[]",
+            2951 => "uuid[]",
+            other => return Ok(Regtype(other.to_string())),
+        };
+        Ok(Regtype(name.to_string()))
+    }
+
+    accepts!(REGTYPE);
+}
+
+impl fmt::Display for Regtype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -437,6 +502,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME => {
                         single_process!(row, row_vec, idx, &str);
                     }
+                    Type::REGTYPE => {
+                        single_process!(row, row_vec, idx, Regtype);
+                    }
                     Type::VARCHAR_ARRAY
                     | Type::TEXT_ARRAY
                     | Type::BPCHAR_ARRAY
@@ -483,8 +551,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::VOID => {
                         single_process!(row, row_vec, idx, Void);
                     }
-                    // SereneDB doesn't return OID type (corresponding OID value). Instead, it returns
-                    // raw u64 type and there are no plans to change this behaviour. Keep this in mind in case
+                    // SereneDB doesn't return OID type (corresponding OID value). Instead, it
+                    // returns raw u64 type and there are no plans to change
+                    // this behaviour. Keep this in mind in case
                     // OID type related problems.
                     Type::OID => {
                         single_process!(row, row_vec, idx, u32);
@@ -535,5 +604,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
 
     async fn run_command(command: Command) -> std::io::Result<std::process::Output> {
         tokio::process::Command::from(command).output().await
+    }
+
+    fn error_sql_state(err: &Self::Error) -> Option<String> {
+        err.code().map(|s| s.code().to_owned())
     }
 }
