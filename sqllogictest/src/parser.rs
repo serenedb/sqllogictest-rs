@@ -211,6 +211,11 @@ pub enum Record<T: ColumnType> {
         loc: Location,
         duration: Duration,
     },
+    /// Print a message to stdout.
+    Print {
+        loc: Location,
+        text: String,
+    },
     /// Subtest.
     Subtest {
         loc: Location,
@@ -381,6 +386,9 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             }
             Record::Sleep { loc: _, duration } => {
                 write!(f, "sleep {}", humantime::format_duration(*duration))
+            }
+            Record::Print { loc: _, text } => {
+                write!(f, "print {text}")
             }
             Record::Subtest { loc: _, name } => {
                 write!(f, "subtest {name}")
@@ -948,6 +956,12 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     duration: humantime::parse_duration(dur).map_err(|_| {
                         ParseErrorKind::InvalidDuration(dur.to_string()).at(loc.clone())
                     })?,
+                    loc,
+                });
+            }
+            ["print", rest @ ..] => {
+                records.push(Record::Print {
+                    text: rest.join(" "),
                     loc,
                 });
             }
@@ -1626,6 +1640,7 @@ select * from foo;
                     Record::ShowColumnNames { loc, .. } => normalize_loc(loc),
                     Record::FlatValues { loc, .. } => normalize_loc(loc),
                     Record::Let { loc, .. } => normalize_loc(loc),
+                    Record::Print { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match

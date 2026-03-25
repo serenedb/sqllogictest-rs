@@ -1125,6 +1125,10 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 D::sleep(duration).await;
                 RecordOutput::Nothing
             }
+            Record::Print { text, .. } => {
+                println!("{text}");
+                RecordOutput::Nothing
+            }
             Record::Control(control) => {
                 match control {
                     Control::SortMode(sort_mode) => {
