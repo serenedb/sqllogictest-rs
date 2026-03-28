@@ -185,7 +185,11 @@ impl<'a> FromSql<'a> for Regtype {
         ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        let oid = <u32 as FromSql>::from_sql(ty, raw)?;
+        let oid = if raw.len() == 8 {
+            <i64 as FromSql>::from_sql(ty, raw)? as u32
+        } else {
+            <u32 as FromSql>::from_sql(ty, raw)?
+        };
         let name = match oid {
             16 => "boolean",
             17 => "bytea",
