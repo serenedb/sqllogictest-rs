@@ -10,6 +10,7 @@ use std::vec;
 
 use async_trait::async_trait;
 use futures::executor::block_on;
+use futures::stream::FuturesUnordered;
 use futures::{stream, Future, FutureExt, StreamExt};
 use itertools::Itertools;
 use md5::Digest;
@@ -20,7 +21,7 @@ use tempfile::TempDir;
 
 use crate::parser::*;
 use crate::substitution::Substitution;
-use crate::{ColumnType, Connections, MakeConnection, SslMode};
+use crate::{ColumnType, Connections, DBPort, MakeConnection, SslMode};
 
 /// Type-erased error type.
 type AnyError = Arc<dyn std::error::Error + Send + Sync>;
@@ -871,6 +872,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 expected: _,
                 loc: _,
                 retry: _,
+                nowait: _,
             } => {
                 let sql = match self.may_substitute(sql, true) {
                     Ok(sql) => sql,
@@ -1020,6 +1022,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 expected,
                 loc: _,
                 retry: _,
+                nowait: _,
             } => {
                 let (types, mut rows) = match self
                     .run_query_inner(&sql, connection, &conditions, &should_skip)
@@ -1156,6 +1159,10 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
             Record::Halt { loc: _ } => {
                 tracing::error!("halt record encountered. It's likely a bug of the runtime.");
+                RecordOutput::Nothing
+            }
+            Record::Sync { loc: _ } => {
+                tracing::error!("sync record encountered outside of run_multi_async. It's likely a bug of the runtime.");
                 RecordOutput::Nothing
             }
             Record::Let {
@@ -1383,6 +1390,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     sql,
                     expected,
                     retry: _,
+                    nowait: _,
                 },
                 RecordOutput::Statement { count, error },
             ) => match (error, expected) {
@@ -1436,6 +1444,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     sql,
                     expected,
                     retry: _,
+                    nowait: _,
                 },
                 RecordOutput::Query { types, rows, error },
             ) => {
@@ -1576,17 +1585,112 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     ///
     /// The runner will stop early once a halt record is seen.
     ///
+    /// Records with the `nowait` flag are dispatched on a dedicated connection and run
+    /// concurrently with subsequent records. A `sync` record (or the end of the iterator)
+    /// waits for all pending `nowait` tasks to complete.
+    ///
     /// To acquire the result of each record, manually call `run_async` for each record instead.
     pub async fn run_multi_async(
         &mut self,
         records: impl IntoIterator<Item = Record<D::ColumnType>>,
-    ) -> Result<(), TestError> {
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        let mut pending: FuturesUnordered<
+            std::pin::Pin<Box<dyn Future<Output = Result<(), TestError>> + Send + 'static>>,
+        > = FuturesUnordered::new();
+
         for record in records.into_iter() {
             if let Record::Halt { .. } = record {
                 break;
             }
-            self.run_async(record).await?;
+
+            // A sync record drains all pending nowait tasks before continuing.
+            if let Record::Sync { .. } = record {
+                while let Some(result) = pending.next().await {
+                    result?;
+                }
+                continue;
+            }
+
+            // Check if this record has the nowait flag set.
+            let is_nowait = match &record {
+                Record::Statement { nowait, .. } | Record::Query { nowait, .. } => *nowait,
+                _ => false,
+            };
+
+            if is_nowait {
+                let loc = match &record {
+                    Record::Statement { loc, .. } | Record::Query { loc, .. } => loc.clone(),
+                    _ => unreachable!(),
+                };
+                let (sql, connection) = match &record {
+                    Record::Statement { sql, connection, .. } => (sql.clone(), connection.clone()),
+                    Record::Query { sql, connection, .. } => (sql.clone(), connection.clone()),
+                    _ => unreachable!(),
+                };
+                let (ssl_mode, port) = match &connection {
+                    Connection::Named { ssl_mode, port, .. } => (ssl_mode.clone(), port.clone()),
+                    Connection::Default => (SslMode::Disable, DBPort::Plain),
+                };
+
+                let sql = match self.may_substitute(sql, true) {
+                    Ok(s) => s,
+                    Err(e) => return Err(TestErrorKind::Fail {
+                        sql: match &record {
+                            Record::Statement { sql, .. } | Record::Query { sql, .. } => sql.clone(),
+                            _ => unreachable!(),
+                        },
+                        err: e,
+                        kind: RecordKind::Statement,
+                    }.at(loc)),
+                };
+
+                let mut conn = self.conn.make_new(ssl_mode, port).await.map_err(|e| {
+                    TestErrorKind::Fail {
+                        sql: sql.clone(),
+                        err: Arc::new(e),
+                        kind: RecordKind::Statement,
+                    }
+                    .at(loc.clone())
+                })?;
+
+                pending.push(Box::pin(async move {
+                    conn.run(&sql).await.map_err(|e| {
+                        TestErrorKind::Fail {
+                            sql,
+                            err: Arc::new(e),
+                            kind: RecordKind::Statement,
+                        }
+                        .at(loc)
+                    })?;
+                    conn.shutdown().await;
+                    Ok(())
+                }));
+            } else {
+                // Drive the main record while concurrently making progress on background tasks.
+                let record_fuse = self.run_async(record).fuse();
+                futures::pin_mut!(record_fuse);
+                loop {
+                    futures::select! {
+                        result = record_fuse => {
+                            result?;
+                            break;
+                        }
+                        bg_result = pending.select_next_some() => {
+                            bg_result?;
+                        }
+                    }
+                }
+            }
         }
+
+        // Drain all remaining pending nowait tasks at end of file.
+        while let Some(result) = pending.next().await {
+            result?;
+        }
+
         Ok(())
     }
 
@@ -1598,12 +1702,18 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     pub fn run_multi(
         &mut self,
         records: impl IntoIterator<Item = Record<D::ColumnType>>,
-    ) -> Result<(), TestError> {
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         block_on(self.run_multi_async(records))
     }
 
     /// Run a sqllogictest script.
-    pub async fn run_script_async(&mut self, script: &str) -> Result<(), TestError> {
+    pub async fn run_script_async(&mut self, script: &str) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         let records = parse(script).expect("failed to parse sqllogictest");
         self.run_multi_async(records).await
     }
@@ -1613,19 +1723,28 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         &mut self,
         script: &str,
         name: impl Into<Arc<str>>,
-    ) -> Result<(), TestError> {
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         let records = parse_with_name(script, name).expect("failed to parse sqllogictest");
         self.run_multi_async(records).await
     }
 
     /// Run a sqllogictest file.
-    pub async fn run_file_async(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError> {
+    pub async fn run_file_async(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         let records = parse_file(filename)?;
         self.run_multi_async(records).await
     }
 
     /// Run a sqllogictest script.
-    pub fn run_script(&mut self, script: &str) -> Result<(), TestError> {
+    pub fn run_script(&mut self, script: &str) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         block_on(self.run_script_async(script))
     }
 
@@ -1634,12 +1753,18 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         &mut self,
         script: &str,
         name: impl Into<Arc<str>>,
-    ) -> Result<(), TestError> {
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         block_on(self.run_script_with_name_async(script, name))
     }
 
     /// Run a sqllogictest file.
-    pub fn run_file(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError> {
+    pub fn run_file(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         block_on(self.run_file_async(filename))
     }
 
@@ -1657,6 +1782,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     ) -> Result<(), ParallelTestError>
     where
         Fut: Future<Output = D>,
+        D: Send + 'static,
     {
         let files = glob::glob(glob).expect("failed to read glob pattern");
         let mut tasks = vec![];
@@ -1728,6 +1854,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     ) -> Result<(), ParallelTestError>
     where
         Fut: Future<Output = D>,
+        D: Send + 'static,
     {
         block_on(self.run_parallel_async(glob, hosts, conn_builder, jobs))
     }
@@ -1964,6 +2091,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 expected: mut expected @ (StatementExpect::Ok | StatementExpect::Count(_)),
                 retry,
+                nowait,
             },
             RecordOutput::Query {
                 error: None, rows, ..
@@ -1987,6 +2115,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 expected,
                 retry,
+                nowait,
             })
         }
         // query, statement
@@ -1998,6 +2127,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 expected: _,
                 retry,
+                nowait,
             },
             RecordOutput::Statement { error: None, count },
         ) => {
@@ -2020,6 +2150,7 @@ pub fn update_record_with_output<T: ColumnType>(
                     label: None,
                 },
                 retry,
+                nowait,
             })
         }
         // statement, statement
@@ -2031,6 +2162,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 sql,
                 expected,
                 retry,
+                nowait,
             },
             RecordOutput::Statement { count, error },
         ) => match (error, expected) {
@@ -2054,6 +2186,7 @@ pub fn update_record_with_output<T: ColumnType>(
                             conditions: new_conditions,
                             connection,
                             retry,
+                            nowait,
                         });
                     }
                 }
@@ -2067,6 +2200,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         StatementExpect::Error(_) | StatementExpect::Ok => StatementExpect::Ok,
                     },
                     retry,
+                    nowait,
                 })
             }
             // Error match
@@ -2094,6 +2228,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         conditions: new_conditions,
                         connection,
                         retry,
+                        nowait,
                     })
                 } else {
                     // Original behavior: update expected error
@@ -2111,6 +2246,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         conditions,
                         connection,
                         retry,
+                        nowait,
                     })
                 }
             }
@@ -2124,6 +2260,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 sql,
                 expected,
                 retry,
+                nowait,
             },
             RecordOutput::Query { types, rows, error },
         ) => match (error, expected) {
@@ -2152,6 +2289,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         conditions: new_conditions,
                         connection,
                         retry,
+                        nowait,
                     })
                 } else {
                     // Original behavior: update expected error
@@ -2169,6 +2307,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         conditions,
                         connection,
                         retry,
+                        nowait,
                     })
                 }
             }
@@ -2203,6 +2342,7 @@ pub fn update_record_with_output<T: ColumnType>(
                             conditions: new_conditions,
                             connection,
                             retry,
+                            nowait,
                         });
                     }
                 }
@@ -2253,6 +2393,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         },
                     },
                     retry,
+                    nowait,
                 })
             }
         },

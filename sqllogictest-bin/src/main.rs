@@ -1185,7 +1185,10 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
     show_all_errors: bool,
-) -> Result<Duration> {
+) -> Result<Duration>
+where
+    M::Conn: Send + 'static,
+{
     let filename = filename.as_ref();
 
     write!(out, "{: <60} .. ", filename.to_string_lossy())?;
@@ -1201,11 +1204,8 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
 
     let mut errors = vec![];
     let mut locations = vec![];
-    for record in records {
-        if let Record::Halt { .. } = record {
-            break;
-        }
-        match &record {
+    for record in &records {
+        match record {
             Record::Injected(Injected::BeginInclude(file)) => {
                 begin_times.push(Instant::now());
                 if !did_pop {
@@ -1227,23 +1227,21 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
             }
             _ => {}
         }
+    }
+    begin_times.truncate(1);
 
-        let res = runner.run_async(record).await;
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                if show_all_errors {
-                    errors.push(e.kind());
-                    locations.push(e.location());
-                } else {
-                    return Err(e)
-                        .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
-                        .context(format!(
-                            "failed to run `{}`",
-                            style(filename.to_string_lossy()).bold()
-                        ));
-                }
-            }
+    // Use run_multi_async so that `nowait` and `sync` records are handled correctly.
+    if let Err(e) = runner.run_multi_async(records).await {
+        if show_all_errors {
+            errors.push(e.kind());
+            locations.push(e.location());
+        } else {
+            return Err(e)
+                .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+                .context(format!(
+                    "failed to run `{}`",
+                    style(filename.to_string_lossy()).bold()
+                ));
         }
     }
     if !errors.is_empty() {

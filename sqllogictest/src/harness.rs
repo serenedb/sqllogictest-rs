@@ -32,7 +32,10 @@ macro_rules! harness {
     };
 }
 
-pub fn test(filename: impl AsRef<Path>, make_conn: impl MakeConnection) -> Result<(), Failed> {
+pub fn test<M: MakeConnection>(filename: impl AsRef<Path>, make_conn: M) -> Result<(), Failed>
+where
+    M::Conn: Send + 'static,
+{
     let mut tester = Runner::new(make_conn);
     tester.run_file(filename)?;
     tester.shutdown();

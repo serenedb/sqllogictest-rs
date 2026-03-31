@@ -77,6 +77,13 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
         Ok(conn)
     }
 
+    /// Create a new connection without caching it.
+    ///
+    /// Used by the `nowait` feature to create a dedicated connection for a background query.
+    pub async fn make_new(&mut self, ssl_mode: SslMode, port: DBPort) -> Result<D, D::Error> {
+        self.make_conn.make(ssl_mode, port).await
+    }
+
     /// Run a SQL statement on the default connection.
     ///
     /// This is a shortcut for calling `get(Default)` then `run`.

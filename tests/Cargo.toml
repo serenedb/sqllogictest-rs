@@ -37,3 +37,7 @@ path = "./substitution/substitution.rs"
 [[test]]
 name = "let_test"
 path = "./let/let_test.rs"
+
+[[test]]
+name = "nowait"
+path = "./nowait/nowait.rs"

@@ -181,6 +181,9 @@ pub enum Record<T: ColumnType> {
         expected: StatementExpect,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `sync` record to wait for all pending nowait queries.
+        nowait: bool,
     },
     /// A query is an SQL command from which we expect to receive results. The result set might be
     /// empty.
@@ -193,6 +196,13 @@ pub enum Record<T: ColumnType> {
         expected: QueryExpect<T>,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `sync` record to wait for all pending nowait queries.
+        nowait: bool,
+    },
+    /// A sync record waits for all pending `nowait` queries to complete before proceeding.
+    Sync {
+        loc: Location,
     },
     /// A system command is an external command that is to be executed by the shell. Currently it
     /// must succeed and the output is ignored.
@@ -297,8 +307,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 sql,
                 expected,
                 retry,
+                nowait,
             } => {
                 write!(f, "statement ")?;
+                if *nowait {
+                    write!(f, "nowait ")?;
+                }
                 match expected {
                     StatementExpect::Ok => write!(f, "ok")?,
                     StatementExpect::Count(cnt) => write!(f, "count {cnt}")?,
@@ -323,8 +337,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 sql,
                 expected,
                 retry,
+                nowait,
             } => {
                 write!(f, "query")?;
+                if *nowait {
+                    write!(f, " nowait")?;
+                }
                 match expected {
                     QueryExpect::Results {
                         types,
@@ -395,6 +413,9 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             }
             Record::Halt { loc: _ } => {
                 write!(f, "halt")
+            }
+            Record::Sync { loc: _ } => {
+                write!(f, "sync")
             }
             Record::Control(c) => match c {
                 Control::SortMode(m) => write!(f, "control sortmode {}", m.as_str()),
@@ -1014,6 +1035,11 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 records.push(Record::Connection(conn));
             }
             ["statement", res @ ..] => {
+                let (nowait, res) = if res.first() == Some(&"nowait") {
+                    (true, &res[1..])
+                } else {
+                    (false, res)
+                };
                 let (mut expected, res) = match res {
                     ["ok", retry @ ..] => (StatementExpect::Ok, retry),
                     ["error", res @ ..] => {
@@ -1061,9 +1087,15 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                     expected,
                     retry,
+                    nowait,
                 });
             }
             ["query", res @ ..] => {
+                let (nowait, res) = if res.first() == Some(&"nowait") {
+                    (true, &res[1..])
+                } else {
+                    (false, res)
+                };
                 let (mut expected, res) = match res {
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
@@ -1078,7 +1110,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                         }
                     }
                     [type_str, res @ ..] => {
-                        // query <type-string> [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
+                        // query [nowait] <type-string> [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
                         let types = type_str
                             .chars()
                             .map(|ch| {
@@ -1149,7 +1181,11 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                     expected,
                     retry,
+                    nowait,
                 });
+            }
+            ["sync"] => {
+                records.push(Record::Sync { loc });
             }
             ["system", "ok", res @ ..] => {
                 let retry = parse_retry_config(res).map_err(|e| e.at(loc.clone()))?;
@@ -1567,6 +1603,7 @@ select * from foo;
                 sql: "select * from foo;".to_string(),
                 expected: QueryExpect::empty_results(),
                 retry: None,
+                nowait: false,
             }]
         );
     }
@@ -1641,6 +1678,7 @@ select * from foo;
                     Record::FlatValues { loc, .. } => normalize_loc(loc),
                     Record::Let { loc, .. } => normalize_loc(loc),
                     Record::Print { loc, .. } => normalize_loc(loc),
+                    Record::Sync { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match
@@ -1693,6 +1731,124 @@ select * from foo;
     #[test]
     fn test_query_retry() {
         parse_roundtrip::<DefaultColumnType>("../tests/no_run/query_retry.slt")
+    }
+
+    #[test]
+    fn test_nowait_roundtrip() {
+        parse_roundtrip::<DefaultColumnType>("../tests/no_run/nowait.slt")
+    }
+
+    #[test]
+    fn test_parse_statement_nowait() {
+        let script = "statement nowait ok\ninsert into t values (1)\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Statement { nowait, expected, .. } => {
+                assert!(*nowait, "expected nowait=true");
+                assert_eq!(*expected, StatementExpect::Ok);
+            }
+            _ => panic!("expected Statement record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_statement_no_nowait_by_default() {
+        let script = "statement ok\ninsert into t values (1)\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Statement { nowait, .. } => {
+                assert!(!*nowait, "expected nowait=false by default");
+            }
+            _ => panic!("expected Statement record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_nowait() {
+        let script = "query nowait I\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query { nowait, expected, .. } => {
+                assert!(*nowait, "expected nowait=true");
+                match expected {
+                    QueryExpect::Results { types, .. } => {
+                        assert_eq!(types.len(), 1);
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_nowait_with_sort_mode() {
+        let script = "query nowait I rowsort\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query { nowait, expected, .. } => {
+                assert!(*nowait);
+                match expected {
+                    QueryExpect::Results { sort_mode, .. } => {
+                        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_nowait_with_label() {
+        let script = "query nowait I rowsort my_label\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query { nowait, expected, .. } => {
+                assert!(*nowait);
+                match expected {
+                    QueryExpect::Results { label, sort_mode, .. } => {
+                        assert_eq!(label.as_deref(), Some("my_label"));
+                        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sync() {
+        let script = "sync\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], Record::Sync { .. }));
+    }
+
+    #[test]
+    fn test_nowait_display_roundtrip() {
+        let cases = [
+            "statement nowait ok\ninsert into t\n\n",
+            "statement nowait count 3\ninsert into t\n\n",
+            "query nowait I\nselect id from t\n----\n1\n\n",
+            "query nowait I rowsort\nselect id from t\n----\n1\n\n",
+            "query nowait I rowsort my_label\nselect id from t\n----\n1\n\n",
+            "sync",
+        ];
+        for case in cases {
+            let records = parse::<DefaultColumnType>(case)
+                .unwrap_or_else(|e| panic!("failed to parse {case:?}: {e}"));
+            let displayed = records.iter().map(|r| r.to_string()).collect::<Vec<_>>().join("\n");
+            let reparsed = parse::<DefaultColumnType>(&displayed)
+                .unwrap_or_else(|e| panic!("failed to reparse {displayed:?}: {e}"));
+            assert_eq!(records.len(), reparsed.len(), "length mismatch for {case:?}");
+        }
     }
 
     #[test]
