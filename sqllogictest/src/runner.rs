@@ -757,6 +757,174 @@ fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
     rows
 }
 
+/// Process raw query rows: strip header, sort, flatten, hash, and escape.
+/// `sort_mode` should already be the merged value (record-level `.or(runner-level)`).
+fn process_query_rows(
+    mut rows: Vec<Vec<String>>,
+    sort_mode: Option<SortMode>,
+    show_column_names: bool,
+    flat_values: bool,
+    hash_threshold: usize,
+    num_types: usize,
+) -> Vec<Vec<String>> {
+    let mut column_names_present = true;
+    if !show_column_names {
+        rows = rows[1..].into();
+        column_names_present = false;
+    }
+    if column_names_present && flat_values {
+        rows = rows[1..].into();
+        column_names_present = false;
+    }
+
+    let mut value_sort = false;
+    match sort_mode {
+        None | Some(SortMode::NoSort) => {}
+        Some(SortMode::RowSort) => {
+            // TODO(mkornaukhov) all protocols except from Postgres one should
+            // return column names by default
+            if column_names_present {
+                assert!(!rows.is_empty());
+                rows[1..].sort_unstable();
+            } else {
+                rows.sort_unstable();
+            }
+        }
+        Some(SortMode::ValueSort) => {
+            if column_names_present {
+                // Column names are useless
+                rows = rows[1..].into();
+            }
+            rows = rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|s| vec![s.to_owned()])
+                .collect();
+            rows.sort_unstable();
+            value_sort = true;
+        }
+    }
+
+    if !value_sort && flat_values {
+        rows = rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|s| vec![s.to_owned()])
+            .collect();
+    }
+
+    let num_values = if value_sort || flat_values {
+        rows.len()
+    } else {
+        rows.len() * num_types
+    };
+
+    if hash_threshold > 0 && num_values > hash_threshold {
+        let mut md5 = md5::Md5::new();
+        for line in &rows {
+            for value in line {
+                md5.update(value.as_bytes());
+                md5.update(b"\n");
+            }
+        }
+        let hash = format!("{:2x}", md5.finalize());
+        rows = vec![vec![format!(
+            "{} values hashing to {}",
+            rows.len() * rows[0].len(),
+            hash
+        )]];
+    }
+
+    escape(rows)
+}
+
+/// Compare processed query rows (or an error) against the expected outcome.
+/// `rows` must already be processed and escaped via [`process_query_rows`].
+fn compare_query_result<D: AsyncDB>(
+    sql: String,
+    loc: Location,
+    types: &Vec<D::ColumnType>,
+    rows: &[Vec<String>],
+    error: Option<Arc<dyn std::error::Error + Send + Sync>>,
+    expected: QueryExpect<D::ColumnType>,
+    result_mode: Option<ResultMode>,
+    validator: Validator,
+    normalizer: Normalizer,
+    column_type_validator: ColumnTypeValidator<D::ColumnType>,
+) -> Result<(), TestError> {
+    match (error, expected) {
+        (None, QueryExpect::Error(_)) => {
+            return Err(TestErrorKind::Ok {
+                sql,
+                kind: RecordKind::Query,
+            }
+            .at(loc));
+        }
+        (Some(e), QueryExpect::Error(expected_error)) => {
+            let sqlstate = e
+                .downcast_ref::<D::Error>()
+                .and_then(|concrete_err| D::error_sql_state(concrete_err));
+            if !expected_error.is_match(&e.to_string(), sqlstate.as_deref()) {
+                return Err(TestErrorKind::ErrorMismatch {
+                    sql,
+                    err: e,
+                    expected_err: expected_error.to_string(),
+                    kind: RecordKind::Query,
+                    actual_sqlstate: sqlstate,
+                }
+                .at(loc));
+            }
+        }
+        (Some(e), QueryExpect::Results { .. }) => {
+            return Err(TestErrorKind::Fail {
+                sql,
+                err: e,
+                kind: RecordKind::Query,
+            }
+            .at(loc));
+        }
+        (
+            None,
+            QueryExpect::Results {
+                types: expected_types,
+                results: expected_results,
+                ..
+            },
+        ) => {
+            if !(column_type_validator)(types, &expected_types) {
+                return Err(TestErrorKind::QueryResultColumnsMismatch {
+                    sql,
+                    expected: expected_types.iter().map(|c| c.to_char()).join(""),
+                    actual: types.iter().map(|c| c.to_char()).join(""),
+                }
+                .at(loc));
+            }
+
+            let actual_results = match result_mode {
+                Some(ResultMode::ValueWise) => rows
+                    .iter()
+                    .flat_map(|strs| strs.iter())
+                    .map(|str| vec![str.to_string()])
+                    .collect_vec(),
+                // default to rowwise
+                _ => rows.to_vec(),
+            };
+
+            if !(validator)(normalizer, &actual_results, &expected_results) {
+                let output_rows =
+                    rows.iter().map(|strs| strs.iter().join("\t")).collect_vec();
+                return Err(TestErrorKind::QueryResultMismatch {
+                    sql,
+                    expected: expected_results.join("\n"),
+                    actual: output_rows.join("\n"),
+                }
+                .at(loc));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     /// Create a new test runner on the database, with the given connection maker.
     ///
@@ -1024,7 +1192,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 retry: _,
                 nowait: _,
             } => {
-                let (types, mut rows) = match self
+                let (types, rows) = match self
                     .run_query_inner(&sql, connection, &conditions, &should_skip)
                     .await
                 {
@@ -1042,86 +1210,24 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     }
                 };
 
-                let mut column_names_present = true;
-                if !self.show_column_names {
-                    rows = rows[1..].into();
-                    column_names_present = false;
-                }
-                if column_names_present && self.flat_values {
-                    rows = rows[1..].into();
-                    column_names_present = false;
-                }
-
-                let sort_mode = match expected {
-                    QueryExpect::Results { sort_mode, .. } => sort_mode,
+                let sort_mode = match &expected {
+                    QueryExpect::Results { sort_mode, .. } => *sort_mode,
                     QueryExpect::Error(_) => None,
                 }
                 .or(self.sort_mode);
 
-                let mut value_sort = false;
-                match sort_mode {
-                    None | Some(SortMode::NoSort) => {}
-                    Some(SortMode::RowSort) => {
-                        // TODO(mkornaukhov) all protocols except from Postgres one should
-                        // return column names by default
-                        if column_names_present {
-                            assert!(!rows.is_empty());
-                            rows[1..].sort_unstable();
-                        } else {
-                            rows.sort_unstable();
-                        }
-                    }
-                    Some(SortMode::ValueSort) => {
-                        if column_names_present {
-                            // Column names are useless
-                            rows = rows[1..].into();
-                            column_names_present = false;
-                        }
-                        rows = rows
-                            .iter()
-                            .flat_map(|row| row.iter())
-                            .map(|s| vec![s.to_owned()])
-                            .collect();
-                        rows.sort_unstable();
-                        value_sort = true;
-                    }
-                };
-
-                if !value_sort && self.flat_values {
-                    rows = rows
-                        .iter()
-                        .flat_map(|row| row.iter())
-                        .map(|s| vec![s.to_owned()])
-                        .collect();
-                }
-                let _ = column_names_present;
-
-                let num_values = if value_sort || self.flat_values {
-                    rows.len()
-                } else {
-                    rows.len() * types.len()
-                };
-
-                if self.hash_threshold > 0 && num_values > self.hash_threshold {
-                    let mut md5 = md5::Md5::new();
-                    for line in &rows {
-                        for value in line {
-                            md5.update(value.as_bytes());
-                            md5.update(b"\n");
-                        }
-                    }
-                    let hash = format!("{:2x}", md5.finalize());
-                    rows = vec![vec![format!(
-                        "{} values hashing to {}",
-                        rows.len() * rows[0].len(),
-                        hash
-                    )]];
-                }
-
+                let num_types = types.len();
                 RecordOutput::Query {
                     error: None,
                     types,
-                    rows: escape(rows),
+                    rows: process_query_rows(
+                        rows,
+                        sort_mode,
+                        self.show_column_names,
+                        self.flat_values,
+                        self.hash_threshold,
+                        num_types,
+                    ),
                 }
             }
             Record::Sleep { duration, .. } => {
@@ -1448,76 +1554,18 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 },
                 RecordOutput::Query { types, rows, error },
             ) => {
-                match (error, expected) {
-                    (None, QueryExpect::Error(_)) => {
-                        return Err(TestErrorKind::Ok {
-                            sql,
-                            kind: RecordKind::Query,
-                        }
-                        .at(loc));
-                    }
-                    (Some(e), QueryExpect::Error(expected_error)) => {
-                        let sqlstate = e
-                            .downcast_ref::<D::Error>()
-                            .and_then(|concrete_err| D::error_sql_state(concrete_err));
-                        if !expected_error.is_match(&e.to_string(), sqlstate.as_deref()) {
-                            return Err(TestErrorKind::ErrorMismatch {
-                                sql,
-                                err: Arc::clone(e),
-                                expected_err: expected_error.to_string(),
-                                kind: RecordKind::Query,
-                                actual_sqlstate: sqlstate,
-                            }
-                            .at(loc));
-                        }
-                    }
-                    (Some(e), QueryExpect::Results { .. }) => {
-                        return Err(TestErrorKind::Fail {
-                            sql,
-                            err: Arc::clone(e),
-                            kind: RecordKind::Query,
-                        }
-                        .at(loc));
-                    }
-                    (
-                        None,
-                        QueryExpect::Results {
-                            types: expected_types,
-                            results: expected_results,
-                            ..
-                        },
-                    ) => {
-                        if !(self.column_type_validator)(types, &expected_types) {
-                            return Err(TestErrorKind::QueryResultColumnsMismatch {
-                                sql,
-                                expected: expected_types.iter().map(|c| c.to_char()).join(""),
-                                actual: types.iter().map(|c| c.to_char()).join(""),
-                            }
-                            .at(loc));
-                        }
-
-                        let actual_results = match self.result_mode {
-                            Some(ResultMode::ValueWise) => rows
-                                .iter()
-                                .flat_map(|strs| strs.iter())
-                                .map(|str| vec![str.to_string()])
-                                .collect_vec(),
-                            // default to rowwise
-                            _ => rows.clone(),
-                        };
-
-                        if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
-                            let output_rows =
-                                rows.iter().map(|strs| strs.iter().join("\t")).collect_vec();
-                            return Err(TestErrorKind::QueryResultMismatch {
-                                sql,
-                                expected: expected_results.join("\n"),
-                                actual: output_rows.join("\n"),
-                            }
-                            .at(loc));
-                        }
-                    }
-                };
+                compare_query_result::<D>(
+                    sql,
+                    loc,
+                    &types,
+                    rows,
+                    error.clone().map(|e| e as Arc<dyn std::error::Error + Send + Sync>),
+                    expected,
+                    self.result_mode,
+                    self.validator,
+                    self.normalizer,
+                    self.column_type_validator,
+                )?;
             }
             (
                 Record::System {
@@ -1647,6 +1695,20 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     }.at(loc)),
                 };
 
+                // For Query records, capture expected results and runner state for comparison.
+                let maybe_expected: Option<QueryExpect<D::ColumnType>> = match &record {
+                    Record::Query { expected, .. } => Some(expected.clone()),
+                    _ => None,
+                };
+                let sort_mode = self.sort_mode;
+                let show_column_names = self.show_column_names;
+                let flat_values = self.flat_values;
+                let hash_threshold = self.hash_threshold;
+                let result_mode = self.result_mode;
+                let validator = self.validator;
+                let normalizer = self.normalizer;
+                let column_type_validator = self.column_type_validator;
+
                 let mut conn = self.conn.make_new(ssl_mode, port).await.map_err(|e| {
                     TestErrorKind::Fail {
                         sql: sql.clone(),
@@ -1657,14 +1719,66 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 })?;
 
                 pending.push(Box::pin(async move {
-                    conn.run(&sql).await.map_err(|e| {
-                        TestErrorKind::Fail {
-                            sql,
-                            err: Arc::new(e),
-                            kind: RecordKind::Statement,
+                    let db_result = conn.run(&sql).await;
+
+                    if let Some(expected) = maybe_expected {
+                        // It's a nowait Query — process rows then check results.
+                        let record_sort_mode = match &expected {
+                            QueryExpect::Results { sort_mode, .. } => *sort_mode,
+                            QueryExpect::Error(_) => None,
+                        };
+                        let effective_sort = record_sort_mode.or(sort_mode);
+                        let effective_result_mode = match &expected {
+                            QueryExpect::Results { result_mode, .. } => *result_mode,
+                            QueryExpect::Error(_) => None,
                         }
-                        .at(loc)
-                    })?;
+                        .or(result_mode);
+
+                        let (error, types, rows) = match db_result {
+                            Err(e) => (
+                                Some(Arc::new(e) as Arc<dyn std::error::Error + Send + Sync>),
+                                vec![],
+                                vec![],
+                            ),
+                            Ok(DBOutput::StatementComplete(_)) => (None, vec![], vec![]),
+                            Ok(DBOutput::Rows { types, rows }) => {
+                                let num_types = types.len();
+                                let processed = process_query_rows(
+                                    rows,
+                                    effective_sort,
+                                    show_column_names,
+                                    flat_values,
+                                    hash_threshold,
+                                    num_types,
+                                );
+                                (None, types, processed)
+                            }
+                        };
+
+                        compare_query_result::<D>(
+                            sql,
+                            loc,
+                            &types,
+                            &rows,
+                            error,
+                            expected,
+                            effective_result_mode,
+                            validator,
+                            normalizer,
+                            column_type_validator,
+                        )?;
+                    } else {
+                        // It's a nowait Statement — only check for errors.
+                        db_result.map_err(|e| {
+                            TestErrorKind::Fail {
+                                sql,
+                                err: Arc::new(e),
+                                kind: RecordKind::Statement,
+                            }
+                            .at(loc)
+                        })?;
+                    }
+
                     conn.shutdown().await;
                     Ok(())
                 }));
