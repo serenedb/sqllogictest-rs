@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
@@ -463,7 +466,10 @@ fn test_async_statement_with_retry_succeeds() {
     let r = remaining.clone();
     let l = log.clone();
     sqllogictest::Runner::new(move |_, _| {
-        let db = FailNTimes { remaining: r.clone(), log: l.clone() };
+        let db = FailNTimes {
+            remaining: r.clone(),
+            log: l.clone(),
+        };
         async move { Ok(db) }
     })
     .run_script(
@@ -477,7 +483,10 @@ wait
     .expect("should succeed after retries");
 
     let got = log.lock().unwrap().clone();
-    assert!(got.contains(&"insert retried".to_string()), "statement was not executed: {got:?}");
+    assert!(
+        got.contains(&"insert retried".to_string()),
+        "statement was not executed: {got:?}"
+    );
 }
 
 #[test]
@@ -487,7 +496,10 @@ fn test_async_statement_with_retry_exhausted() {
     let r = remaining.clone();
     let l = log.clone();
     let err = sqllogictest::Runner::new(move |_, _| {
-        let db = FailNTimes { remaining: r.clone(), log: l.clone() };
+        let db = FailNTimes {
+            remaining: r.clone(),
+            log: l.clone(),
+        };
         async move { Ok(db) }
     })
     .run_script(
@@ -513,7 +525,10 @@ fn test_async_query_with_retry_succeeds() {
     let r = remaining.clone();
     let l = log.clone();
     sqllogictest::Runner::new(move |_, _| {
-        let db = FailNTimes { remaining: r.clone(), log: l.clone() };
+        let db = FailNTimes {
+            remaining: r.clone(),
+            log: l.clone(),
+        };
         async move { Ok(db) }
     })
     .run_script(
@@ -529,7 +544,10 @@ wait
     .expect("query should succeed after retry");
 
     let got = log.lock().unwrap().clone();
-    assert!(got.contains(&"select value".to_string()), "query was not executed: {got:?}");
+    assert!(
+        got.contains(&"select value".to_string()),
+        "query was not executed: {got:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +655,6 @@ wait
         )
         .expect("async system with retry should succeed");
 }
-
 
 // ---------------------------------------------------------------------------
 // control always-async tests
@@ -926,10 +943,7 @@ impl sqllogictest::AsyncDB for ConcurrentDB {
     type Error = ConcurrentDBError;
     type ColumnType = DefaultColumnType;
 
-    async fn run(
-        &mut self,
-        _sql: &str,
-    ) -> Result<DBOutput<Self::ColumnType>, ConcurrentDBError> {
+    async fn run(&mut self, _sql: &str) -> Result<DBOutput<Self::ColumnType>, ConcurrentDBError> {
         // Increment active count and record peak before yielding.
         let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         loop {

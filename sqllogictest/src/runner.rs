@@ -1774,12 +1774,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             if let Record::Wait { .. } = record {
                 for (name, handle) in pending.drain() {
                     tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-                    let task = handle.await.expect("Background task panicked or was aborted")?;
+                    let task = handle
+                        .await
+                        .expect("Background task panicked or was aborted")?;
                     tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
                     task_pool.insert(name, task);
                 }
                 for handle in system_pending.drain(..) {
-                    handle.await.expect("Background task panicked or was aborted")?;
+                    handle
+                        .await
+                        .expect("Background task panicked or was aborted")?;
                 }
                 continue;
             }
@@ -1820,7 +1824,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 // If there's a pending async task on this connection, wait for it first.
                 if let Some(handle) = pending.remove(&conn_name) {
                     tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-                    let task = handle.await.expect("Background task panicked or was aborted")?;
+                    let task = handle
+                        .await
+                        .expect("Background task panicked or was aborted")?;
                     task_pool.insert(conn_name.clone(), task);
                 }
 
@@ -1854,7 +1860,12 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
 
                 if is_exec_async {
                     let permit = if let Some(sem) = &semaphore {
-                        Some(Arc::clone(sem).acquire_owned().await.expect("semaphore closed"))
+                        Some(
+                            Arc::clone(sem)
+                                .acquire_owned()
+                                .await
+                                .expect("semaphore closed"),
+                        )
                     } else {
                         None
                     };
@@ -1881,7 +1892,12 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     },
                 };
                 let permit = if let Some(sem) = &semaphore {
-                    Some(Arc::clone(sem).acquire_owned().await.expect("semaphore closed"))
+                    Some(
+                        Arc::clone(sem)
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore closed"),
+                    )
                 } else {
                     None
                 };
@@ -1909,12 +1925,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         // Drain all remaining pending async tasks at end of input.
         for (name, handle) in pending {
             tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-            let task = handle.await.expect("Background task panicked or was aborted")?;
+            let task = handle
+                .await
+                .expect("Background task panicked or was aborted")?;
             tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
             task_pool.insert(name, task);
         }
         for handle in system_pending {
-            handle.await.expect("Background task panicked or was aborted")?;
+            handle
+                .await
+                .expect("Background task panicked or was aborted")?;
         }
 
         // Return all pooled connections back to self.conn.

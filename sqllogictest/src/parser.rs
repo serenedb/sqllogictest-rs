@@ -1205,12 +1205,11 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 records.push(Record::Wait { loc });
             }
             ["system", rest @ ..] => {
-                let (exec_async, rest) =
-                    if rest.first() == Some(&"async") {
-                        (true, &rest[1..])
-                    } else {
-                        (false, rest)
-                    };
+                let (exec_async, rest) = if rest.first() == Some(&"async") {
+                    (true, &rest[1..])
+                } else {
+                    (false, rest)
+                };
                 let res = match rest {
                     ["ok", res @ ..] => res,
                     _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
