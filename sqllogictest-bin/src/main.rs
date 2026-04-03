@@ -639,7 +639,11 @@ async fn run_parallel(
         }
     }
 
-    eprintln!("\n Finished in {} ms", start.elapsed().as_millis());
+    eprintln!(
+        "\nFinished in {} ms. Engine: {engine}, labels: [{}]",
+        start.elapsed().as_millis(),
+        labels.join(", ")
+    );
 
     drop(drop_tx);
 
@@ -855,6 +859,7 @@ async fn run_serial(
 ) -> Result<()> {
     let mut failed_cases = vec![];
     let mut connection_refused = false;
+    let start = Instant::now();
 
     for file in files {
         let test_case_name = file.to_string_lossy().to_test_case_name();
@@ -891,6 +896,12 @@ async fn run_serial(
             RunResult::Skipped | RunResult::Cancelled => {}
         };
     }
+
+    eprintln!(
+        "\nFinished in {} ms. Engine: {engine}, labels: [{}]",
+        start.elapsed().as_millis(),
+        labels.join(", ")
+    );
 
     if !failed_cases.is_empty() {
         Err(anyhow!("some test case failed:\n{:#?}", failed_cases))
