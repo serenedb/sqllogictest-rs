@@ -4,7 +4,7 @@ use std::future::IntoFuture;
 use futures::future::join_all;
 use futures::Future;
 
-use crate::{AsyncDB, Connection as ConnectionName, DBOutput, DBPort, SslMode};
+use crate::{AsyncDB, Connection as ConnectionName, DBPort, SslMode};
 
 /// Trait for making connections to an [`AsyncDB`].
 ///
@@ -76,20 +76,6 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
 
     pub fn add(&mut self, name: ConnectionName, conn: D) {
         self.conns.insert(name, conn);
-    }
-
-    /// Create a new connection without caching it.
-    ///
-    /// Used by the `async` feature to create a dedicated connection for a background query.
-    pub async fn make_new(&mut self, ssl_mode: SslMode, port: DBPort) -> Result<D, D::Error> {
-        self.make_conn.make(ssl_mode, port).await
-    }
-
-    /// Run a SQL statement on the default connection.
-    ///
-    /// This is a shortcut for calling `get(Default)` then `run`.
-    pub async fn run_default(&mut self, sql: &str) -> Result<DBOutput<D::ColumnType>, D::Error> {
-        self.get(ConnectionName::Default).await?.run(sql).await
     }
 
     /// Shutdown all connections.

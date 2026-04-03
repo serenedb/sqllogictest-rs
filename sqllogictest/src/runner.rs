@@ -771,6 +771,17 @@ pub struct RunVariables {
     substitution_on: bool,
 }
 
+
+/// Substitute the input SQL or command with [`Substitution`], if enabled by `control
+/// substitution`.
+///
+/// If `subst_env_vars`, we will use the `subst` crate to support extensive substitutions, incl.
+/// `$NAME`, `${NAME}`, `${NAME:default}`. The cost is that we will have to use escape
+/// characters, e.g., `\$` & `\\`.
+///
+/// Otherwise, we just do simple string substitution for `__TEST_DIR__` and `__NOW__`.
+/// This is useful for `system` commands: The shell can do the environment variables, and we can
+/// write strings like `\n` without escaping.
 fn may_substitute(
     vars: &RunVariables,
     input: String,
@@ -2021,19 +2032,6 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         block_on(self.run_file_async(filename))
     }
 
-    /// Substitute the input SQL or command with [`Substitution`], if enabled by `control
-    /// substitution`.
-    ///
-    /// If `subst_env_vars`, we will use the `subst` crate to support extensive substitutions, incl.
-    /// `$NAME`, `${NAME}`, `${NAME:default}`. The cost is that we will have to use escape
-    /// characters, e.g., `\$` & `\\`.
-    ///
-    /// Otherwise, we just do simple string substitution for `__TEST_DIR__` and `__NOW__`.
-    /// This is useful for `system` commands: The shell can do the environment variables, and we can
-    /// write strings like `\n` without escaping.
-    fn may_substitute(&self, input: String, subst_env_vars: bool) -> Result<String, AnyError> {
-        may_substitute(&self.vars, input, subst_env_vars)
-    }
 }
 
 impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
