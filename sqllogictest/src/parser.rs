@@ -215,6 +215,9 @@ pub enum Record<T: ColumnType> {
         stdout: Option<String>,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async system commands.
+        exec_async: bool,
     },
     /// A sleep period.
     Sleep {
@@ -392,11 +395,17 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 command,
                 stdout,
                 retry,
+                exec_async,
             } => {
-                writeln!(f, "system ok\n{command}")?;
+                write!(f, "system ")?;
+                if *exec_async {
+                    write!(f, "async ")?;
+                }
+                write!(f, "ok")?;
                 if let Some(retry) = retry {
                     write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
+                writeln!(f, "\n{command}")?;
                 if let Some(stdout) = stdout {
                     writeln!(f, "----\n{}\n", stdout.trim())?;
                 }
@@ -421,6 +430,8 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 Control::SortMode(m) => write!(f, "control sortmode {}", m.as_str()),
                 Control::ResultMode(m) => write!(f, "control resultmode {}", m.as_str()),
                 Control::Substitution(s) => write!(f, "control substitution {}", s.as_str()),
+                Control::AlwaysAsync(s) => write!(f, "control always-async {}", s.as_str()),
+                Control::MaxAsyncConnections(n) => write!(f, "control max-async-connections {}", n),
             },
             Record::Condition(cond) => match cond {
                 Condition::OnlyIf { label, comments } => {
@@ -635,6 +646,12 @@ pub enum Control {
     ResultMode(ResultMode),
     /// Control whether or not to substitute variables in the SQL.
     Substitution(bool),
+    /// When on, all subsequent statement/query/system records are treated as async
+    /// without needing to write `async` on each one.
+    AlwaysAsync(bool),
+    /// Limit the number of concurrently executing async tasks.
+    /// `0` clears the limit (unlimited).
+    MaxAsyncConnections(usize),
 }
 
 trait ControlItem: Sized {
@@ -1184,10 +1201,20 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     exec_async,
                 });
             }
-            ["wait"] | ["sync"] => {
+            ["wait"] => {
                 records.push(Record::Wait { loc });
             }
-            ["system", "ok", res @ ..] => {
+            ["system", rest @ ..] => {
+                let (exec_async, rest) =
+                    if rest.first() == Some(&"async") {
+                        (true, &rest[1..])
+                    } else {
+                        (false, rest)
+                    };
+                let res = match rest {
+                    ["ok", res @ ..] => res,
+                    _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
+                };
                 let retry = parse_retry_config(res).map_err(|e| e.at(loc.clone()))?;
 
                 // TODO: we don't support asserting error message for system command
@@ -1205,6 +1232,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     command,
                     stdout,
                     retry,
+                    exec_async,
                 });
             }
             ["control", res @ ..] => match res {
@@ -1221,6 +1249,14 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 ["substitution", on_off] => match bool::try_from_str(on_off) {
                     Ok(on_off) => records.push(Record::Control(Control::Substitution(on_off))),
                     Err(k) => return Err(k.at(loc)),
+                },
+                ["always-async", on_off] => match bool::try_from_str(on_off) {
+                    Ok(on_off) => records.push(Record::Control(Control::AlwaysAsync(on_off))),
+                    Err(k) => return Err(k.at(loc)),
+                },
+                ["max-async-connections", n] => match n.parse::<usize>() {
+                    Ok(n) => records.push(Record::Control(Control::MaxAsyncConnections(n))),
+                    Err(_) => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
                 },
                 _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
             },

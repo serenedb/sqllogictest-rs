@@ -24,6 +24,7 @@ similar = { workspace = true }
 subst = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "process", "macros"] }
 tracing = { workspace = true }
 rand = { workspace = true }
 log = { workspace = true }

@@ -5,9 +5,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
+async-trait = { workspace = true }
 regex = "1.11.1"
 rusty-fork = "0.3"
 sqllogictest = { path = "../sqllogictest" }
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [[test]]
 name = "harness"

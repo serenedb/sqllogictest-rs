@@ -9,9 +9,15 @@ use std::time::Duration;
 use std::vec;
 
 use async_trait::async_trait;
-use futures::executor::block_on;
-use futures::Future;
 use itertools::Itertools;
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(fut)
+}
 use md5::Digest;
 use owo_colors::OwoColorize;
 use similar::{Change, ChangeTag, TextDiff};
@@ -731,6 +737,12 @@ pub struct CheckOptions<D: AsyncDB> {
     hash_threshold: usize,
     show_column_names: bool,
     flat_values: bool,
+    /// When true, all statement/query/system records are treated as async
+    /// without needing `async` on each one.
+    always_async: bool,
+    /// Maximum number of concurrently executing async tasks. `None` means unlimited.
+    /// Controlled by `control max-async-connections N` (0 = unlimited).
+    max_async_connections: Option<usize>,
 }
 
 impl<D: AsyncDB> Clone for CheckOptions<D> {
@@ -744,6 +756,8 @@ impl<D: AsyncDB> Clone for CheckOptions<D> {
             hash_threshold: self.hash_threshold,
             show_column_names: self.show_column_names,
             flat_values: self.flat_values,
+            always_async: self.always_async,
+            max_async_connections: self.max_async_connections,
         }
     }
 }
@@ -1074,6 +1088,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
                 loc: _,
                 stdout: expected_stdout,
                 retry: _,
+                exec_async: _,
             } => {
                 if should_skip(&self.context.vars.labels, "", &conditions) {
                     return RecordOutput::Nothing;
@@ -1230,6 +1245,13 @@ impl<D: AsyncDB> ConnectionTask<D> {
                         self.context.check_options.result_mode = Some(result_mode);
                     }
                     Control::Substitution(on_off) => self.context.vars.substitution_on = on_off,
+                    Control::AlwaysAsync(on_off) => {
+                        self.context.check_options.always_async = on_off
+                    }
+                    Control::MaxAsyncConnections(n) => {
+                        self.context.check_options.max_async_connections =
+                            if n == 0 { None } else { Some(n) };
+                    }
                 }
 
                 RecordOutput::Nothing
@@ -1464,6 +1486,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
                     command,
                     stdout: expected_stdout,
                     retry: _,
+                    exec_async: _,
                 },
                 RecordOutput::System {
                     error,
@@ -1601,7 +1624,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        futures::executor::block_on(self.run_record_async(record))
+        block_on(self.run_record_async(record))
     }
 }
 
@@ -1622,6 +1645,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 hash_threshold: 0,
                 show_column_names: true,
                 flat_values: false,
+                always_async: false,
+                max_async_connections: None,
             },
             vars: RunVariables {
                 labels: HashSet::new(),
@@ -1726,13 +1751,19 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         // Idle ConnectionTasks keyed by connection name, available for the next record.
         let mut task_pool: HashMap<ConnectionName, ConnectionTask<D>> = HashMap::new();
 
-        // exec_async tasks currently in-flight, keyed by connection name.
+        let semaphore: Option<Arc<tokio::sync::Semaphore>> = self
+            .check_options
+            .max_async_connections
+            .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+
+        // exec_async connection tasks (Statement/Query) currently in-flight, keyed by connection name.
         let mut pending: HashMap<
             ConnectionName,
-            std::pin::Pin<
-                Box<dyn Future<Output = Result<ConnectionTask<D>, TestError>> + Send + 'static>,
-            >,
+            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
         > = HashMap::new();
+
+        // exec_async system tasks in-flight (no connection to return).
+        let mut system_pending: Vec<tokio::task::JoinHandle<Result<(), TestError>>> = Vec::new();
 
         for record in records.into_iter() {
             if let Record::Halt { .. } = record {
@@ -1741,18 +1772,23 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
 
             // A wait record drains all pending async tasks before continuing.
             if let Record::Wait { .. } = record {
-                for (name, fut) in pending.drain() {
+                for (name, handle) in pending.drain() {
                     tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-                    let task = fut.await?;
+                    let task = handle.await.expect("Background task panicked or was aborted")?;
                     tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
                     task_pool.insert(name, task);
+                }
+                for handle in system_pending.drain(..) {
+                    handle.await.expect("Background task panicked or was aborted")?;
                 }
                 continue;
             }
 
             let is_exec_async = match &record {
-                Record::Statement { exec_async, .. } | Record::Query { exec_async, .. } => {
-                    *exec_async
+                Record::Statement { exec_async, .. }
+                | Record::Query { exec_async, .. }
+                | Record::System { exec_async, .. } => {
+                    *exec_async || self.check_options.always_async
                 }
                 _ => false,
             };
@@ -1782,9 +1818,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
 
             if let Some((conn_name, sql, loc)) = maybe_conn_info {
                 // If there's a pending async task on this connection, wait for it first.
-                if let Some(fut) = pending.remove(&conn_name) {
+                if let Some(handle) = pending.remove(&conn_name) {
                     tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-                    let task = fut.await?;
+                    let task = handle.await.expect("Background task panicked or was aborted")?;
                     task_pool.insert(conn_name.clone(), task);
                 }
 
@@ -1817,11 +1853,17 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 };
 
                 if is_exec_async {
-                    let fut = Box::pin(async move {
+                    let permit = if let Some(sem) = &semaphore {
+                        Some(Arc::clone(sem).acquire_owned().await.expect("semaphore closed"))
+                    } else {
+                        None
+                    };
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit;
                         task.run_record_async(record).await?;
                         Ok(task)
                     });
-                    pending.insert(conn_name, fut);
+                    pending.insert(conn_name, handle);
                 } else {
                     task.run_record_async(record).await?;
                     // Propagate any context changes (e.g. let variables) back to runner state.
@@ -1829,6 +1871,25 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     self.check_options = task.context.check_options.clone();
                     task_pool.insert(conn_name, task);
                 }
+            } else if is_exec_async {
+                // Async system command — dispatch without waiting for completion.
+                let mut task = ConnectionTask {
+                    conn: None,
+                    context: TaskContext {
+                        vars: self.vars.clone(),
+                        check_options: self.check_options.clone(),
+                    },
+                };
+                let permit = if let Some(sem) = &semaphore {
+                    Some(Arc::clone(sem).acquire_owned().await.expect("semaphore closed"))
+                } else {
+                    None
+                };
+                let handle = tokio::spawn(async move {
+                    let _permit = permit;
+                    task.run_record_async(record).await.map(|_| ())
+                });
+                system_pending.push(handle);
             } else {
                 // Records that don't need a connection (System, Control, Sleep, etc.)
                 let mut task = ConnectionTask {
@@ -1846,11 +1907,14 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         }
 
         // Drain all remaining pending async tasks at end of input.
-        for (name, fut) in pending {
+        for (name, handle) in pending {
             tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-            let task = fut.await?;
+            let task = handle.await.expect("Background task panicked or was aborted")?;
             tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
             task_pool.insert(name, task);
+        }
+        for handle in system_pending {
+            handle.await.expect("Background task panicked or was aborted")?;
         }
 
         // Return all pooled connections back to self.conn.
@@ -2320,6 +2384,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 command,
                 stdout: _,
                 retry,
+                exec_async,
             },
             RecordOutput::System {
                 stdout: actual_stdout,
@@ -2339,6 +2404,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 command,
                 stdout: actual_stdout.clone(),
                 retry,
+                exec_async,
             })
         }
 
