@@ -57,7 +57,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
     /// The [`SslMode`] from the [`ConnectionName`] is forwarded to
     /// [`MakeConnection::make`] only when creating a new connection — it is
     /// ignored on cache hits since the connection is already established.
-    pub async fn get(&mut self, name: ConnectionName) -> Result<&mut D, D::Error> {
+    pub async fn get(&mut self, name: ConnectionName) -> Result<D, D::Error> {
         use std::collections::hash_map::Entry;
 
         // Extract ssl_mode and port before moving `name` into the entry API.
@@ -67,21 +67,22 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
         };
 
         let conn = match self.conns.entry(name) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => {
-                let conn = self.make_conn.make(ssl_mode, port).await?;
-                v.insert(conn)
-            }
+            Entry::Occupied(o) => o.remove(),
+            Entry::Vacant(_) => self.make_conn.make(ssl_mode, port).await?,
         };
 
         Ok(conn)
     }
 
+    pub fn add(&mut self, name: ConnectionName, conn: D) {
+        self.conns.insert(name, conn);
+    }
+
     /// Create a new connection without caching it.
     ///
-    /// Used by the `nowait` feature to create a dedicated connection for a background query.
+    /// Used by the `async` feature to create a dedicated connection for a background query.
     pub async fn make_new(&mut self, ssl_mode: SslMode, port: DBPort) -> Result<D, D::Error> {
-        self.make_conn.make(ssl_mode, port).await
+        Ok(self.make_conn.make(ssl_mode, port).await?)
     }
 
     /// Run a SQL statement on the default connection.

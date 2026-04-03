@@ -1,0 +1,24 @@
+statement async ok
+insert row1
+
+statement async ok
+insert row2
+
+wait
+
+query async I
+select count()
+----
+1
+
+query async I rowsort
+select values()
+----
+1
+
+query async I rowsort my_label
+select values()
+----
+1
+
+wait

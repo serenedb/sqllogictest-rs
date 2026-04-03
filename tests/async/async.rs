@@ -49,43 +49,43 @@ macro_rules! runner {
 }
 
 // ---------------------------------------------------------------------------
-// nowait statement tests
+// async statement tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_nowait_statement_executes() {
+fn test_async_statement_executes() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
         .run_script(
             "\
-statement nowait ok
+statement async ok
 insert a
 
-statement nowait ok
+statement async ok
 insert b
 
-sync
+wait
 ",
         )
         .expect("script should succeed");
 
     let got = log.lock().unwrap().clone();
-    assert_eq!(got.len(), 2, "both nowait statements should have executed");
+    assert_eq!(got.len(), 2, "both async statements should have executed");
     assert!(got.contains(&"insert a".to_string()));
     assert!(got.contains(&"insert b".to_string()));
 }
 
 #[test]
-fn test_nowait_statement_auto_sync_at_eof() {
-    // No explicit `sync` — statements should still execute by end of script.
+fn test_async_statement_auto_sync_at_eof() {
+    // No explicit `wait` — statements should still execute by end of script.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
         .run_script(
             "\
-statement nowait ok
+statement async ok
 insert x
 
-statement nowait ok
+statement async ok
 insert y
 ",
         )
@@ -98,19 +98,19 @@ insert y
 }
 
 #[test]
-fn test_nowait_statement_error_reported_at_sync() {
+fn test_async_statement_error_reported_at_sync() {
     let log = Arc::new(Mutex::new(vec![]));
 
     let err = runner!(log)
         .run_script(
             "\
-statement nowait ok
+statement async ok
 fail something went wrong
 
-sync
+wait
 ",
         )
-        .expect_err("error from nowait statement should surface at sync");
+        .expect_err("error from async statement should surface at wait");
 
     assert!(
         err.to_string().contains("something went wrong"),
@@ -119,17 +119,17 @@ sync
 }
 
 #[test]
-fn test_nowait_statement_error_reported_at_eof() {
+fn test_async_statement_error_reported_at_eof() {
     let log = Arc::new(Mutex::new(vec![]));
 
     let err = runner!(log)
         .run_script(
             "\
-statement nowait ok
+statement async ok
 fail another error
 ",
         )
-        .expect_err("error from nowait statement should surface at end of script");
+        .expect_err("error from async statement should surface at end of script");
 
     assert!(
         err.to_string().contains("another error"),
@@ -138,23 +138,23 @@ fail another error
 }
 
 // ---------------------------------------------------------------------------
-// nowait query tests
+// async query tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_nowait_query_executes() {
-    // The query result is not validated (nowait), but the SQL must be executed.
+fn test_async_query_executes() {
+    // The query result is not validated (async), but the SQL must be executed.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
         .run_script(
             "\
-query nowait I
+query async I
 select count
 
-sync
+wait
 ",
         )
-        .expect("nowait query should succeed");
+        .expect("async query should succeed");
 
     let got = log.lock().unwrap().clone();
     assert!(
@@ -164,41 +164,41 @@ sync
 }
 
 #[test]
-fn test_nowait_query_auto_sync() {
+fn test_async_query_auto_sync() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
         .run_script(
             "\
-query nowait I
+query async I
 select value
 ",
         )
-        .expect("nowait query should succeed");
+        .expect("async query should succeed");
 
     let got = log.lock().unwrap().clone();
     assert!(got.contains(&"select value".to_string()));
 }
 
 // ---------------------------------------------------------------------------
-// Mixing nowait with regular records
+// Mixing async with regular records
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_nowait_interleaved_with_regular() {
+fn test_async_interleaved_with_regular() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
         .run_script(
             "\
-statement nowait ok
+statement async ok
 insert background
 
 statement ok
 insert foreground
 
-sync
+wait
 ",
         )
-        .expect("mixed nowait/regular should succeed");
+        .expect("mixed async/regular should succeed");
 
     let got = log.lock().unwrap().clone();
     assert_eq!(got.len(), 2);
@@ -212,21 +212,21 @@ fn test_multiple_sync_points() {
     runner!(log)
         .run_script(
             "\
-statement nowait ok
+statement async ok
 insert batch1_a
 
-statement nowait ok
+statement async ok
 insert batch1_b
 
-sync
+wait
 
-statement nowait ok
+statement async ok
 insert batch2_a
 
-sync
+wait
 ",
         )
-        .expect("multiple sync points should work");
+        .expect("multiple wait points should work");
 
     let got = log.lock().unwrap().clone();
     assert_eq!(got.len(), 3);
@@ -236,7 +236,7 @@ sync
 }
 
 // ---------------------------------------------------------------------------
-// sync with no pending is a no-op
+// wait with no pending is a no-op
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -248,13 +248,13 @@ fn test_sync_with_no_pending_is_noop() {
 statement ok
 insert regular
 
-sync
+wait
 
 statement ok
 insert another
 ",
         )
-        .expect("sync with nothing pending should not error");
+        .expect("wait with nothing pending should not error");
 
     let got = log.lock().unwrap().clone();
     assert_eq!(got.len(), 2);

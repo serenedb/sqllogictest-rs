@@ -47,9 +47,7 @@
 //!
 //! // You can also parse the script and execute the records separately:
 //! let records = sqllogictest::parse_file("../tests/slt/basic.slt").unwrap();
-//! for record in records {
-//!     let _res = tester.run(record);
-//! }
+//! let _res = tester.run_multi(records);
 //! ```
 
 pub mod column_type;

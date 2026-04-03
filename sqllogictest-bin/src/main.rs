@@ -1230,7 +1230,7 @@ where
     }
     begin_times.truncate(1);
 
-    // Use run_multi_async so that `nowait` and `sync` records are handled correctly.
+    // Use run_multi_async so that `async` and `wait` records are handled correctly.
     if let Err(e) = runner.run_multi_async(records).await {
         if show_all_errors {
             errors.push(e.kind());
@@ -1479,7 +1479,7 @@ async fn update_record<M: MakeConnection>(
         return Ok(());
     }
 
-    let record_output = runner.apply_record(record.clone()).await;
+    let record_output = runner.run_record_async(record.clone()).await;
     match update_record_with_output(
         &record,
         &record_output,
