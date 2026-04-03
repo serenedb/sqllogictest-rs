@@ -751,8 +751,8 @@ impl<D: AsyncDB> Clone for CheckOptions<D> {
             validator: self.validator,
             normalizer: self.normalizer,
             column_type_validator: self.column_type_validator,
-            sort_mode: self.sort_mode.clone(),
-            result_mode: self.result_mode.clone(),
+            sort_mode: self.sort_mode,
+            result_mode: self.result_mode,
             hash_threshold: self.hash_threshold,
             show_column_names: self.show_column_names,
             flat_values: self.flat_values,
@@ -1471,7 +1471,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
                 self.compare_query_result(
                     sql,
                     loc,
-                    &types,
+                    types,
                     rows,
                     error
                         .clone()

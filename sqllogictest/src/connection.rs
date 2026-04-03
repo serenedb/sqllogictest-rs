@@ -82,7 +82,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
     ///
     /// Used by the `async` feature to create a dedicated connection for a background query.
     pub async fn make_new(&mut self, ssl_mode: SslMode, port: DBPort) -> Result<D, D::Error> {
-        Ok(self.make_conn.make(ssl_mode, port).await?)
+        self.make_conn.make(ssl_mode, port).await
     }
 
     /// Run a SQL statement on the default connection.
