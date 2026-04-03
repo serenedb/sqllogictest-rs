@@ -771,7 +771,6 @@ pub struct RunVariables {
     substitution_on: bool,
 }
 
-
 /// Substitute the input SQL or command with [`Substitution`], if enabled by `control
 /// substitution`.
 ///
@@ -2031,7 +2030,6 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     {
         block_on(self.run_file_async(filename))
     }
-
 }
 
 impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
