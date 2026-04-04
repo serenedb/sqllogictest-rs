@@ -181,6 +181,9 @@ pub enum Record<T: ColumnType> {
         expected: StatementExpect,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async queries.
+        exec_async: bool,
     },
     /// A query is an SQL command from which we expect to receive results. The result set might be
     /// empty.
@@ -193,6 +196,13 @@ pub enum Record<T: ColumnType> {
         expected: QueryExpect<T>,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async queries.
+        exec_async: bool,
+    },
+    /// A wait record waits for all pending `async` queries to complete before proceeding.
+    Wait {
+        loc: Location,
     },
     /// A system command is an external command that is to be executed by the shell. Currently it
     /// must succeed and the output is ignored.
@@ -205,6 +215,9 @@ pub enum Record<T: ColumnType> {
         stdout: Option<String>,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async system commands.
+        exec_async: bool,
     },
     /// A sleep period.
     Sleep {
@@ -297,8 +310,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 sql,
                 expected,
                 retry,
+                exec_async,
             } => {
                 write!(f, "statement ")?;
+                if *exec_async {
+                    write!(f, "async ")?;
+                }
                 match expected {
                     StatementExpect::Ok => write!(f, "ok")?,
                     StatementExpect::Count(cnt) => write!(f, "count {cnt}")?,
@@ -323,8 +340,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 sql,
                 expected,
                 retry,
+                exec_async,
             } => {
                 write!(f, "query")?;
+                if *exec_async {
+                    write!(f, " async")?;
+                }
                 match expected {
                     QueryExpect::Results {
                         types,
@@ -374,11 +395,17 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 command,
                 stdout,
                 retry,
+                exec_async,
             } => {
-                writeln!(f, "system ok\n{command}")?;
+                write!(f, "system ")?;
+                if *exec_async {
+                    write!(f, "async ")?;
+                }
+                write!(f, "ok")?;
                 if let Some(retry) = retry {
                     write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
+                writeln!(f, "\n{command}")?;
                 if let Some(stdout) = stdout {
                     writeln!(f, "----\n{}\n", stdout.trim())?;
                 }
@@ -396,10 +423,15 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             Record::Halt { loc: _ } => {
                 write!(f, "halt")
             }
+            Record::Wait { loc: _ } => {
+                write!(f, "wait")
+            }
             Record::Control(c) => match c {
                 Control::SortMode(m) => write!(f, "control sortmode {}", m.as_str()),
                 Control::ResultMode(m) => write!(f, "control resultmode {}", m.as_str()),
                 Control::Substitution(s) => write!(f, "control substitution {}", s.as_str()),
+                Control::AlwaysAsync(s) => write!(f, "control always-async {}", s.as_str()),
+                Control::MaxAsyncConnections(n) => write!(f, "control max-async-connections {}", n),
             },
             Record::Condition(cond) => match cond {
                 Condition::OnlyIf { label, comments } => {
@@ -614,6 +646,12 @@ pub enum Control {
     ResultMode(ResultMode),
     /// Control whether or not to substitute variables in the SQL.
     Substitution(bool),
+    /// When on, all subsequent statement/query/system records are treated as async
+    /// without needing to write `async` on each one.
+    AlwaysAsync(bool),
+    /// Limit the number of concurrently executing async tasks.
+    /// `0` clears the limit (unlimited).
+    MaxAsyncConnections(usize),
 }
 
 trait ControlItem: Sized {
@@ -1014,6 +1052,11 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 records.push(Record::Connection(conn));
             }
             ["statement", res @ ..] => {
+                let (exec_async, res) = if res.first() == Some(&"async") {
+                    (true, &res[1..])
+                } else {
+                    (false, res)
+                };
                 let (mut expected, res) = match res {
                     ["ok", retry @ ..] => (StatementExpect::Ok, retry),
                     ["error", res @ ..] => {
@@ -1061,9 +1104,15 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                     expected,
                     retry,
+                    exec_async,
                 });
             }
             ["query", res @ ..] => {
+                let (exec_async, res) = if res.first() == Some(&"async") {
+                    (true, &res[1..])
+                } else {
+                    (false, res)
+                };
                 let (mut expected, res) = match res {
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
@@ -1078,7 +1127,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                         }
                     }
                     [type_str, res @ ..] => {
-                        // query <type-string> [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
+                        // query [async] <type-string> [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
                         let types = type_str
                             .chars()
                             .map(|ch| {
@@ -1149,9 +1198,22 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                     expected,
                     retry,
+                    exec_async,
                 });
             }
-            ["system", "ok", res @ ..] => {
+            ["wait"] => {
+                records.push(Record::Wait { loc });
+            }
+            ["system", rest @ ..] => {
+                let (exec_async, rest) = if rest.first() == Some(&"async") {
+                    (true, &rest[1..])
+                } else {
+                    (false, rest)
+                };
+                let res = match rest {
+                    ["ok", res @ ..] => res,
+                    _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
+                };
                 let retry = parse_retry_config(res).map_err(|e| e.at(loc.clone()))?;
 
                 // TODO: we don't support asserting error message for system command
@@ -1169,6 +1231,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     command,
                     stdout,
                     retry,
+                    exec_async,
                 });
             }
             ["control", res @ ..] => match res {
@@ -1185,6 +1248,14 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                 ["substitution", on_off] => match bool::try_from_str(on_off) {
                     Ok(on_off) => records.push(Record::Control(Control::Substitution(on_off))),
                     Err(k) => return Err(k.at(loc)),
+                },
+                ["always-async", on_off] => match bool::try_from_str(on_off) {
+                    Ok(on_off) => records.push(Record::Control(Control::AlwaysAsync(on_off))),
+                    Err(k) => return Err(k.at(loc)),
+                },
+                ["max-async-connections", n] => match n.parse::<usize>() {
+                    Ok(n) => records.push(Record::Control(Control::MaxAsyncConnections(n))),
+                    Err(_) => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
                 },
                 _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
             },
@@ -1567,6 +1638,7 @@ select * from foo;
                 sql: "select * from foo;".to_string(),
                 expected: QueryExpect::empty_results(),
                 retry: None,
+                exec_async: false,
             }]
         );
     }
@@ -1641,6 +1713,7 @@ select * from foo;
                     Record::FlatValues { loc, .. } => normalize_loc(loc),
                     Record::Let { loc, .. } => normalize_loc(loc),
                     Record::Print { loc, .. } => normalize_loc(loc),
+                    Record::Wait { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match
@@ -1693,6 +1766,150 @@ select * from foo;
     #[test]
     fn test_query_retry() {
         parse_roundtrip::<DefaultColumnType>("../tests/no_run/query_retry.slt")
+    }
+
+    #[test]
+    fn test_async_roundtrip() {
+        parse_roundtrip::<DefaultColumnType>("../tests/no_run/async.slt")
+    }
+
+    #[test]
+    fn test_parse_statement_async() {
+        let script = "statement async ok\ninsert into t values (1)\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Statement {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async, "expected async=true");
+                assert_eq!(*expected, StatementExpect::Ok);
+            }
+            _ => panic!("expected Statement record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_statement_no_async_by_default() {
+        let script = "statement ok\ninsert into t values (1)\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Statement { exec_async, .. } => {
+                assert!(!*exec_async, "expected async=false by default");
+            }
+            _ => panic!("expected Statement record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_async() {
+        let script = "query async I\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async, "expected async=true");
+                match expected {
+                    QueryExpect::Results { types, .. } => {
+                        assert_eq!(types.len(), 1);
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_async_with_sort_mode() {
+        let script = "query async I rowsort\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async);
+                match expected {
+                    QueryExpect::Results { sort_mode, .. } => {
+                        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_async_with_label() {
+        let script = "query async I rowsort my_label\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async);
+                match expected {
+                    QueryExpect::Results {
+                        label, sort_mode, ..
+                    } => {
+                        assert_eq!(label.as_deref(), Some("my_label"));
+                        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wait() {
+        let script = "wait\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], Record::Wait { .. }));
+    }
+
+    #[test]
+    fn test_async_display_roundtrip() {
+        let cases = [
+            "statement async ok\ninsert into t\n\n",
+            "statement async count 3\ninsert into t\n\n",
+            "query async I\nselect id from t\n----\n1\n\n",
+            "query async I rowsort\nselect id from t\n----\n1\n\n",
+            "query async I rowsort my_label\nselect id from t\n----\n1\n\n",
+            "wait",
+        ];
+        for case in cases {
+            let records = parse::<DefaultColumnType>(case)
+                .unwrap_or_else(|e| panic!("failed to parse {case:?}: {e}"));
+            let displayed = records
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let reparsed = parse::<DefaultColumnType>(&displayed)
+                .unwrap_or_else(|e| panic!("failed to reparse {displayed:?}: {e}"));
+            assert_eq!(
+                records.len(),
+                reparsed.len(),
+                "length mismatch for {case:?}"
+            );
+        }
     }
 
     #[test]

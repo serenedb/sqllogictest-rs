@@ -4,7 +4,7 @@ use std::future::IntoFuture;
 use futures::future::join_all;
 use futures::Future;
 
-use crate::{AsyncDB, Connection as ConnectionName, DBOutput, DBPort, SslMode};
+use crate::{AsyncDB, Connection as ConnectionName, DBPort, SslMode};
 
 /// Trait for making connections to an [`AsyncDB`].
 ///
@@ -57,7 +57,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
     /// The [`SslMode`] from the [`ConnectionName`] is forwarded to
     /// [`MakeConnection::make`] only when creating a new connection — it is
     /// ignored on cache hits since the connection is already established.
-    pub async fn get(&mut self, name: ConnectionName) -> Result<&mut D, D::Error> {
+    pub async fn get(&mut self, name: ConnectionName) -> Result<D, D::Error> {
         use std::collections::hash_map::Entry;
 
         // Extract ssl_mode and port before moving `name` into the entry API.
@@ -67,21 +67,15 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
         };
 
         let conn = match self.conns.entry(name) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => {
-                let conn = self.make_conn.make(ssl_mode, port).await?;
-                v.insert(conn)
-            }
+            Entry::Occupied(o) => o.remove(),
+            Entry::Vacant(_) => self.make_conn.make(ssl_mode, port).await?,
         };
 
         Ok(conn)
     }
 
-    /// Run a SQL statement on the default connection.
-    ///
-    /// This is a shortcut for calling `get(Default)` then `run`.
-    pub async fn run_default(&mut self, sql: &str) -> Result<DBOutput<D::ColumnType>, D::Error> {
-        self.get(ConnectionName::Default).await?.run(sql).await
+    pub fn add(&mut self, name: ConnectionName, conn: D) {
+        self.conns.insert(name, conn);
     }
 
     /// Shutdown all connections.
