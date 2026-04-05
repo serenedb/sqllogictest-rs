@@ -78,6 +78,10 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
         self.conns.insert(name, conn);
     }
 
+    pub async fn make_new(&mut self) -> Result<D, D::Error> {
+        self.make_conn.make(SslMode::Disable, DBPort::Plain).await
+    }
+
     /// Shutdown all connections.
     pub async fn shutdown_all(&mut self) {
         join_all(self.conns.values_mut().map(|conn| conn.shutdown())).await;

@@ -1758,29 +1758,26 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        // Idle ConnectionTasks keyed by connection name, available for the next record.
-        let mut task_pool: HashMap<ConnectionName, ConnectionTask<D>> = HashMap::new();
-
-        let semaphore: Option<Arc<tokio::sync::Semaphore>> = self
+        let mut semaphore: Option<Arc<tokio::sync::Semaphore>> = self
             .check_options
             .max_async_connections
             .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
 
-        // exec_async connection tasks (Statement/Query) currently in-flight, keyed by connection name.
+        // exec_async named tasks in-flight, keyed by connection name.
         let mut pending: HashMap<
             ConnectionName,
             tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
         > = HashMap::new();
 
-        // exec_async system tasks in-flight (no connection to return).
-        let mut system_pending: Vec<tokio::task::JoinHandle<Result<(), TestError>>> = Vec::new();
+        // exec_async anonymous tasks in-flight (System or connectionless records).
+        let mut anon_pending: Vec<tokio::task::JoinHandle<Result<(), TestError>>> = Vec::new();
 
         for record in records.into_iter() {
             if let Record::Halt { .. } = record {
                 break;
             }
 
-            // A wait record drains all pending async tasks before continuing.
+            // Wait drains all in-flight tasks before continuing.
             if let Record::Wait { .. } = record {
                 for (name, handle) in pending.drain() {
                     tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
@@ -1788,9 +1785,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         .await
                         .expect("Background task panicked or was aborted")?;
                     tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
-                    task_pool.insert(name, task);
+                    self.conn.add(name, task.conn.unwrap());
                 }
-                for handle in system_pending.drain(..) {
+                for handle in anon_pending.drain(..) {
                     handle
                         .await
                         .expect("Background task panicked or was aborted")?;
@@ -1798,160 +1795,271 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 continue;
             }
 
+            // Determine is_exec_async only for stmt/query/system; everything else is executed
+            // directly below.
             let is_exec_async = match &record {
                 Record::Statement { exec_async, .. }
                 | Record::Query { exec_async, .. }
                 | Record::System { exec_async, .. } => {
                     *exec_async || self.check_options.always_async
                 }
-                _ => false,
-            };
-
-            // Determine whether this record needs a connection, and extract info for errors.
-            let maybe_conn_info = match &record {
-                Record::Statement {
-                    connection,
-                    sql,
-                    loc,
-                    ..
-                }
-                | Record::Query {
-                    connection,
-                    sql,
-                    loc,
-                    ..
-                }
-                | Record::Let {
-                    connection,
-                    sql,
-                    loc,
-                    ..
-                } => Some((connection.clone(), sql.clone(), loc.clone())),
-                _ => None,
-            };
-
-            if let Some((conn_name, sql, loc)) = maybe_conn_info {
-                // If there's a pending async task on this connection, wait for it first.
-                if let Some(handle) = pending.remove(&conn_name) {
-                    tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-                    let task = handle
-                        .await
-                        .expect("Background task panicked or was aborted")?;
-                    task_pool.insert(conn_name.clone(), task);
-                }
-
-                // Take an idle task from the pool, or create a new one.
-                // Refresh context in case Control records changed runner state since last use.
-                let mut task = if let Some(mut t) = task_pool.remove(&conn_name) {
-                    t.context.vars = self.vars.clone();
-                    t.context.check_options = self.check_options.clone();
-                    t
-                } else {
-                    let conn = self
-                        .conn
-                        .get(conn_name.clone())
-                        .await
-                        .map_err(|e| TestError {
-                            loc: loc.clone(),
-                            kind: Box::new(TestErrorKind::Fail {
-                                sql: sql.clone(),
-                                err: Arc::new(e),
-                                kind: RecordKind::Statement,
-                            }),
-                        })?;
-                    ConnectionTask {
-                        conn: Some(conn),
+                _ => {
+                    // Not a stmt/query/system — run directly, no connection needed.
+                    let mut task = ConnectionTask {
+                        conn: None,
                         context: TaskContext {
                             vars: self.vars.clone(),
                             check_options: self.check_options.clone(),
                         },
-                    }
-                };
-
-                if is_exec_async {
-                    let permit = if let Some(sem) = &semaphore {
-                        Some(
-                            Arc::clone(sem)
-                                .acquire_owned()
-                                .await
-                                .expect("semaphore closed"),
-                        )
-                    } else {
-                        None
                     };
-                    let handle = tokio::spawn(async move {
-                        let _permit = permit;
-                        task.run_record_async(record).await?;
-                        Ok(task)
-                    });
-                    pending.insert(conn_name, handle);
-                } else {
                     task.run_record_async(record).await?;
-                    // Propagate any context changes (e.g. let variables) back to runner state.
+                    self.vars = task.context.vars;
+                    let old_limit = self.check_options.max_async_connections;
+                    self.check_options = task.context.check_options;
+                    // Resync the semaphore if max_async_connections changed (e.g. via a
+                    // `control max-async-connections` record).  No tasks are in-flight when
+                    // a control record is processed so it is safe to replace the semaphore.
+                    if self.check_options.max_async_connections != old_limit {
+                        semaphore = self
+                            .check_options
+                            .max_async_connections
+                            .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+                    }
+                    continue;
+                }
+            };
+
+            match record {
+                // ── Statement / Query ────────────────────────────────────────────────────
+                Record::Statement {
+                    ref connection,
+                    ref sql,
+                    ref loc,
+                    ..
+                }
+                | Record::Query {
+                    ref connection,
+                    ref sql,
+                    ref loc,
+                    ..
+                } => {
+                    let conn_name = connection.clone();
+
+                    if is_exec_async {
+                        match &conn_name {
+                            ConnectionName::Named { .. } => {
+                                // Explicitly named connection: wait for any in-flight task on it,
+                                // then spawn the new async task tracked under the same name.
+                                let mut task = if let Some(handle) = pending.remove(&conn_name) {
+                                    tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
+                                    let mut task = handle
+                                        .await
+                                        .expect("Background task panicked or was aborted")?;
+                                    task.context.vars = self.vars.clone();
+                                    task.context.check_options = self.check_options.clone();
+                                    task
+                                } else {
+                                    let conn =
+                                        self.conn.get(conn_name.clone()).await.map_err(|e| {
+                                            TestError {
+                                                loc: loc.clone(),
+                                                kind: Box::new(TestErrorKind::Fail {
+                                                    sql: sql.clone(),
+                                                    err: Arc::new(e),
+                                                    kind: RecordKind::Statement,
+                                                }),
+                                            }
+                                        })?;
+                                    ConnectionTask {
+                                        conn: Some(conn),
+                                        context: TaskContext {
+                                            vars: self.vars.clone(),
+                                            check_options: self.check_options.clone(),
+                                        },
+                                    }
+                                };
+                                let permit = if let Some(sem) = &semaphore {
+                                    Some(
+                                        Arc::clone(sem)
+                                            .acquire_owned()
+                                            .await
+                                            .expect("semaphore closed"),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let handle = tokio::spawn(async move {
+                                    let _permit = permit;
+                                    task.run_record_async(record).await?;
+                                    Ok(task)
+                                });
+                                pending.insert(conn_name, handle);
+                            }
+                            ConnectionName::Default => {
+                                // No explicit connection: create a fresh anonymous connection.
+                                let conn = self.conn.make_new().await.map_err(|e| TestError {
+                                    loc: loc.clone(),
+                                    kind: Box::new(TestErrorKind::Fail {
+                                        sql: sql.clone(),
+                                        err: Arc::new(e),
+                                        kind: RecordKind::Statement,
+                                    }),
+                                })?;
+                                let mut task = ConnectionTask {
+                                    conn: Some(conn),
+                                    context: TaskContext {
+                                        vars: self.vars.clone(),
+                                        check_options: self.check_options.clone(),
+                                    },
+                                };
+                                let permit = if let Some(sem) = &semaphore {
+                                    Some(
+                                        Arc::clone(sem)
+                                            .acquire_owned()
+                                            .await
+                                            .expect("semaphore closed"),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let handle = tokio::spawn(async move {
+                                    let _permit = permit;
+                                    task.run_record_async(record).await.map(|_| ())
+                                });
+                                anon_pending.push(handle);
+                            }
+                        }
+                    } else {
+                        // Sync: get the named connection, waiting for any in-flight task on it first.
+                        let mut task = if let Some(handle) = pending.remove(&conn_name) {
+                            tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
+                            let mut task = handle
+                                .await
+                                .expect("Background task panicked or was aborted")?;
+                            task.context.vars = self.vars.clone();
+                            task.context.check_options = self.check_options.clone();
+                            task
+                        } else {
+                            let conn =
+                                self.conn
+                                    .get(conn_name.clone())
+                                    .await
+                                    .map_err(|e| TestError {
+                                        loc: loc.clone(),
+                                        kind: Box::new(TestErrorKind::Fail {
+                                            sql: sql.clone(),
+                                            err: Arc::new(e),
+                                            kind: RecordKind::Statement,
+                                        }),
+                                    })?;
+                            ConnectionTask {
+                                conn: Some(conn),
+                                context: TaskContext {
+                                    vars: self.vars.clone(),
+                                    check_options: self.check_options.clone(),
+                                },
+                            }
+                        };
+                        task.run_record_async(record).await?;
+                        self.vars = task.context.vars.clone();
+                        self.check_options = task.context.check_options.clone();
+                        self.conn.add(conn_name, task.conn.unwrap());
+                    }
+                }
+
+                // ── Let ──────────────────────────────────────────────────────────────────
+                // Let has no exec_async; always runs synchronously on its connection.
+                Record::Let {
+                    ref connection,
+                    ref sql,
+                    ref loc,
+                    ..
+                } => {
+                    let conn_name = connection.clone();
+                    let mut task = if let Some(handle) = pending.remove(&conn_name) {
+                        tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
+                        let mut task = handle
+                            .await
+                            .expect("Background task panicked or was aborted")?;
+                        task.context.vars = self.vars.clone();
+                        task.context.check_options = self.check_options.clone();
+                        task
+                    } else {
+                        let conn =
+                            self.conn
+                                .get(conn_name.clone())
+                                .await
+                                .map_err(|e| TestError {
+                                    loc: loc.clone(),
+                                    kind: Box::new(TestErrorKind::Fail {
+                                        sql: sql.clone(),
+                                        err: Arc::new(e),
+                                        kind: RecordKind::Statement,
+                                    }),
+                                })?;
+                        ConnectionTask {
+                            conn: Some(conn),
+                            context: TaskContext {
+                                vars: self.vars.clone(),
+                                check_options: self.check_options.clone(),
+                            },
+                        }
+                    };
+                    task.run_record_async(record).await?;
                     self.vars = task.context.vars.clone();
                     self.check_options = task.context.check_options.clone();
-                    task_pool.insert(conn_name, task);
+                    self.conn.add(conn_name, task.conn.unwrap());
                 }
-            } else if is_exec_async {
-                // Async system command — dispatch without waiting for completion.
-                let mut task = ConnectionTask {
-                    conn: None,
-                    context: TaskContext {
-                        vars: self.vars.clone(),
-                        check_options: self.check_options.clone(),
-                    },
-                };
-                let permit = if let Some(sem) = &semaphore {
-                    Some(
-                        Arc::clone(sem)
-                            .acquire_owned()
-                            .await
-                            .expect("semaphore closed"),
-                    )
-                } else {
-                    None
-                };
-                let handle = tokio::spawn(async move {
-                    let _permit = permit;
-                    task.run_record_async(record).await.map(|_| ())
-                });
-                system_pending.push(handle);
-            } else {
-                // Records that don't need a connection (System, Control, Sleep, etc.)
-                let mut task = ConnectionTask {
-                    conn: None,
-                    context: TaskContext {
-                        vars: self.vars.clone(),
-                        check_options: self.check_options.clone(),
-                    },
-                };
-                task.run_record_async(record).await?;
-                // Propagate any context changes (e.g. sort-mode, show-column-names) back.
-                self.vars = task.context.vars;
-                self.check_options = task.context.check_options;
+
+                // ── System ───────────────────────────────────────────────────────────────
+                // System has no connection field; async tasks go into anon_pending.
+                _ => {
+                    let mut task = ConnectionTask {
+                        conn: None,
+                        context: TaskContext {
+                            vars: self.vars.clone(),
+                            check_options: self.check_options.clone(),
+                        },
+                    };
+                    if is_exec_async {
+                        let permit = if let Some(sem) = &semaphore {
+                            Some(
+                                Arc::clone(sem)
+                                    .acquire_owned()
+                                    .await
+                                    .expect("semaphore closed"),
+                            )
+                        } else {
+                            None
+                        };
+                        let handle = tokio::spawn(async move {
+                            let _permit = permit;
+                            task.run_record_async(record).await.map(|_| ())
+                        });
+                        anon_pending.push(handle);
+                    } else {
+                        task.run_record_async(record).await?;
+                        self.vars = task.context.vars;
+                        self.check_options = task.context.check_options;
+                    }
+                }
             }
         }
 
-        // Drain all remaining pending async tasks at end of input.
+        // Drain all remaining named async tasks.
         for (name, handle) in pending {
             tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
             let task = handle
                 .await
                 .expect("Background task panicked or was aborted")?;
             tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
-            task_pool.insert(name, task);
+            self.conn.add(name, task.conn.unwrap());
         }
-        for handle in system_pending {
+        // Drain all remaining anonymous async tasks.
+        for handle in anon_pending {
             handle
                 .await
                 .expect("Background task panicked or was aborted")?;
-        }
-
-        // Return all pooled connections back to self.conn.
-        for (name, task) in task_pool {
-            if let Some(conn) = task.conn {
-                self.conn.add(name, conn);
-            }
         }
 
         Ok(())
