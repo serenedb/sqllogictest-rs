@@ -795,6 +795,32 @@ fn may_substitute(
     }
 }
 
+/// Resolve retry attempts and backoff from a `RetryConfig`, substituting any env-var references.
+///
+/// Returns `(1, Duration::ZERO)` when no retry config is present or when resolution fails,
+/// so callers always get a safe default (one attempt, no sleep).
+fn resolve_retry_params(retry: &Option<RetryConfig>, vars: &RunVariables) -> (usize, Duration) {
+    let Some(rc) = retry else {
+        return (1, Duration::ZERO);
+    };
+    let attempts = match &rc.attempts {
+        RetryAttempts::Count(n) => *n,
+        RetryAttempts::EnvVar(var) => may_substitute(vars, var.clone(), true)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1),
+    };
+    let backoff = match &rc.backoff {
+        RetryBackoff::Duration(d) => *d,
+        RetryBackoff::EnvVar(var) => may_substitute(vars, var.clone(), true)
+            .ok()
+            .and_then(|s| humantime::parse_duration(&s).ok())
+            .unwrap_or(Duration::ZERO),
+    };
+    (attempts, backoff)
+}
+
 pub struct TaskContext<D: AsyncDB> {
     vars: RunVariables,
     check_options: CheckOptions<D>,
@@ -811,6 +837,20 @@ pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
     partitioner: Arc<dyn Partitioner>,
     check_options: CheckOptions<D>,
     vars: RunVariables,
+}
+
+async fn acquire_permit(
+    semaphore: &Option<Arc<tokio::sync::Semaphore>>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match semaphore {
+        Some(sem) => Some(
+            Arc::clone(sem)
+                .acquire_owned()
+                .await
+                .expect("semaphore closed"),
+        ),
+        None => None,
+    }
 }
 
 fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -1742,6 +1782,101 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         task.apply_record_async(record).await
     }
 
+    /// Get the named connection from `pending` (if an in-flight task exists for it, wait for it
+    /// first) or from the connection pool (creating one if needed), with optional retry.
+    async fn get_or_resume_named_conn(
+        &mut self,
+        conn_name: ConnectionName,
+        pending: &mut HashMap<
+            ConnectionName,
+            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
+        >,
+        loc: &Location,
+        sql: &str,
+        retry: &Option<RetryConfig>,
+    ) -> Result<ConnectionTask<D>, TestError>
+    where
+        D: Send + 'static,
+    {
+        if let Some(handle) = pending.remove(&conn_name) {
+            tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
+            let mut task = handle
+                .await
+                .expect("Background task panicked or was aborted")?;
+            task.context.vars = self.vars.clone();
+            task.context.check_options = self.check_options.clone();
+            Ok(task)
+        } else {
+            let (attempts, backoff) = resolve_retry_params(retry, &self.vars);
+            let mut last_err = None;
+            let mut conn_opt = None;
+            for attempt in 0..attempts {
+                match self.conn.get(conn_name.clone()).await {
+                    Ok(c) => {
+                        conn_opt = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "sqllogictest::retry",
+                            attempt = attempt + 1,
+                            attempts,
+                            backoff = ?backoff,
+                            "retrying connection"
+                        );
+                        last_err = Some(e);
+                        if attempt + 1 < attempts {
+                            D::sleep(backoff).await;
+                        }
+                    }
+                }
+            }
+            let conn = conn_opt.ok_or_else(|| TestError {
+                loc: loc.clone(),
+                kind: Box::new(TestErrorKind::Fail {
+                    sql: sql.to_owned(),
+                    err: Arc::new(last_err.unwrap()),
+                    kind: RecordKind::Statement,
+                }),
+            })?;
+            Ok(ConnectionTask {
+                conn: Some(conn),
+                context: TaskContext {
+                    vars: self.vars.clone(),
+                    check_options: self.check_options.clone(),
+                },
+            })
+        }
+    }
+
+    /// Drain all in-flight named and anonymous async tasks, returning connections to the pool.
+    async fn drain_all_pending(
+        &mut self,
+        pending: &mut HashMap<
+            ConnectionName,
+            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
+        >,
+        anon_pending: &mut Vec<tokio::task::JoinHandle<Result<(), TestError>>>,
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        for (name, handle) in pending.drain() {
+            tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
+            let task = handle
+                .await
+                .expect("Background task panicked or was aborted")?;
+            tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
+            self.conn.add(name, task.conn.unwrap());
+        }
+        for handle in anon_pending.drain(..) {
+            handle
+                .await
+                .expect("Background task panicked or was aborted")?;
+        }
+        Ok(())
+    }
+
     /// Run multiple records.
     ///
     /// The runner will stop early once a halt record is seen.
@@ -1779,54 +1914,18 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
 
             // Wait drains all in-flight tasks before continuing.
             if let Record::Wait { .. } = record {
-                for (name, handle) in pending.drain() {
-                    tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-                    let task = handle
-                        .await
-                        .expect("Background task panicked or was aborted")?;
-                    tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
-                    self.conn.add(name, task.conn.unwrap());
-                }
-                for handle in anon_pending.drain(..) {
-                    handle
-                        .await
-                        .expect("Background task panicked or was aborted")?;
-                }
+                self.drain_all_pending(&mut pending, &mut anon_pending)
+                    .await?;
                 continue;
             }
 
-            // Determine is_exec_async only for stmt/query/system; everything else is executed
-            // directly below.
             let is_exec_async = match &record {
                 Record::Statement { exec_async, .. }
                 | Record::Query { exec_async, .. }
                 | Record::System { exec_async, .. } => {
                     *exec_async || self.check_options.always_async
                 }
-                _ => {
-                    // Not a stmt/query/system — run directly, no connection needed.
-                    let mut task = ConnectionTask {
-                        conn: None,
-                        context: TaskContext {
-                            vars: self.vars.clone(),
-                            check_options: self.check_options.clone(),
-                        },
-                    };
-                    task.run_record_async(record).await?;
-                    self.vars = task.context.vars;
-                    let old_limit = self.check_options.max_async_connections;
-                    self.check_options = task.context.check_options;
-                    // Resync the semaphore if max_async_connections changed (e.g. via a
-                    // `control max-async-connections` record).  No tasks are in-flight when
-                    // a control record is processed so it is safe to replace the semaphore.
-                    if self.check_options.max_async_connections != old_limit {
-                        semaphore = self
-                            .check_options
-                            .max_async_connections
-                            .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
-                    }
-                    continue;
-                }
+                _ => false,
             };
 
             match record {
@@ -1835,12 +1934,14 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     ref connection,
                     ref sql,
                     ref loc,
+                    ref retry,
                     ..
                 }
                 | Record::Query {
                     ref connection,
                     ref sql,
                     ref loc,
+                    ref retry,
                     ..
                 } => {
                     let conn_name = connection.clone();
@@ -1850,44 +1951,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                             ConnectionName::Named { .. } => {
                                 // Explicitly named connection: wait for any in-flight task on it,
                                 // then spawn the new async task tracked under the same name.
-                                let mut task = if let Some(handle) = pending.remove(&conn_name) {
-                                    tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-                                    let mut task = handle
-                                        .await
-                                        .expect("Background task panicked or was aborted")?;
-                                    task.context.vars = self.vars.clone();
-                                    task.context.check_options = self.check_options.clone();
-                                    task
-                                } else {
-                                    let conn =
-                                        self.conn.get(conn_name.clone()).await.map_err(|e| {
-                                            TestError {
-                                                loc: loc.clone(),
-                                                kind: Box::new(TestErrorKind::Fail {
-                                                    sql: sql.clone(),
-                                                    err: Arc::new(e),
-                                                    kind: RecordKind::Statement,
-                                                }),
-                                            }
-                                        })?;
-                                    ConnectionTask {
-                                        conn: Some(conn),
-                                        context: TaskContext {
-                                            vars: self.vars.clone(),
-                                            check_options: self.check_options.clone(),
-                                        },
-                                    }
-                                };
-                                let permit = if let Some(sem) = &semaphore {
-                                    Some(
-                                        Arc::clone(sem)
-                                            .acquire_owned()
-                                            .await
-                                            .expect("semaphore closed"),
+                                let mut task = self
+                                    .get_or_resume_named_conn(
+                                        conn_name.clone(),
+                                        &mut pending,
+                                        loc,
+                                        sql,
+                                        retry,
                                     )
-                                } else {
-                                    None
-                                };
+                                    .await?;
+                                let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
                                     let _permit = permit;
                                     task.run_record_async(record).await?;
@@ -1912,16 +1985,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                         check_options: self.check_options.clone(),
                                     },
                                 };
-                                let permit = if let Some(sem) = &semaphore {
-                                    Some(
-                                        Arc::clone(sem)
-                                            .acquire_owned()
-                                            .await
-                                            .expect("semaphore closed"),
-                                    )
-                                } else {
-                                    None
-                                };
+                                let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
                                     let _permit = permit;
                                     task.run_record_async(record).await.map(|_| ())
@@ -1931,35 +1995,15 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         }
                     } else {
                         // Sync: get the named connection, waiting for any in-flight task on it first.
-                        let mut task = if let Some(handle) = pending.remove(&conn_name) {
-                            tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-                            let mut task = handle
-                                .await
-                                .expect("Background task panicked or was aborted")?;
-                            task.context.vars = self.vars.clone();
-                            task.context.check_options = self.check_options.clone();
-                            task
-                        } else {
-                            let conn =
-                                self.conn
-                                    .get(conn_name.clone())
-                                    .await
-                                    .map_err(|e| TestError {
-                                        loc: loc.clone(),
-                                        kind: Box::new(TestErrorKind::Fail {
-                                            sql: sql.clone(),
-                                            err: Arc::new(e),
-                                            kind: RecordKind::Statement,
-                                        }),
-                                    })?;
-                            ConnectionTask {
-                                conn: Some(conn),
-                                context: TaskContext {
-                                    vars: self.vars.clone(),
-                                    check_options: self.check_options.clone(),
-                                },
-                            }
-                        };
+                        let mut task = self
+                            .get_or_resume_named_conn(
+                                conn_name.clone(),
+                                &mut pending,
+                                loc,
+                                sql,
+                                retry,
+                            )
+                            .await?;
                         task.run_record_async(record).await?;
                         self.vars = task.context.vars.clone();
                         self.check_options = task.context.check_options.clone();
@@ -1976,35 +2020,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     ..
                 } => {
                     let conn_name = connection.clone();
-                    let mut task = if let Some(handle) = pending.remove(&conn_name) {
-                        tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-                        let mut task = handle
-                            .await
-                            .expect("Background task panicked or was aborted")?;
-                        task.context.vars = self.vars.clone();
-                        task.context.check_options = self.check_options.clone();
-                        task
-                    } else {
-                        let conn =
-                            self.conn
-                                .get(conn_name.clone())
-                                .await
-                                .map_err(|e| TestError {
-                                    loc: loc.clone(),
-                                    kind: Box::new(TestErrorKind::Fail {
-                                        sql: sql.clone(),
-                                        err: Arc::new(e),
-                                        kind: RecordKind::Statement,
-                                    }),
-                                })?;
-                        ConnectionTask {
-                            conn: Some(conn),
-                            context: TaskContext {
-                                vars: self.vars.clone(),
-                                check_options: self.check_options.clone(),
-                            },
-                        }
-                    };
+                    let mut task = self
+                        .get_or_resume_named_conn(conn_name.clone(), &mut pending, loc, sql, &None)
+                        .await?;
                     task.run_record_async(record).await?;
                     self.vars = task.context.vars.clone();
                     self.check_options = task.context.check_options.clone();
@@ -2022,16 +2040,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         },
                     };
                     if is_exec_async {
-                        let permit = if let Some(sem) = &semaphore {
-                            Some(
-                                Arc::clone(sem)
-                                    .acquire_owned()
-                                    .await
-                                    .expect("semaphore closed"),
-                            )
-                        } else {
-                            None
-                        };
+                        let permit = acquire_permit(&semaphore).await;
                         let handle = tokio::spawn(async move {
                             let _permit = permit;
                             task.run_record_async(record).await.map(|_| ())
@@ -2040,28 +2049,24 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     } else {
                         task.run_record_async(record).await?;
                         self.vars = task.context.vars;
+                        let old_limit = self.check_options.max_async_connections;
                         self.check_options = task.context.check_options;
+                        // Resync the semaphore if max_async_connections changed (e.g. via a
+                        // `control max-async-connections` record).  No tasks are in-flight when
+                        // a control record is processed so it is safe to replace the semaphore.
+                        if self.check_options.max_async_connections != old_limit {
+                            semaphore = self
+                                .check_options
+                                .max_async_connections
+                                .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+                        }
                     }
                 }
             }
         }
 
-        // Drain all remaining named async tasks.
-        for (name, handle) in pending {
-            tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-            let task = handle
-                .await
-                .expect("Background task panicked or was aborted")?;
-            tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
-            self.conn.add(name, task.conn.unwrap());
-        }
-        // Drain all remaining anonymous async tasks.
-        for handle in anon_pending {
-            handle
-                .await
-                .expect("Background task panicked or was aborted")?;
-        }
-
+        self.drain_all_pending(&mut pending, &mut anon_pending)
+            .await?;
         Ok(())
     }
 
