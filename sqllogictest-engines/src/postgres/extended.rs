@@ -594,7 +594,7 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
     }
 
     fn engine_name(&self) -> &str {
-        "postgres-extended"
+        "pg-wire-extended"
     }
 
     async fn sleep(dur: Duration) {
