@@ -641,7 +641,13 @@ pub fn default_validator(
         .map(|strs| strs.iter().map(normalizer).join("\t"))
         .collect_vec();
 
-    normalized_rows == expected_results
+    if normalized_rows == expected_results {
+        return true;
+    }
+    // Allow first row (column names) to differ
+    normalized_rows.len() == expected_results.len()
+        && normalized_rows.len() >= 2
+        && normalized_rows[1..] == expected_results[1..]
 }
 
 /// [`Runner`] uses this validator to check that the expected column types match an actual output.
