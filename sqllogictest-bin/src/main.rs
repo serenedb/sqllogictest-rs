@@ -1216,6 +1216,9 @@ where
     let mut errors = vec![];
     let mut locations = vec![];
     for record in &records {
+        if let Record::Halt { .. } = record {
+            break;
+        }
         match record {
             Record::Injected(Injected::BeginInclude(file)) => {
                 begin_times.push(Instant::now());
