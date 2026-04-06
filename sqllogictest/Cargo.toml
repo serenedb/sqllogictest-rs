@@ -29,5 +29,8 @@ tracing = { workspace = true }
 rand = { workspace = true }
 log = { workspace = true }
 
+[features]
+testing = []
+
 [dev-dependencies]
 pretty_assertions = "1"

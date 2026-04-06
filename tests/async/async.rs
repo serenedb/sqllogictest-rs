@@ -60,7 +60,7 @@ macro_rules! runner {
 fn test_async_statement_executes() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 insert a
@@ -84,7 +84,7 @@ fn test_async_statement_auto_sync_at_eof() {
     // No explicit `wait` — statements should still execute by end of script.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 insert x
@@ -106,7 +106,7 @@ fn test_async_statement_error_reported_at_sync() {
     let log = Arc::new(Mutex::new(vec![]));
 
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 fail something went wrong
@@ -127,7 +127,7 @@ fn test_async_statement_error_reported_at_eof() {
     let log = Arc::new(Mutex::new(vec![]));
 
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 fail another error
@@ -150,7 +150,7 @@ fn test_async_statement_expected_error_matches() {
     // `statement async error <pat>` should succeed when the error matches.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async error expected failure
 fail expected failure
@@ -166,7 +166,7 @@ fn test_async_statement_expected_error_mismatch() {
     // The actual error message does not match the expected pattern.
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async error wrong pattern
 fail actual message
@@ -188,7 +188,7 @@ fn test_async_statement_expected_to_fail_but_succeeded() {
     // `statement async error` when the statement succeeds → error at wait.
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async error some error
 insert succeeds
@@ -209,7 +209,7 @@ fn test_async_statement_expected_error_at_eof() {
     // Error-pattern match should also work when surfaced at EOF instead of wait.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async error eof error
 fail eof error
@@ -224,7 +224,7 @@ fn test_async_multiple_tasks_one_errors() {
     // and the statement index is identifiable from the message.
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 insert before_error
@@ -255,7 +255,7 @@ fn test_async_query_executes() {
     // The query result is not validated (async), but the SQL must be executed.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 query async I
 select count
@@ -276,7 +276,7 @@ wait
 fn test_async_query_auto_sync() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 query async I
 select value
@@ -293,7 +293,7 @@ fn test_async_query_error_at_wait() {
     // A query that raises a DB error (not a result mismatch) should surface at wait.
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 query async I
 fail query broke
@@ -313,7 +313,7 @@ wait
 fn test_async_query_error_at_eof() {
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 query async I
 fail eof query error
@@ -332,7 +332,7 @@ fn test_async_query_result_mismatch_at_wait() {
     // FakeDB returns StatementComplete(0) for everything; expecting rows causes mismatch.
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 show-column-names false
 
@@ -361,7 +361,7 @@ wait
 fn test_async_interleaved_with_regular() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 insert background
@@ -384,7 +384,7 @@ wait
 fn test_multiple_sync_points() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement async ok
 insert batch1_a
@@ -417,7 +417,7 @@ wait
 fn test_sync_with_no_pending_is_noop() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 statement ok
 insert regular
@@ -472,7 +472,7 @@ fn test_async_statement_with_retry_succeeds() {
         };
         async move { Ok(db) }
     })
-    .run_script(
+    .run_script_test(
         "\
 statement async ok retry 3 backoff 0s
 insert retried
@@ -502,7 +502,7 @@ fn test_async_statement_with_retry_exhausted() {
         };
         async move { Ok(db) }
     })
-    .run_script(
+    .run_script_test(
         "\
 statement async ok retry 2 backoff 0s
 insert always_fails
@@ -531,7 +531,7 @@ fn test_async_query_with_retry_succeeds() {
         };
         async move { Ok(db) }
     })
-    .run_script(
+    .run_script_test(
         "\
 show-column-names false
 
@@ -558,7 +558,7 @@ wait
 fn test_async_system_executes() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 system async ok
 echo hello
@@ -576,7 +576,7 @@ wait
 fn test_async_system_auto_sync_at_eof() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 system async ok
 echo auto_sync
@@ -589,7 +589,7 @@ echo auto_sync
 fn test_async_system_error_at_wait() {
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 system async ok
 exit 1
@@ -609,7 +609,7 @@ wait
 fn test_async_system_error_at_eof() {
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 system async ok
 exit 1
@@ -627,7 +627,7 @@ exit 1
 fn test_async_system_with_stdout_check() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 system async ok
 echo hello world
@@ -645,7 +645,7 @@ wait
 fn test_async_system_with_retry() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 system async ok retry 3 backoff 0s
 echo retry_ok
@@ -664,7 +664,7 @@ wait
 fn test_always_async_makes_statements_async() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control always-async on
 
@@ -689,7 +689,7 @@ wait
 fn test_always_async_off_restores_sync() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control always-async on
 
@@ -717,7 +717,7 @@ fn test_always_async_with_explicit_async_is_still_async() {
     // An explicit `async` keyword must still work when always-async is also on.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control always-async on
 
@@ -737,7 +737,7 @@ wait
 fn test_always_async_error_surfaces_at_wait() {
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control always-async on
 
@@ -759,7 +759,7 @@ wait
 fn test_always_async_query() {
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control always-async on
 
@@ -784,7 +784,7 @@ fn test_max_async_connections_all_tasks_complete() {
     // Basic correctness: all tasks complete when a limit is set.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control max-async-connections 2
 
@@ -818,7 +818,7 @@ fn test_max_async_connections_one_serializes() {
     // limit=1 forces one-at-a-time but all tasks still complete.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control max-async-connections 1
 
@@ -848,7 +848,7 @@ fn test_max_async_connections_zero_is_unlimited() {
     // 0 clears any previously set limit.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control max-async-connections 1
 control max-async-connections 0
@@ -874,7 +874,7 @@ wait
 fn test_max_async_connections_error_propagated() {
     let log = Arc::new(Mutex::new(vec![]));
     let err = runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control max-async-connections 2
 
@@ -900,7 +900,7 @@ fn test_max_async_connections_system_tasks() {
     // System tasks also count against the semaphore.
     let log = Arc::new(Mutex::new(vec![]));
     runner!(log)
-        .run_script(
+        .run_script_test(
             "\
 control max-async-connections 2
 
@@ -984,7 +984,7 @@ fn test_max_async_connections_limits_peak_concurrency() {
         };
         async move { Ok(db) }
     })
-    .run_script(&format!(
+    .run_script_test(&format!(
         "\
 control max-async-connections {LIMIT}
 

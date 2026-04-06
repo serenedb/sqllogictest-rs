@@ -11,6 +11,8 @@ use std::vec;
 use async_trait::async_trait;
 use itertools::Itertools;
 
+// Only for testing
+#[cfg(any(test, feature = "testing"))]
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1063,7 +1065,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
         }
     }
 
-    pub async fn apply_record_async(
+    pub async fn apply_record(
         &mut self,
         record: Record<D::ColumnType>,
     ) -> RecordOutput<D::ColumnType> {
@@ -1357,7 +1359,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
                 RecordOutput::Nothing
             }
             Record::Wait { loc: _ } => {
-                tracing::error!("wait record encountered outside of run_multi_async. It's likely a bug of the runtime.");
+                tracing::error!("wait record encountered outside of run_multi_records. It's likely a bug of the runtime.");
                 RecordOutput::Nothing
             }
             Record::Let {
@@ -1432,7 +1434,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        let result = self.apply_record_async(record.clone()).await;
+        let result = self.apply_record(record.clone()).await;
 
         match (record, &result) {
             (_, RecordOutput::Nothing) => {}
@@ -1616,7 +1618,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
         Ok(result)
     }
 
-    pub async fn run_record_async(
+    pub async fn run_record(
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
@@ -1704,11 +1706,12 @@ impl<D: AsyncDB> ConnectionTask<D> {
         Err(last_error.unwrap())
     }
 
-    pub fn run_record(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_record_test(
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        block_on(self.run_record_async(record))
+        block_on(self.run_record(record))
     }
 }
 
@@ -1776,7 +1779,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     ///
     /// Returns the raw [`RecordOutput`] without comparing it against any expected value.
     /// Useful for update modes that rewrite expected values based on actual output.
-    pub async fn run_record_async(
+    pub async fn run_record(
         &mut self,
         record: Record<D::ColumnType>,
     ) -> RecordOutput<D::ColumnType> {
@@ -1817,7 +1820,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
         };
 
-        task.apply_record_async(record).await
+        task.apply_record(record).await
     }
 
     /// Get the named connection from `pending` (if an in-flight task exists for it, wait for it
@@ -1925,7 +1928,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     /// to the pool.
     ///
     /// Records that do not need a connection (e.g. `system`, `control`) are run with `conn = None`.
-    pub async fn run_multi_async(
+    pub async fn run_multi_records(
         &mut self,
         records: impl IntoIterator<Item = Record<D::ColumnType>>,
     ) -> Result<(), TestError>
@@ -2001,7 +2004,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                 let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
                                     let _permit = permit;
-                                    task.run_record_async(record).await?;
+                                    task.run_record(record).await?;
                                     Ok(task)
                                 });
                                 pending.insert(conn_name, handle);
@@ -2027,7 +2030,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                 let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
                                     let _permit = permit;
-                                    task.run_record_async(record).await.map(|_| ())
+                                    task.run_record(record).await.map(|_| ())
                                 });
                                 anon_pending.push(handle);
                             }
@@ -2059,7 +2062,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                 _ => return Err(conn_err),
                             },
                         };
-                        task.run_record_async(record).await?;
+                        task.run_record(record).await?;
                         self.vars = task.context.vars.clone();
                         self.check_options = task.context.check_options.clone();
                         if let Some(conn) = task.conn {
@@ -2080,7 +2083,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     let mut task = self
                         .get_or_resume_named_conn(conn_name.clone(), &mut pending, loc, sql, &None)
                         .await?;
-                    task.run_record_async(record).await?;
+                    task.run_record(record).await?;
                     self.vars = task.context.vars.clone();
                     self.check_options = task.context.check_options.clone();
                     self.conn.add(conn_name, task.conn.unwrap());
@@ -2101,11 +2104,11 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         let permit = acquire_permit(&semaphore).await;
                         let handle = tokio::spawn(async move {
                             let _permit = permit;
-                            task.run_record_async(record).await.map(|_| ())
+                            task.run_record(record).await.map(|_| ())
                         });
                         anon_pending.push(handle);
                     } else {
-                        task.run_record_async(record).await?;
+                        task.run_record(record).await?;
                         self.vars = task.context.vars;
                         let old_limit = self.check_options.max_async_connections;
                         self.check_options = task.context.check_options;
@@ -2132,27 +2135,28 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     /// The runner will stop early once a halt record is seen.
     ///
     /// To acquire the result of each record, manually call `run` for each record instead.
-    pub fn run_multi(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_multi_test(
         &mut self,
         records: impl IntoIterator<Item = Record<D::ColumnType>>,
     ) -> Result<(), TestError>
     where
         D: Send + 'static,
     {
-        block_on(self.run_multi_async(records))
+        block_on(self.run_multi_records(records))
     }
 
     /// Run a sqllogictest script.
-    pub async fn run_script_async(&mut self, script: &str) -> Result<(), TestError>
+    pub async fn run_script(&mut self, script: &str) -> Result<(), TestError>
     where
         D: Send + 'static,
     {
         let records = parse(script).expect("failed to parse sqllogictest");
-        self.run_multi_async(records).await
+        self.run_multi_records(records).await
     }
 
     /// Run a sqllogictest script with a given script name.
-    pub async fn run_script_with_name_async(
+    pub async fn run_script_with_name(
         &mut self,
         script: &str,
         name: impl Into<Arc<str>>,
@@ -2161,28 +2165,30 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         D: Send + 'static,
     {
         let records = parse_with_name(script, name).expect("failed to parse sqllogictest");
-        self.run_multi_async(records).await
+        self.run_multi_records(records).await
     }
 
     /// Run a sqllogictest file.
-    pub async fn run_file_async(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
+    pub async fn run_file(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
     where
         D: Send + 'static,
     {
         let records = parse_file(filename)?;
-        self.run_multi_async(records).await
+        self.run_multi_records(records).await
     }
 
     /// Run a sqllogictest script.
-    pub fn run_script(&mut self, script: &str) -> Result<(), TestError>
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_script_test(&mut self, script: &str) -> Result<(), TestError>
     where
         D: Send + 'static,
     {
-        block_on(self.run_script_async(script))
+        block_on(self.run_script(script))
     }
 
     /// Run a sqllogictest script with a given script name.
-    pub fn run_script_with_name(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_script_with_name_test(
         &mut self,
         script: &str,
         name: impl Into<Arc<str>>,
@@ -2190,15 +2196,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        block_on(self.run_script_with_name_async(script, name))
+        block_on(self.run_script_with_name(script, name))
     }
 
     /// Run a sqllogictest file.
-    pub fn run_file(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_file_test(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
     where
         D: Send + 'static,
     {
-        block_on(self.run_file_async(filename))
+        block_on(self.run_file(filename))
     }
 }
 

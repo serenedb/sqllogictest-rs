@@ -8,7 +8,7 @@ publish = false
 async-trait = { workspace = true }
 regex = "1.11.1"
 rusty-fork = "0.3"
-sqllogictest = { path = "../sqllogictest" }
+sqllogictest = { path = "../sqllogictest", features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 [[test]]

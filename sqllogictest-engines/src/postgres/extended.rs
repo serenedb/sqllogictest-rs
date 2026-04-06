@@ -142,7 +142,7 @@ impl<'a> FromSql<'a> for Void {
 
 impl fmt::Display for Void {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Ok(())
+        unreachable!("Void type is not printable");
     }
 }
 
