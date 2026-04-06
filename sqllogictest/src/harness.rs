@@ -1,8 +1,10 @@
+#[cfg(any(test, feature = "testing"))]
 use std::path::Path;
 
 pub use glob::glob;
 pub use libtest_mimic::{run, Arguments, Failed, Trial};
 
+#[cfg(any(test, feature = "testing"))]
 use crate::{MakeConnection, Runner};
 
 /// * `db_fn`: `fn() -> sqllogictest::AsyncDB`

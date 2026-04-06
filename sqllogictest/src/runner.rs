@@ -7,13 +7,14 @@ use std::process::{Command, ExitStatus, Output};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::vec;
+use futures::executor::block_on;
 
 use async_trait::async_trait;
 use itertools::Itertools;
 
 // Only for testing
 #[cfg(any(test, feature = "testing"))]
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+fn block_on_tokio<F: std::future::Future>(fut: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1711,7 +1712,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        block_on(self.run_record(record))
+        block_on_tokio(self.run_record(record))
     }
 }
 
@@ -2143,7 +2144,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        block_on(self.run_multi_records(records))
+        block_on_tokio(self.run_multi_records(records))
     }
 
     /// Run a sqllogictest script.
@@ -2183,7 +2184,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        block_on(self.run_script(script))
+        block_on_tokio(self.run_script(script))
     }
 
     /// Run a sqllogictest script with a given script name.
@@ -2196,7 +2197,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        block_on(self.run_script_with_name(script, name))
+        block_on_tokio(self.run_script_with_name(script, name))
     }
 
     /// Run a sqllogictest file.
@@ -2205,7 +2206,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        block_on(self.run_file(filename))
+        block_on_tokio(self.run_file(filename))
     }
 }
 
