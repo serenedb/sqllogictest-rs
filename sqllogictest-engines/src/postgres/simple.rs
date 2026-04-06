@@ -75,7 +75,7 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
     }
 
     fn engine_name(&self) -> &str {
-        "postgres"
+        "pg-wire-simple"
     }
 
     async fn sleep(dur: Duration) {
