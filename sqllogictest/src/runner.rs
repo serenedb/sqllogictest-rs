@@ -1,5 +1,6 @@
 //! Sqllogictest runner.
 
+use futures::executor::block_on;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::path::Path;
@@ -7,7 +8,6 @@ use std::process::{Command, ExitStatus, Output};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::vec;
-use futures::executor::block_on;
 
 use async_trait::async_trait;
 use itertools::Itertools;
