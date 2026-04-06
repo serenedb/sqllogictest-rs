@@ -740,9 +740,9 @@ pub struct CheckOptions<D: AsyncDB> {
     /// When true, all statement/query/system records are treated as async
     /// without needing `async` on each one.
     always_async: bool,
-    /// Maximum number of concurrently executing async tasks. `None` means unlimited.
-    /// Controlled by `control max-async-connections N` (0 = unlimited).
-    max_async_connections: Option<usize>,
+    /// Maximum number of concurrently executing async tasks.
+    /// Controlled by `control max-async-connections N` (0 resets to the default of 10).
+    max_async_connections: usize,
 }
 
 impl<D: AsyncDB> Clone for CheckOptions<D> {
@@ -795,6 +795,8 @@ fn may_substitute(
     }
 }
 
+const DEFAULT_MAX_ASYNC_CONNECTIONS: usize = 10;
+
 /// Resolve retry attempts and backoff from a `RetryConfig`, substituting any env-var references.
 ///
 /// Returns `(1, Duration::ZERO)` when no retry config is present or when resolution fails,
@@ -840,17 +842,12 @@ pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
 }
 
 async fn acquire_permit(
-    semaphore: &Option<Arc<tokio::sync::Semaphore>>,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    match semaphore {
-        Some(sem) => Some(
-            Arc::clone(sem)
-                .acquire_owned()
-                .await
-                .expect("semaphore closed"),
-        ),
-        None => None,
-    }
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) -> tokio::sync::OwnedSemaphorePermit {
+    Arc::clone(semaphore)
+        .acquire_owned()
+        .await
+        .expect("semaphore closed")
 }
 
 fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -1300,7 +1297,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
                     }
                     Control::MaxAsyncConnections(n) => {
                         self.context.check_options.max_async_connections =
-                            if n == 0 { None } else { Some(n) };
+                            if n == 0 { DEFAULT_MAX_ASYNC_CONNECTIONS } else { n };
                     }
                 }
 
@@ -1696,7 +1693,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 show_column_names: true,
                 flat_values: false,
                 always_async: false,
-                max_async_connections: None,
+                max_async_connections: DEFAULT_MAX_ASYNC_CONNECTIONS,
             },
             vars: RunVariables {
                 labels: HashSet::new(),
@@ -1893,10 +1890,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        let mut semaphore: Option<Arc<tokio::sync::Semaphore>> = self
-            .check_options
-            .max_async_connections
-            .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+        let mut semaphore: Arc<tokio::sync::Semaphore> =
+            Arc::new(tokio::sync::Semaphore::new(self.check_options.max_async_connections));
 
         // exec_async named tasks in-flight, keyed by connection name.
         let mut pending: HashMap<
@@ -2055,10 +2050,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         // `control max-async-connections` record).  No tasks are in-flight when
                         // a control record is processed so it is safe to replace the semaphore.
                         if self.check_options.max_async_connections != old_limit {
-                            semaphore = self
-                                .check_options
-                                .max_async_connections
-                                .map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
+                            semaphore = Arc::new(tokio::sync::Semaphore::new(
+                                self.check_options.max_async_connections,
+                            ));
                         }
                     }
                 }
