@@ -831,6 +831,10 @@ pub struct TaskContext<D: AsyncDB> {
 pub struct ConnectionTask<D: AsyncDB> {
     conn: Option<D>,
     context: TaskContext<D>,
+    /// Connection-time error to propagate as a query/statement error.
+    /// Set when connection establishment fails, allowing `query error` /
+    /// `statement error` records to match the connection error.
+    pending_error: Option<AnyError>,
 }
 
 /// Sqllogictest runner.
@@ -1079,6 +1083,36 @@ impl<D: AsyncDB> ConnectionTask<D> {
                         .chain(Some(engine_name).filter(|n| !n.is_empty())),
                 )
             })
+        }
+
+        // If connection establishment failed, propagate it as a query/statement error so
+        // `query error` / `statement error` records can match connection-time failures
+        // (e.g., TLS handshake errors when connecting with sslmode=require to a plain port).
+        if let Some(err) = self.pending_error.take() {
+            return match record {
+                Record::Statement { conditions, .. } => {
+                    if should_skip(&self.context.vars.labels, "", &conditions) {
+                        RecordOutput::Nothing
+                    } else {
+                        RecordOutput::Statement {
+                            count: 0,
+                            error: Some(err),
+                        }
+                    }
+                }
+                Record::Query { conditions, .. } => {
+                    if should_skip(&self.context.vars.labels, "", &conditions) {
+                        RecordOutput::Nothing
+                    } else {
+                        RecordOutput::Query {
+                            types: vec![],
+                            rows: vec![],
+                            error: Some(err),
+                        }
+                    }
+                }
+                _ => RecordOutput::Nothing,
+            };
         }
 
         match record {
@@ -1761,13 +1795,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         vars: self.vars.clone(),
                         check_options: self.check_options.clone(),
                     },
+                    pending_error: None,
                 },
-                Err(e) => {
-                    return RecordOutput::Statement {
-                        count: 0,
-                        error: Some(Arc::new(e)),
-                    };
-                }
+                Err(e) => ConnectionTask {
+                    conn: None,
+                    context: TaskContext {
+                        vars: self.vars.clone(),
+                        check_options: self.check_options.clone(),
+                    },
+                    pending_error: Some(Arc::new(e)),
+                },
             }
         } else {
             ConnectionTask {
@@ -1776,6 +1813,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     vars: self.vars.clone(),
                     check_options: self.check_options.clone(),
                 },
+                pending_error: None,
             }
         };
 
@@ -1845,6 +1883,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     vars: self.vars.clone(),
                     check_options: self.check_options.clone(),
                 },
+                pending_error: None,
             })
         }
     }
@@ -1983,6 +2022,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                         vars: self.vars.clone(),
                                         check_options: self.check_options.clone(),
                                     },
+                                    pending_error: None,
                                 };
                                 let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
@@ -1994,7 +2034,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         }
                     } else {
                         // Sync: get the named connection, waiting for any in-flight task on it first.
-                        let mut task = self
+                        // If connection establishment fails, propagate the error via pending_error
+                        // so `query error` / `statement error` records can match it.
+                        let mut task = match self
                             .get_or_resume_named_conn(
                                 conn_name.clone(),
                                 &mut pending,
@@ -2002,11 +2044,27 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                 sql,
                                 retry,
                             )
-                            .await?;
+                            .await
+                        {
+                            Ok(task) => task,
+                            Err(conn_err) => match conn_err.kind() {
+                                TestErrorKind::Fail { err, .. } => ConnectionTask {
+                                    conn: None,
+                                    context: TaskContext {
+                                        vars: self.vars.clone(),
+                                        check_options: self.check_options.clone(),
+                                    },
+                                    pending_error: Some(err),
+                                },
+                                _ => return Err(conn_err),
+                            },
+                        };
                         task.run_record_async(record).await?;
                         self.vars = task.context.vars.clone();
                         self.check_options = task.context.check_options.clone();
-                        self.conn.add(conn_name, task.conn.unwrap());
+                        if let Some(conn) = task.conn {
+                            self.conn.add(conn_name, conn);
+                        }
                     }
                 }
 
@@ -2037,6 +2095,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                             vars: self.vars.clone(),
                             check_options: self.check_options.clone(),
                         },
+                        pending_error: None,
                     };
                     if is_exec_async {
                         let permit = acquire_permit(&semaphore).await;
