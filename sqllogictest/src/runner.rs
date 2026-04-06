@@ -1296,8 +1296,11 @@ impl<D: AsyncDB> ConnectionTask<D> {
                         self.context.check_options.always_async = on_off
                     }
                     Control::MaxAsyncConnections(n) => {
-                        self.context.check_options.max_async_connections =
-                            if n == 0 { DEFAULT_MAX_ASYNC_CONNECTIONS } else { n };
+                        self.context.check_options.max_async_connections = if n == 0 {
+                            DEFAULT_MAX_ASYNC_CONNECTIONS
+                        } else {
+                            n
+                        };
                     }
                 }
 
@@ -1890,8 +1893,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
-        let mut semaphore: Arc<tokio::sync::Semaphore> =
-            Arc::new(tokio::sync::Semaphore::new(self.check_options.max_async_connections));
+        let mut semaphore: Arc<tokio::sync::Semaphore> = Arc::new(tokio::sync::Semaphore::new(
+            self.check_options.max_async_connections,
+        ));
 
         // exec_async named tasks in-flight, keyed by connection name.
         let mut pending: HashMap<
