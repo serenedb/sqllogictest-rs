@@ -1,0 +1,71 @@
+# --- basic async statement / query ---
+
+statement async ok
+insert row1
+
+statement async ok
+insert row2
+
+wait
+
+query async I
+select count()
+----
+1
+
+query async I rowsort
+select values()
+----
+1
+
+query async I rowsort my_label
+select values()
+----
+1
+
+wait
+
+# --- async + retry ---
+
+statement async ok retry 2 backoff 0s
+INSERT INTO test VALUES (1);
+
+statement async error retry 2 backoff 0s
+INSERT INTO test VALUES (1);
+----
+duplicate key
+
+query async I retry 2 backoff 0s
+SELECT id FROM test;
+----
+1
+
+query async I rowsort retry 2 backoff 0s
+SELECT id FROM test ORDER BY random();
+----
+1
+2
+
+query async I rowsort my_label retry 2 backoff 0s
+SELECT id FROM test;
+----
+1
+
+wait
+
+# --- async system ---
+
+system async ok
+echo "hello"
+
+system async ok
+echo "world"
+
+wait
+
+# --- async system with retry ---
+
+system async ok retry 2 backoff 0s
+echo "with retry"
+
+wait

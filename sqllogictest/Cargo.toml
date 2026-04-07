@@ -12,7 +12,7 @@ description = "Sqllogictest parser and runner."
 async-trait = { workspace = true }
 educe = { workspace = true }
 fs-err = { workspace = true }
-futures = { workspace = true, features = ["executor"] }
+futures = { workspace = true, features = ["executor", "async-await"] }
 glob = { workspace = true }
 humantime = { workspace = true }
 itertools = { workspace = true }
@@ -24,9 +24,13 @@ similar = { workspace = true }
 subst = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "process", "macros"] }
 tracing = { workspace = true }
 rand = { workspace = true }
 log = { workspace = true }
+
+[features]
+testing = []
 
 [dev-dependencies]
 pretty_assertions = "1"

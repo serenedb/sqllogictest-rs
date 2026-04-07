@@ -31,5 +31,5 @@ fn test() {
     // Validator will always return true.
     tester.with_validator(|_, _, _| true);
 
-    tester.run_file("./validator/validator.slt").unwrap();
+    tester.run_file_test("./validator/validator.slt").unwrap();
 }

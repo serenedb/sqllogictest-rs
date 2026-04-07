@@ -30,6 +30,6 @@ fn test() {
     let mut tester = sqllogictest::Runner::new(|_ssl_mode, _port| async { Ok(FakeDB) });
 
     tester
-        .run_file("./test_dir_escape/test_dir_escape.slt")
+        .run_file_test("./test_dir_escape/test_dir_escape.slt")
         .unwrap();
 }

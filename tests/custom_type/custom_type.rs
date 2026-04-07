@@ -69,7 +69,7 @@ fn test() {
     let mut tester = sqllogictest::Runner::new(|_ssl_mode, _port| async { Ok(FakeDB) });
     tester.with_column_validator(strict_column_validator);
 
-    let r = tester.run_file("./custom_type/custom_type.slt");
+    let r = tester.run_file_test("./custom_type/custom_type.slt");
     if let Err(err) = r {
         eprintln!("{:?}", err);
     }

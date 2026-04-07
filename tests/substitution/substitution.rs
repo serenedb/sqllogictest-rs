@@ -62,6 +62,6 @@ rusty_fork_test! {
         let mut tester = sqllogictest::Runner::new(|_ssl_mode, _port| async { Ok(FakeDB) });
         tester.set_var(well_known::DATABASE.to_owned(), "fake_db".to_owned());
 
-        tester.run_file("./substitution/basic.slt").unwrap();
+        tester.run_file_test("./substitution/basic.slt").unwrap();
     }
 }

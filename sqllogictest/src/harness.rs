@@ -1,13 +1,16 @@
+#[cfg(any(test, feature = "testing"))]
 use std::path::Path;
 
 pub use glob::glob;
 pub use libtest_mimic::{run, Arguments, Failed, Trial};
 
+#[cfg(any(test, feature = "testing"))]
 use crate::{MakeConnection, Runner};
 
 /// * `db_fn`: `fn() -> sqllogictest::AsyncDB`
 /// * `pattern`: The glob used to match against and select each file to be tested. It is relative to
 ///   the root of the crate.
+#[cfg(any(test, feature = "testing"))]
 #[macro_export]
 macro_rules! harness {
     ($db_fn:path, $pattern:expr) => {
@@ -32,9 +35,13 @@ macro_rules! harness {
     };
 }
 
-pub fn test(filename: impl AsRef<Path>, make_conn: impl MakeConnection) -> Result<(), Failed> {
+#[cfg(any(test, feature = "testing"))]
+pub fn test<M: MakeConnection>(filename: impl AsRef<Path>, make_conn: M) -> Result<(), Failed>
+where
+    M::Conn: Send + 'static,
+{
     let mut tester = Runner::new(make_conn);
-    tester.run_file(filename)?;
+    tester.run_file_test(filename)?;
     tester.shutdown();
     Ok(())
 }
