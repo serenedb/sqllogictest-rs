@@ -251,7 +251,7 @@ pub enum Record<T: ColumnType> {
         loc: Location,
         threshold: u64,
     },
-    /// Show column names or not. True by default.
+    /// Show column names or not. False by default.
     ShowColumnNames {
         loc: Location,
         value: bool,

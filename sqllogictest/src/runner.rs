@@ -1731,7 +1731,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 sort_mode: None,
                 result_mode: None,
                 hash_threshold: 0,
-                show_column_names: true,
+                show_column_names: false,
                 flat_values: false,
                 always_async: false,
                 max_async_connections: DEFAULT_MAX_ASYNC_CONNECTIONS,
