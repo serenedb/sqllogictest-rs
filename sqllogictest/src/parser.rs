@@ -501,6 +501,33 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
     }
 }
 
+/// Returns true if `actual` matches `expected`, treating `<slt:ignore>` as a wildcard that
+/// matches any substring. Each non-empty fragment between markers must appear in `actual` in
+/// order. If `expected` contains no marker the comparison falls back to exact equality.
+pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
+    const IGNORE_MARKER: &str = "<slt:ignore>";
+    let fragments: Vec<&str> = expected.split(IGNORE_MARKER).collect();
+    if fragments.len() == 1 {
+        return expected == actual;
+    }
+    let mut pos = 0;
+    let mut allow_trailing_data = false;
+    for (i, frag) in fragments.iter().enumerate() {
+        if frag.is_empty() {
+            if i == fragments.len() - 1 {
+                allow_trailing_data = true;
+            }
+            continue;
+        }
+        if let Some(idx) = actual[pos..].find(frag) {
+            pos += idx + frag.len();
+        } else {
+            return false;
+        }
+    }
+    pos >= actual.len() || allow_trailing_data
+}
+
 /// Expected error message after `error` or under `----`.
 #[derive(Debug, Clone)]
 pub enum ExpectedError {
@@ -586,7 +613,7 @@ impl ExpectedError {
         match self {
             Self::Empty => true,
             Self::Inline(regex) => regex.is_match(err),
-            Self::Multiline(results) => results.trim() == err.trim(),
+            Self::Multiline(results) => match_with_ignore_marker(results.trim(), err.trim()),
             Self::SqlState(expected_state) => sqlstate.is_some_and(|state| state == expected_state),
         }
     }

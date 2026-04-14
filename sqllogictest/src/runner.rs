@@ -595,51 +595,13 @@ pub fn default_validator(
     const IGNORE_MARKER: &str = "<slt:ignore>";
     let contains_ignore_marker = expected.iter().any(|line| line.contains(IGNORE_MARKER));
 
-    // Normalize expected lines.
     // If ignore marker present, perform fragment-based matching on the full snapshot.
+    // The actual results might contain \n, and may not be a normal "row", which is not suitable
+    // to normalize.
     if contains_ignore_marker {
-        // If ignore marker present, perform fragment-based matching on the full snapshot.
-        // The actual results might contain \n, and may not be a normal "row", which is not suitable
-        // to normalize.
-        let expected_results = expected;
-        let actual_rows = actual
-            .iter()
-            .map(|strs| strs.iter().join("\t"))
-            .collect_vec();
-
-        let expected_snapshot = expected_results.join("\n");
-        let actual_snapshot = actual_rows.join("\n");
-        let fragments: Vec<&str> = expected_snapshot.split(IGNORE_MARKER).collect();
-        let mut pos = 0;
-        let mut allow_trailing_data = false;
-        for (i, frag) in fragments.iter().enumerate() {
-            if frag.is_empty() {
-                // If it's the last fragment, trailing data is allowed
-                if i == fragments.len() - 1 {
-                    allow_trailing_data = true;
-                }
-                continue;
-            }
-            if let Some(idx) = actual_snapshot[pos..].find(frag) {
-                pos += idx + frag.len();
-            } else {
-                tracing::error!(
-                    "mismatch at: {}\nexpected: {}\nactual: {}",
-                    pos,
-                    frag,
-                    &actual_snapshot[pos..]
-                );
-                return false;
-            }
-        }
-        if pos < actual_snapshot.len() && !allow_trailing_data {
-            tracing::error!(
-                "extra data found after last expected fragment:\nremaining: {}",
-                &actual_snapshot[pos..]
-            );
-            return false;
-        }
-        return true;
+        let expected_snapshot = expected.join("\n");
+        let actual_snapshot = actual.iter().map(|strs| strs.iter().join("\t")).join("\n");
+        return match_with_ignore_marker(&expected_snapshot, &actual_snapshot);
     }
 
     let expected_results = expected.iter().map(normalizer).collect_vec();
@@ -3137,5 +3099,25 @@ Caused by:
         ]];
         let expected = vec!["alpha<slt:ignore>delta".to_string()];
         assert!(!default_validator(normalizer, &actual, &expected));
+    }
+
+    #[test]
+    fn test_expected_error_multiline_ignore() {
+        let err = ExpectedError::Multiline(
+            "db error: ERROR: unrecognized configuration <slt:ignore>".to_string(),
+        );
+        assert!(err.is_match(
+            r#"db error: ERROR: unrecognized configuration parameter "non_existed_variable""#,
+            None
+        ));
+        assert!(!err.is_match("some other error", None));
+    }
+
+    #[test]
+    fn test_expected_error_multiline_ignore_trailing() {
+        // Marker at end allows any trailing content
+        let err = ExpectedError::Multiline("db error: ERROR: <slt:ignore>".to_string());
+        assert!(err.is_match("db error: ERROR: something unexpected here", None));
+        assert!(!err.is_match("completely different message", None));
     }
 }
