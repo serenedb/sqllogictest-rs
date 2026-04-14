@@ -522,10 +522,23 @@ pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
         if let Some(idx) = actual[pos..].find(frag) {
             pos += idx + frag.len();
         } else {
+            tracing::error!(
+                "mismatch at: {}\nexpected: {}\nactual: {}",
+                pos,
+                frag,
+                &actual[pos..]
+            );
             return false;
         }
     }
-    pos >= actual.len() || allow_trailing_data
+    if pos < actual.len() && !allow_trailing_data {
+        tracing::error!(
+            "extra data found after last expected fragment:\nremaining: {}",
+            &actual[pos..]
+        );
+        return false;
+    }
+    true
 }
 
 /// Expected error message after `error` or under `----`.
