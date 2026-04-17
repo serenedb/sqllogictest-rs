@@ -656,6 +656,7 @@ async fn run_parallel(
     }
 
     if !failed_cases.is_empty() {
+        failed_cases.sort();
         Err(anyhow!("some test cases failed:\n{:#?}", failed_cases))
     } else if cancel.is_cancelled() {
         Err(anyhow!("some test cases skipped or cancelled"))
@@ -904,7 +905,8 @@ async fn run_serial(
     );
 
     if !failed_cases.is_empty() {
-        Err(anyhow!("some test case failed:\n{:#?}", failed_cases))
+        failed_cases.sort();
+        Err(anyhow!("some test cases failed:\n{:#?}", failed_cases))
     } else if cancel.is_cancelled() {
         Err(anyhow!("some test cases skipped or cancelled"))
     } else {
