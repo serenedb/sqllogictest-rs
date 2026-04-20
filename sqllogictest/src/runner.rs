@@ -1753,8 +1753,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             _ => None,
         };
 
-        let mut task = if let Some(conn_name) = maybe_conn_name {
-            match self.conn.get(conn_name).await {
+        let mut task = if let Some(ref conn_name) = maybe_conn_name {
+            match self.conn.get(conn_name.clone()).await {
                 Ok(conn) => ConnectionTask {
                     conn: Some(conn),
                     context: TaskContext {
@@ -1783,7 +1783,12 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
         };
 
-        task.apply_record(record).await
+        let output = task.apply_record(record).await;
+        // Return connection to pool
+        if let (Some(conn_name), Some(conn)) = (maybe_conn_name, task.conn) {
+            self.conn.add(conn_name, conn);
+        }
+        output
     }
 
     /// Get the named connection from `pending` (if an in-flight task exists for it, wait for it
