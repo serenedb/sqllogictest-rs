@@ -1784,7 +1784,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         };
 
         let output = task.apply_record(record).await;
-        // Return connection to pool — same pattern as run_multi_records lines 2031-2033.
+        // Return connection to pool
         if let (Some(conn_name), Some(conn)) = (maybe_conn_name, task.conn) {
             self.conn.add(conn_name, conn);
         }
