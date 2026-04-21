@@ -1053,7 +1053,9 @@ impl<D: AsyncDB> ConnectionTask<D> {
         // If connection establishment failed, propagate it as a query/statement error so
         // `query error` / `statement error` records can match connection-time failures
         // (e.g., TLS handshake errors when connecting with sslmode=require to a plain port).
-        if let Some(err) = self.pending_error.take() {
+        // Clone rather than take: retry loops call apply_record multiple times, and conn
+        // stays None across attempts, so later attempts would hit an unwrap panic below.
+        if let Some(err) = self.pending_error.clone() {
             return match record {
                 Record::Statement { conditions, .. } => {
                     if should_skip(&self.context.vars.labels, "", &conditions) {
