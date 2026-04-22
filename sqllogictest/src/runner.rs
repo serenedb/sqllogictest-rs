@@ -1786,6 +1786,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         };
 
         let output = task.apply_record(record).await;
+        self.vars = task.context.vars.clone();
+        self.check_options = task.context.check_options.clone();
         // Return connection to pool
         if let (Some(conn_name), Some(conn)) = (maybe_conn_name, task.conn) {
             self.conn.add(conn_name, conn);
