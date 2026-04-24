@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use futures::{pin_mut, StreamExt};
 use pg_interval::Interval;
-use postgres_types::{accepts, FromSql, ToSql, Type};
+use postgres_types::{accepts, FromSql, Kind, ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
@@ -123,6 +123,30 @@ impl<'a> FromSql<'a> for JsonPreservedValue {
 impl fmt::Display for JsonPreservedValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.payload)
+    }
+}
+
+#[derive(Debug)]
+struct EnumValue(String);
+
+impl<'a> FromSql<'a> for EnumValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        // PG wire encoding for an enum value is its label as UTF-8 text in
+        // both text and binary formats.
+        Ok(EnumValue(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Enum(_))
+    }
+}
+
+impl fmt::Display for EnumValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -559,6 +583,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::OID_ARRAY => {
                         array_process!(row, row_vec, idx, u32);
+                    }
+                    _ if matches!(column.type_().kind(), Kind::Enum(_)) => {
+                        single_process!(row, row_vec, idx, EnumValue);
                     }
                     _ => {
                         todo!("Don't support {} type now.", column.type_().name())
