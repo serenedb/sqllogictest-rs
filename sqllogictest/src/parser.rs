@@ -547,28 +547,14 @@ pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
     true
 }
 
-/// Produces a hybrid "actual" string that preserves `<slt:ignore>` markers from `expected`
-/// wherever the surrounding fragments can be found in `actual`, and substitutes content from
-/// `actual` where they can't.
-///
-/// This is used to build both the diff shown on a failed match and the replacement written by
-/// `--override`, so that existing `<slt:ignore>` markers survive the update and only the parts
-/// that genuinely diverge get rewritten.
-///
-/// When `expected` contains no marker this returns `actual` unchanged — there is nothing to
-/// align.
-pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
-    if !expected.contains(IGNORE_MARKER) {
-        return actual.to_string();
-    }
-    align_line_based(expected, actual)
-}
-
 /// Aligns `actual` against `expected` line-by-line. Marker lines absorb actual lines up to
 /// the next non-marker anchor; inline markers whose surrounding structure still matches are
 /// kept, otherwise substituted. Non-marker lines are matched, dropped when they're extras in
 /// expected, or substituted on value divergence. Trailing actual lines are appended.
-fn align_line_based(expected: &str, actual: &str) -> String {
+pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
+    if !expected.contains(IGNORE_MARKER) {
+        return actual.to_string();
+    }
     let expected_lines: Vec<&str> = expected.split('\n').collect();
     let actual_lines: Vec<&str> = actual.split('\n').collect();
     let mut aligned: Vec<&str> = Vec::with_capacity(expected_lines.len());
@@ -601,7 +587,7 @@ fn align_line_based(expected: &str, actual: &str) -> String {
         if head == current {
             aligned.push(current);
             actual_cursor += 1;
-        } else if is_expected_extra(head, expected_remaining) {
+        } else if is_expected_extra(current, head, expected_remaining) {
             // Some upcoming expected literal already anchors on `head` → `current` has no
             // counterpart in actual. Drop it so the diff shows "-".
         } else {
@@ -617,6 +603,22 @@ fn align_line_based(expected: &str, actual: &str) -> String {
 
 fn has_marker(line: &str) -> bool {
     line.contains(IGNORE_MARKER)
+}
+
+/// [`align_with_ignore_marker`] with a defensive post-check: the aligned string is itself
+/// a wildcard pattern (it still carries `<slt:ignore>` markers), and a correct alignment
+/// must match `actual` when read through those markers. If it doesn't, alignment produced
+/// something inconsistent with actual — warn and fall back to the raw `actual`.
+pub(crate) fn align_with_ignore_marker_checked(expected: &str, actual: &str) -> String {
+    let aligned = align_with_ignore_marker(expected, actual);
+    if !match_with_ignore_marker(&aligned, actual) {
+        tracing::warn!(
+            target: "sqllogictest::align",
+            "Aligned pattern does not match actual; falling back to raw actual.\nactual: {actual}\naligned: {aligned}",
+        );
+        return actual.to_string();
+    }
+    aligned
 }
 
 /// Number of actual lines the marker absorbs: up to the next non-marker anchor in
@@ -636,11 +638,17 @@ fn absorb_count(remaining_expected: &[&str], remaining_actual: &[&str]) -> usize
 /// matches `head`. That means the current expected line has no counterpart in actual — it's
 /// an extra the aligned output should drop. Markers act as barriers because anything past
 /// one is part of a different wildcard block and not a reliable anchor for the current line.
-fn is_expected_extra(head: &str, remaining_expected: &[&str]) -> bool {
-    remaining_expected
-        .iter()
-        .take_while(|line| !has_marker(line))
-        .any(|&line| line == head)
+/// True when `current` has no counterpart in actual and should be dropped. Two cases:
+/// - the next non-marker expected line already matches the actual `head` (so everything
+///   between is meant to be absorbed by the intervening marker), or
+/// - `current` has a non-marker duplicate further down in expected (it's one of several
+///   identical extras, e.g. repeated blank lines, that line up with actual content later).
+fn is_expected_extra(current: &str, head: &str, remaining_expected: &[&str]) -> bool {
+    let next_literal = remaining_expected.iter().copied().find(|l| !has_marker(l));
+    next_literal == Some(head)
+        || remaining_expected
+            .iter()
+            .any(|&l| !has_marker(l) && l == current)
 }
 
 /// Expected error message after `error` or under `----`.
@@ -751,7 +759,7 @@ impl ExpectedError {
             // only substitute the fragments that diverge — same behavior as query results.
             let body = match reference {
                 Some(Self::Multiline(ref_body)) if contains_ignore_marker(ref_body) => {
-                    align_with_ignore_marker(ref_body.trim(), trimmed_err)
+                    align_with_ignore_marker_checked(ref_body.trim(), trimmed_err)
                 }
                 _ => trimmed_err.to_string(),
             };

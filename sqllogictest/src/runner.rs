@@ -993,7 +993,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
                     let expected_snapshot = expected_results.join("\n");
                     let actual_snapshot = output_rows.join("\n");
                     let actual = if contains_ignore_marker(&expected_snapshot) {
-                        align_with_ignore_marker(&expected_snapshot, &actual_snapshot)
+                        align_with_ignore_marker_checked(&expected_snapshot, &actual_snapshot)
                     } else {
                         actual_snapshot
                     };
@@ -2514,12 +2514,10 @@ pub fn update_record_with_output<T: ColumnType>(
                         ..
                     } if expected_results.iter().any(|l| contains_ignore_marker(l)) => {
                         let expected_snapshot = expected_results.join("\n");
-                        let actual_snapshot = rows
-                            .iter()
-                            .map(|cols| cols.join(col_separator))
-                            .join("\n");
+                        let actual_snapshot =
+                            rows.iter().map(|cols| cols.join(col_separator)).join("\n");
                         let aligned =
-                            align_with_ignore_marker(&expected_snapshot, &actual_snapshot);
+                            align_with_ignore_marker_checked(&expected_snapshot, &actual_snapshot);
                         aligned.split('\n').map(|s| s.to_string()).collect()
                     }
                     // Otherwise, regenerate with proper formatting.
