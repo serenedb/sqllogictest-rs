@@ -990,10 +990,17 @@ impl<D: AsyncDB> ConnectionTask<D> {
                     &expected_results,
                 ) {
                     let output_rows = rows.iter().map(|strs| strs.iter().join("\t")).collect_vec();
+                    let expected_snapshot = expected_results.join("\n");
+                    let actual_snapshot = output_rows.join("\n");
+                    let actual = if contains_ignore_marker(&expected_snapshot) {
+                        align_with_ignore_marker_checked(&expected_snapshot, &actual_snapshot)
+                    } else {
+                        actual_snapshot
+                    };
                     return Err(TestErrorKind::QueryResultMismatch {
                         sql,
-                        expected: expected_results.join("\n"),
-                        actual: output_rows.join("\n"),
+                        expected: expected_snapshot,
+                        actual,
                     }
                     .at(loc));
                 }
@@ -2500,6 +2507,19 @@ pub fn update_record_with_output<T: ColumnType>(
                         results: expected_results,
                         ..
                     } if results_match && !force_override => expected_results.clone(),
+                    // If the expected snapshot contains `<slt:ignore>` markers, preserve them
+                    // in the override output and only substitute the fragments that diverge.
+                    QueryExpect::Results {
+                        results: expected_results,
+                        ..
+                    } if expected_results.iter().any(|l| contains_ignore_marker(l)) => {
+                        let expected_snapshot = expected_results.join("\n");
+                        let actual_snapshot =
+                            rows.iter().map(|cols| cols.join(col_separator)).join("\n");
+                        let aligned =
+                            align_with_ignore_marker_checked(&expected_snapshot, &actual_snapshot);
+                        aligned.split('\n').map(|s| s.to_string()).collect()
+                    }
                     // Otherwise, regenerate with proper formatting.
                     _ => rows.iter().map(|cols| cols.join(col_separator)).collect(),
                 };
@@ -2666,6 +2686,67 @@ mod tests {
 
             // No update
             expected: None,
+        }
+        .run()
+    }
+
+    #[test]
+    fn test_query_replacement_preserves_ignore_markers() {
+        // From improve_override.md: override must keep `<slt:ignore>` markers and only
+        // substitute fragments that diverge from actual.
+        TestCase {
+            input: "query I\n\
+                    select * from foo;\n\
+                    ----\n\
+                    <slt:ignore>\n\
+                    2\n\
+                    <slt:ignore>\n\
+                    8",
+
+            record_output: query_output(
+                &[&["1"], &["2"], &["3"], &["4"]],
+                vec![DefaultColumnType::Integer],
+            ),
+
+            expected: Some(
+                "query I\n\
+                 select * from foo;\n\
+                 ----\n\
+                 <slt:ignore>\n\
+                 2\n\
+                 <slt:ignore>\n\
+                 4",
+            ),
+        }
+        .run()
+    }
+
+    #[test]
+    fn test_query_replacement_preserves_ignore_markers_when_matching() {
+        // When actual already matches, override preserves the original expected verbatim.
+        TestCase {
+            input: "query I\n\
+                    select * from foo;\n\
+                    ----\n\
+                    <slt:ignore>\n\
+                    2\n\
+                    <slt:ignore>\n\
+                    4",
+
+            record_output: query_output(
+                &[&["1"], &["2"], &["3"], &["4"]],
+                vec![DefaultColumnType::Integer],
+            ),
+
+            expected: Some(
+                "query I\n\
+                 select * from foo;\n\
+                 ----\n\
+                 <slt:ignore>\n\
+                 2\n\
+                 <slt:ignore>\n\
+                 4",
+            ),
         }
         .run()
     }
