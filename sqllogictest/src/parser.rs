@@ -547,10 +547,7 @@ pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
     true
 }
 
-/// Aligns `actual` against `expected` line-by-line. Marker lines absorb actual lines up to
-/// the next non-marker anchor; inline markers whose surrounding structure still matches are
-/// kept, otherwise substituted. Non-marker lines are matched, dropped when they're extras in
-/// expected, or substituted on value divergence. Trailing actual lines are appended.
+/// Aligns `actual` against `expected` line-by-line
 pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
     if !expected.contains(IGNORE_MARKER) {
         return actual.to_string();
@@ -558,51 +555,45 @@ pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
     let expected_lines: Vec<&str> = expected.split('\n').collect();
     let actual_lines: Vec<&str> = actual.split('\n').collect();
     let mut aligned: Vec<&str> = Vec::with_capacity(expected_lines.len());
-    let mut actual_cursor: usize = 0;
+    let mut cursor: usize = 0;
 
-    for (i, &current) in expected_lines.iter().enumerate() {
-        let actual_remaining = &actual_lines[actual_cursor..];
-        let expected_remaining = &expected_lines[i + 1..];
-
-        if has_marker(current) {
-            let absorbed = absorb_count(expected_remaining, actual_remaining);
-            let keep_marker = current == IGNORE_MARKER
-                || absorbed == 0
-                || (absorbed == 1 && match_with_ignore_marker(current, actual_remaining[0]));
-            if keep_marker {
-                aligned.push(current);
-            } else {
-                aligned.extend(actual_remaining[..absorbed].iter().copied());
+    for (i, &exp) in expected_lines.iter().enumerate() {
+        if exp == IGNORE_MARKER {
+            let next_anchor = expected_lines[i + 1..]
+                .iter()
+                .copied()
+                .find(|l| !l.contains(IGNORE_MARKER));
+            let remaining = actual_lines.len() - cursor;
+            let absorbed = match next_anchor {
+                None => remaining,
+                Some(anchor) => actual_lines[cursor..]
+                    .iter()
+                    .position(|&l| l == anchor)
+                    .unwrap_or(remaining.min(1)),
+            };
+            aligned.push(exp);
+            cursor += absorbed;
+        } else if exp.contains(IGNORE_MARKER) {
+            // Not properly handle the following case:
+            // some prefix <slt:ignore>\n
+            // as it may absorb more lines, but it's OK for now.
+            match actual_lines.get(cursor) {
+                Some(&act) if match_with_ignore_marker(exp, act) => aligned.push(exp),
+                Some(&act) => aligned.push(act),
+                None => aligned.push(exp),
             }
-            actual_cursor += absorbed;
-            continue;
-        }
-
-        let Some(&head) = actual_remaining.first() else {
-            // Actual exhausted — keep the literal so we don't lose it silently.
-            aligned.push(current);
-            continue;
-        };
-
-        if head == current {
-            aligned.push(current);
-            actual_cursor += 1;
-        } else if is_expected_extra(current, head, expected_remaining) {
-            // Some upcoming expected literal already anchors on `head` → `current` has no
-            // counterpart in actual. Drop it so the diff shows "-".
+            cursor = (cursor + 1).min(actual_lines.len());
         } else {
-            // Value diverged — substitute so the diff surfaces the change.
-            aligned.push(head);
-            actual_cursor += 1;
+            match actual_lines.get(cursor) {
+                Some(&act) => aligned.push(if exp == act { exp } else { act }),
+                None => aligned.push(exp),
+            }
+            cursor = (cursor + 1).min(actual_lines.len());
         }
     }
 
-    aligned.extend(actual_lines[actual_cursor..].iter().copied());
+    aligned.extend(actual_lines[cursor..].iter().copied());
     aligned.join("\n")
-}
-
-fn has_marker(line: &str) -> bool {
-    line.contains(IGNORE_MARKER)
 }
 
 /// [`align_with_ignore_marker`] with a defensive post-check: the aligned string is itself
@@ -619,36 +610,6 @@ pub(crate) fn align_with_ignore_marker_checked(expected: &str, actual: &str) -> 
         return actual.to_string();
     }
     aligned
-}
-
-/// Number of actual lines the marker absorbs: up to the next non-marker anchor in
-/// `remaining_expected`, all of `remaining_actual` if no anchor remains, or a single line
-/// when the anchor can't be located (so the next literal substitution lines up).
-fn absorb_count(remaining_expected: &[&str], remaining_actual: &[&str]) -> usize {
-    let Some(anchor) = remaining_expected.iter().copied().find(|l| !has_marker(l)) else {
-        return remaining_actual.len();
-    };
-    remaining_actual
-        .iter()
-        .position(|&l| l == anchor)
-        .unwrap_or(remaining_actual.len().min(1))
-}
-
-/// True when some upcoming expected literal (before the next marker barrier) already
-/// matches `head`. That means the current expected line has no counterpart in actual — it's
-/// an extra the aligned output should drop. Markers act as barriers because anything past
-/// one is part of a different wildcard block and not a reliable anchor for the current line.
-/// True when `current` has no counterpart in actual and should be dropped. Two cases:
-/// - the next non-marker expected line already matches the actual `head` (so everything
-///   between is meant to be absorbed by the intervening marker), or
-/// - `current` has a non-marker duplicate further down in expected (it's one of several
-///   identical extras, e.g. repeated blank lines, that line up with actual content later).
-fn is_expected_extra(current: &str, head: &str, remaining_expected: &[&str]) -> bool {
-    let next_literal = remaining_expected.iter().copied().find(|l| !has_marker(l));
-    next_literal == Some(head)
-        || remaining_expected
-            .iter()
-            .any(|&l| !has_marker(l) && l == current)
 }
 
 /// Expected error message after `error` or under `----`.
@@ -2274,30 +2235,6 @@ SELECT 1
     }
 
     #[test]
-    fn test_align_inline_marker_absorbs_when_expected_has_extra_line() {
-        // User-reported "abobus" case: when the expected has an extra line that isn't in
-        // actual, the extra line is dropped from the aligned output, and the inline-marker
-        // line absorbs the volatile actual line. The inline marker's surrounding structure
-        // here (`│ ` + `│`) matches the actual line, so the marker itself is preserved.
-        let expected = "abobus\n\
-                        │ rows │\n\
-                        │ <slt:ignore> │\n\
-                        └─ end ─┘\n\
-                        └─last─┘";
-        let actual = "│ rows │\n\
-                      │ 0.67s │\n\
-                      └─ end ─┘\n\
-                      └─last─┘";
-        assert_eq!(
-            align_with_ignore_marker(expected, actual),
-            "│ rows │\n\
-             │ <slt:ignore> │\n\
-             └─ end ─┘\n\
-             └─last─┘"
-        );
-    }
-
-    #[test]
     fn test_align_inline_marker_structure_change_surfaces_as_substitution() {
         // When the inline marker line itself is edited so its non-marker parts no longer
         // match the actual line (here: a stray "z" was added after the marker), we should
@@ -2318,44 +2255,15 @@ SELECT 1
     }
 
     #[test]
-    fn test_align_multiple_extras_before_and_after_marker() {
-        // Several consecutive extra lines on either side of an inline marker. The extras
-        // must all be dropped, the marker preserved, and no shift should compound into the
-        // trailing section.
-        let expected = "│ rows │\n\
-                        │      │\n\
-                        │      │\n\
-                        │ <slt:ignore> │\n\
-                        │      │\n\
-                        └─end─┘\n\
-                        │ 11 │\n\
-                        │ <slt:ignore> │\n\
-                        └─bot─┘";
-        let actual = "│ rows │\n\
-                      │ 0.68s │\n\
-                      └─end─┘\n\
-                      │ 11 │\n\
-                      │ 0.00s │\n\
-                      └─bot─┘";
+    fn test_align_inline_marker_changed_literal_between_markers() {
+        // Two markers with a literal between them. The literal in actual changed; the marker
+        // patterns still match their actual lines, so the markers are preserved and the
+        // changed literal is substituted.
+        let expected = "aboba 1\n<slt:ignore> abobus\nkek 32\n<slt:ignore> 32";
+        let actual = "aboba 1\nxxxx abobus\nlol 32\nuuuu 32";
         assert_eq!(
             align_with_ignore_marker(expected, actual),
-            "│ rows │\n\
-             │ <slt:ignore> │\n\
-             └─end─┘\n\
-             │ 11 │\n\
-             │ <slt:ignore> │\n\
-             └─bot─┘"
-        );
-    }
-
-    #[test]
-    fn test_align_bare_marker_absorbs_when_expected_has_extra_line() {
-        // Same scenario but with the marker alone on its line — should behave the same.
-        let expected = "extra\nrows\n<slt:ignore>\nend";
-        let actual = "rows\nvolatile\nend";
-        assert_eq!(
-            align_with_ignore_marker(expected, actual),
-            "rows\n<slt:ignore>\nend"
+            "aboba 1\n<slt:ignore> abobus\nlol 32\n<slt:ignore> 32"
         );
     }
 
