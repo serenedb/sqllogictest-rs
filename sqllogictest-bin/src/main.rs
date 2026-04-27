@@ -361,6 +361,8 @@ pub async fn main() -> Result<()> {
         all_files.extend(files);
     }
 
+    all_files = all_files.into_iter().unique().collect();
+
     let config = DBConfig {
         addrs,
         ssl_port,
