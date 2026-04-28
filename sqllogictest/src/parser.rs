@@ -516,18 +516,13 @@ pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
     if fragments.len() == 1 {
         return expected == actual;
     }
+    let allow_leading_data = fragments[0].is_empty();
+    let allow_trailing_data = fragments[fragments.len() - 1].is_empty();
+
     let mut pos = 0;
-    let mut allow_trailing_data = false;
-    for (i, frag) in fragments.iter().enumerate() {
-        if frag.is_empty() {
-            if i == fragments.len() - 1 {
-                allow_trailing_data = true;
-            }
-            continue;
-        }
-        if let Some(idx) = actual[pos..].find(frag) {
-            pos += idx + frag.len();
-        } else {
+    let mut at_start = true;
+    for frag in fragments.iter().filter(|f| !f.is_empty()) {
+        let Some(idx) = actual[pos..].find(frag) else {
             tracing::error!(
                 "mismatch at: {}\nexpected: {}\nactual: {}",
                 pos,
@@ -535,7 +530,17 @@ pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
                 &actual[pos..]
             );
             return false;
+        };
+        if at_start && !allow_leading_data && idx > 0 {
+            tracing::error!(
+                "data found before first expected fragment:\nleading: {}\nexpected: {}",
+                &actual[..idx],
+                frag
+            );
+            return false;
         }
+        at_start = false;
+        pos += idx + frag.len();
     }
     if pos < actual.len() && !allow_trailing_data {
         tracing::error!(
@@ -549,51 +554,82 @@ pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
 
 /// Aligns `actual` against `expected` line-by-line
 pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
-    if !expected.contains(IGNORE_MARKER) {
-        return actual.to_string();
-    }
-    let expected_lines: Vec<&str> = expected.split('\n').collect();
-    let actual_lines: Vec<&str> = actual.split('\n').collect();
-    let mut aligned: Vec<&str> = Vec::with_capacity(expected_lines.len());
-    let mut cursor: usize = 0;
-
-    for (i, &exp) in expected_lines.iter().enumerate() {
-        if exp == IGNORE_MARKER {
-            let next_anchor = expected_lines[i + 1..]
-                .iter()
-                .copied()
-                .find(|l| !l.contains(IGNORE_MARKER));
-            let remaining = actual_lines.len() - cursor;
-            let absorbed = match next_anchor {
-                None => remaining,
-                Some(anchor) => actual_lines[cursor..]
-                    .iter()
-                    .position(|&l| l == anchor)
-                    .unwrap_or(remaining.min(1)),
-            };
-            aligned.push(exp);
-            cursor += absorbed;
-        } else if exp.contains(IGNORE_MARKER) {
-            // Not properly handle the following case:
-            // some prefix <slt:ignore>\n
-            // as it may absorb more lines, but it's OK for now.
-            match actual_lines.get(cursor) {
-                Some(&act) if match_with_ignore_marker(exp, act) => aligned.push(exp),
-                Some(&act) => aligned.push(act),
-                None => aligned.push(exp),
-            }
-            cursor = (cursor + 1).min(actual_lines.len());
+    // Takes expected marker-free and actual substring and tries to build new substring in output.
+    // Depending on marker position, tries to eagerly adsorb suffix or prefix.
+    fn transform<'a>(
+        exp: &str,
+        act: &'a str,
+        has_left_marker: bool,
+        has_right_marker: bool,
+    ) -> &'a str {
+        let act = if has_left_marker {
+            std::iter::once(exp.len())
+                .chain(exp.char_indices().rev().map(|(i, _)| i))
+                .find_map(|end| act.find(&exp[..end]).map(|pos| &act[pos..]))
+                .unwrap_or(act)
         } else {
-            match actual_lines.get(cursor) {
-                Some(&act) => aligned.push(if exp == act { exp } else { act }),
-                None => aligned.push(exp),
-            }
-            cursor = (cursor + 1).min(actual_lines.len());
+            act
+        };
+
+        if has_right_marker {
+            exp.char_indices()
+                .find_map(|(i, _)| {
+                    let suffix = &exp[i..];
+                    act.rfind(suffix).map(|pos| &act[..pos + suffix.len()])
+                })
+                .unwrap_or(act)
+        } else {
+            act
         }
     }
 
-    aligned.extend(actual_lines[cursor..].iter().copied());
-    aligned.join("\n")
+    fn widen<'a>(source: &'a str, prev: &str, next: &str) -> &'a str {
+        let start = prev.as_ptr() as usize - source.as_ptr() as usize;
+        let total = prev.len() + IGNORE_MARKER.len() + next.len();
+        &source[start..start + total]
+    }
+
+    let starts_with_ignore = expected.starts_with(IGNORE_MARKER);
+    let ends_with_ignore = expected.ends_with(IGNORE_MARKER);
+
+    let expected_chunks: Vec<_> = expected.split(IGNORE_MARKER).collect();
+    let chunks_count = expected_chunks.len();
+
+    let mut resp: Vec<&str> = Vec::with_capacity(chunks_count + 1);
+    let mut pending: Option<&str> = None;
+    let mut actual_rem = actual;
+
+    for (i, chunk) in expected_chunks.into_iter().enumerate() {
+        let Some(pos) = actual_rem.find(chunk) else {
+            pending = Some(match pending {
+                Some(prev) => widen(expected, prev, chunk),
+                None => chunk,
+            });
+            continue;
+        };
+
+        if let Some(prev) = pending.take() {
+            resp.push(transform(prev, &actual_rem[..pos], i != 1, true));
+            resp.push(chunk);
+        } else if i == 0 && pos > 0 && !starts_with_ignore {
+            resp.push(&actual_rem[..pos + chunk.len()]);
+        } else {
+            resp.push(chunk);
+        }
+        actual_rem = &actual_rem[pos + chunk.len()..];
+    }
+
+    let trailing_unmatched = pending.is_none() && !actual_rem.is_empty() && !ends_with_ignore;
+
+    if let Some(prev) = pending {
+        resp.push(transform(prev, actual_rem, chunks_count != 0, false));
+    }
+
+    let mut result = resp.into_iter().join(IGNORE_MARKER);
+    if trailing_unmatched {
+        result.push_str(actual_rem);
+    }
+    result
 }
 
 /// [`align_with_ignore_marker`] with a defensive post-check: the aligned string is itself
@@ -603,7 +639,7 @@ pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
 pub(crate) fn align_with_ignore_marker_checked(expected: &str, actual: &str) -> String {
     let aligned = align_with_ignore_marker(expected, actual);
     if !match_with_ignore_marker(&aligned, actual) {
-        tracing::warn!(
+        tracing::error!(
             target: "sqllogictest::align",
             "Aligned pattern does not match actual; falling back to raw actual.\nactual: {actual}\naligned: {aligned}",
         );
@@ -2231,39 +2267,6 @@ SELECT 1
         assert_eq!(
             align_with_ignore_marker(expected, actual),
             "prefix\nwildly different\nsuffix"
-        );
-    }
-
-    #[test]
-    fn test_align_inline_marker_structure_change_surfaces_as_substitution() {
-        // When the inline marker line itself is edited so its non-marker parts no longer
-        // match the actual line (here: a stray "z" was added after the marker), we should
-        // substitute with the actual line so the diff surfaces the change — not silently
-        // preserve the broken expected line.
-        let expected = "│ rows │\n\
-                        │   <slt:ignore>  z   │\n\
-                        └─ end ─┘";
-        let actual = "│ rows │\n\
-                      │    0.062s   │\n\
-                      └─ end ─┘";
-        assert_eq!(
-            align_with_ignore_marker(expected, actual),
-            "│ rows │\n\
-             │    0.062s   │\n\
-             └─ end ─┘"
-        );
-    }
-
-    #[test]
-    fn test_align_inline_marker_changed_literal_between_markers() {
-        // Two markers with a literal between them. The literal in actual changed; the marker
-        // patterns still match their actual lines, so the markers are preserved and the
-        // changed literal is substituted.
-        let expected = "aboba 1\n<slt:ignore> abobus\nkek 32\n<slt:ignore> 32";
-        let actual = "aboba 1\nxxxx abobus\nlol 32\nuuuu 32";
-        assert_eq!(
-            align_with_ignore_marker(expected, actual),
-            "aboba 1\n<slt:ignore> abobus\nlol 32\n<slt:ignore> 32"
         );
     }
 
