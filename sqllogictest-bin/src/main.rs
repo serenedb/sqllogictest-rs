@@ -916,6 +916,36 @@ async fn run_serial(
     }
 }
 
+/// Owns a unique scratch directory under [`std::env::temp_dir`] used to stage
+/// override output. `Drop` removes it; if the process is killed by a signal the
+/// directory is left behind for inspection.
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    /// Creates a fresh `<tmp>/sqllogictest-<suffix>` directory.
+    fn new() -> io::Result<Self> {
+        let suffix = rand::distributions::Alphanumeric
+            .sample_string(&mut rand::thread_rng(), 8)
+            .to_lowercase();
+        let path = std::env::temp_dir().join(format!("sqllogictest-{suffix}"));
+        fs_err::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup; nothing useful to do on failure.
+        let _ = fs_err::remove_dir_all(&self.path);
+    }
+}
+
 async fn update_test_files(
     files: Vec<PathBuf>,
     engine: &EngineConfig,
@@ -925,6 +955,11 @@ async fn update_test_files(
     keep_db_on_failure: bool,
     labels: Vec<String>,
 ) -> Result<()> {
+    let temp_dir =
+        TempDirGuard::new().context("failed to create temp directory for overrides")?;
+
+    eprintln!("staging override output in {}", temp_dir.path().display());
+
     let mut db = engines::connect(engine, &config, SslMode::Disable, DBPort::Plain).await?;
     let test_databases = if jobs.is_some() {
         test_db_names(files)?
@@ -951,6 +986,7 @@ async fn update_test_files(
     }
 
     let failed_dbs: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let temp_dir_path: &Path = temp_dir.path();
 
     let mut stream = futures::stream::iter(test_databases)
         .map(|(db_name, file)| {
@@ -968,7 +1004,14 @@ async fn update_test_files(
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
-                if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, update_mode).await
+                if let Err(e) = update_test_file(
+                    &mut buffer,
+                    &mut runner,
+                    &file,
+                    update_mode,
+                    temp_dir_path,
+                )
+                .await
                 {
                     writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
                         .expect("cannot write to buffer");
@@ -1326,6 +1369,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
     update_mode: &UpdateMode,
+    temp_dir: &Path,
 ) -> Result<()> {
     let filename = filename.as_ref();
     let records = tokio::task::block_in_place(|| {
@@ -1341,18 +1385,38 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
 
     begin_times.push(Instant::now());
 
-    fn create_outfile(filename: impl AsRef<Path>) -> io::Result<(PathBuf, File)> {
-        let filename = filename.as_ref();
-        let outfilename = filename.file_name().unwrap().to_str().unwrap().to_owned() + ".temp";
-        let outfilename = filename.parent().unwrap().join(outfilename);
-        // create a temp file in read-write mode
-        let outfile = OpenOptions::new()
+    /// Mirrors the source path's structure inside `temp_dir` and opens the
+    /// staging file in read+write mode. Absolute paths under the CWD are made
+    /// relative first so the temp tree stays shallow; root and `..` components
+    /// are sanitized so the output path can never escape `temp_dir`.
+    fn create_outfile(source: impl AsRef<Path>, temp_dir: &Path) -> io::Result<(PathBuf, File)> {
+        use std::path::Component;
+
+        let source = source.as_ref();
+        let cwd = std::env::current_dir().ok();
+        let relative = cwd
+            .as_deref()
+            .and_then(|cwd| source.strip_prefix(cwd).ok())
+            .unwrap_or(source);
+
+        let mut staged = temp_dir.to_path_buf();
+        for comp in relative.components() {
+            match comp {
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => staged.push("__up__"),
+                Component::Normal(s) => staged.push(s),
+            }
+        }
+        if let Some(parent) = staged.parent() {
+            fs_err::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .read(true)
-            .open(&outfilename)?;
-        Ok((outfilename, outfile))
+            .open(&staged)?;
+        Ok((staged, file))
     }
 
     fn override_with_outfile(
@@ -1384,12 +1448,18 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
             }
         }
 
-        let metadata = fs_err::symlink_metadata(filename)?;
-        if metadata.is_symlink() {
+        let replace_via_copy = || -> io::Result<()> {
             fs_err::copy(outfilename, filename)?;
             fs_err::remove_file(outfilename)?;
-        } else {
-            fs_err::rename(outfilename, filename)?;
+            Ok(())
+        };
+
+        // For symlinks, copy through the link instead of replacing it.
+        // For regular files, prefer atomic rename; fall back to copy when the
+        // staged file lives on a different filesystem (e.g. /tmp on tmpfs).
+        let is_symlink = fs_err::symlink_metadata(filename)?.is_symlink();
+        if is_symlink || fs_err::rename(outfilename, filename).is_err() {
+            replace_via_copy()?;
         }
 
         Ok(())
@@ -1401,7 +1471,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
         outfile: File,
         halt: bool,
     }
-    let (outfilename, outfile) = create_outfile(filename)?;
+    let (outfilename, outfile) = create_outfile(filename, temp_dir)?;
     let mut stack = vec![Item {
         filename: filename.to_string_lossy().to_string(),
         outfilename,
@@ -1419,7 +1489,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
 
         match &record {
             Record::Injected(Injected::BeginInclude(filename)) => {
-                let (outfilename, outfile) = create_outfile(filename)?;
+                let (outfilename, outfile) = create_outfile(filename, temp_dir)?;
                 stack.push(Item {
                     filename: filename.clone(),
                     outfilename,
