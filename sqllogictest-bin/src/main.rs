@@ -955,8 +955,7 @@ async fn update_test_files(
     keep_db_on_failure: bool,
     labels: Vec<String>,
 ) -> Result<()> {
-    let temp_dir =
-        TempDirGuard::new().context("failed to create temp directory for overrides")?;
+    let temp_dir = TempDirGuard::new().context("failed to create temp directory for overrides")?;
 
     eprintln!("staging override output in {}", temp_dir.path().display());
 
@@ -1004,14 +1003,9 @@ async fn update_test_files(
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
-                if let Err(e) = update_test_file(
-                    &mut buffer,
-                    &mut runner,
-                    &file,
-                    update_mode,
-                    temp_dir_path,
-                )
-                .await
+                if let Err(e) =
+                    update_test_file(&mut buffer, &mut runner, &file, update_mode, temp_dir_path)
+                        .await
                 {
                     writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
                         .expect("cannot write to buffer");
