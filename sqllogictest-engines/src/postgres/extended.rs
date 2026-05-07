@@ -273,7 +273,11 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
     if let Some(t) = ty {
         match t {
             Type::BOOL if bytes.len() == 1 => {
-                return Some(if bytes[0] != 0 { "t".into() } else { "f".into() });
+                return Some(if bytes[0] != 0 {
+                    "t".into()
+                } else {
+                    "f".into()
+                });
             }
             Type::INT2 if bytes.len() == 2 => {
                 return Some(i16::from_be_bytes(bytes.try_into().ok()?).to_string());
@@ -312,8 +316,7 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(format_naive_timestamp(dt));
             }
             Type::TIMESTAMPTZ => {
-                let dt = DateTime::<chrono::Utc>::from_sql(&Type::TIMESTAMPTZ, bytes)
-                    .ok()?;
+                let dt = DateTime::<chrono::Utc>::from_sql(&Type::TIMESTAMPTZ, bytes).ok()?;
                 return Some(format_naive_timestamp(dt.naive_utc()) + "+00");
             }
             Type::DATE => {
@@ -389,9 +392,9 @@ fn format_naive_time(t: NaiveTime) -> String {
 // `\` becomes `\\` (each special char is doubled).
 fn append_composite_field(out: &mut String, field: &str) {
     let needs_quote = field.is_empty()
-        || field.chars().any(|c| {
-            matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace()
-        });
+        || field
+            .chars()
+            .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace());
     if needs_quote {
         out.push('"');
         for c in field.chars() {
@@ -519,12 +522,7 @@ fn parse_array_binary(raw: &[u8]) -> Option<String> {
     Some(out)
 }
 
-fn render_array_dim(
-    out: &mut String,
-    elems: &[Option<String>],
-    dims: &[usize],
-    idx: &mut usize,
-) {
+fn render_array_dim(out: &mut String, elems: &[Option<String>], dims: &[usize], idx: &mut usize) {
     out.push('{');
     if dims.len() == 1 {
         for i in 0..dims[0] {
