@@ -353,10 +353,15 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
             _ => {}
         }
     }
-    // Unknown OID (custom composite, enum, etc.): fall back to raw UTF-8
-    // (covers enums sent as label bytes). Don't speculatively try array/
-    // record binary parsers -- they're loose enough to match interval/
-    // numeric/uuid bytes by accident.
+    // Unknown OID -- most commonly a user-defined composite (CREATE TYPE foo
+    // AS (...)) whose pg_type OID is a server-assigned value tokio-postgres
+    // doesn't know about. We've already handled the primitives that share
+    // ambiguous wire shapes above, so it's safe to try the record parser
+    // first; if the bytes don't look like a record (e.g. enum label) the
+    // parser rejects them and we fall back to UTF-8.
+    if let Some(rendered) = parse_record_binary(bytes) {
+        return Some(rendered);
+    }
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }
 
