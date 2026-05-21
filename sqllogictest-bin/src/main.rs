@@ -160,6 +160,12 @@ struct Opt {
     /// Skip tests that matches the given regex.
     #[clap(long)]
     skip: Option<String>,
+
+    /// Print a `+ Discovered Test: <name>` line for each test file before
+    /// running. Off by default; enable for debugging which files were picked
+    /// up by the glob.
+    #[clap(long, default_value = "false", env = "SLT_SHOW_DISCOVERED_TESTS")]
+    show_discovered_tests: bool,
 }
 
 /// Connection configuration.
@@ -277,6 +283,7 @@ pub async fn main() -> Result<()> {
         partition_id,
         shutdown_timeout_secs,
         skip,
+        show_discovered_tests,
     } = Opt::from_arg_matches(&matches)
         .map_err(|err| err.exit())
         .unwrap();
@@ -401,6 +408,7 @@ pub async fn main() -> Result<()> {
             jobs,
             keep_db_on_failure,
             labels,
+            show_discovered_tests,
         )
         .await;
     }
@@ -430,6 +438,7 @@ pub async fn main() -> Result<()> {
         junit: junit.clone(),
         fail_fast,
         show_all_errors,
+        show_discovered_tests,
         cancel,
         shutdown_timeout: shutdown_timeout_secs.map(Duration::from_secs),
     };
@@ -463,6 +472,7 @@ struct RunConfig {
     junit: Option<String>,
     fail_fast: bool,
     show_all_errors: bool,
+    show_discovered_tests: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
 }
@@ -484,7 +494,10 @@ fn test_db_name(test_case_name: String) -> String {
     format!("{test_case_prefix}_{random_id}")
 }
 
-fn test_db_names(files: Vec<PathBuf>) -> Result<Vec<(String, PathBuf)>> {
+fn test_db_names(
+    files: Vec<PathBuf>,
+    show_discovered_tests: bool,
+) -> Result<Vec<(String, PathBuf)>> {
     let mut test_databases = Vec::new();
     let mut test_cases = HashSet::new();
     for file in files {
@@ -493,7 +506,9 @@ fn test_db_names(files: Vec<PathBuf>) -> Result<Vec<(String, PathBuf)>> {
             .ok_or_else(|| anyhow!("not a UTF-8 filename"))?;
         let test_case_name = filename.to_test_case_name();
 
-        eprintln!("+ Discovered Test: {test_case_name}");
+        if show_discovered_tests {
+            eprintln!("+ Discovered Test: {test_case_name}");
+        }
         if !test_cases.insert(test_case_name.clone()) {
             return Err(anyhow!("duplicated test case found: {}", test_case_name));
         }
@@ -532,11 +547,12 @@ async fn run_parallel(
         junit,
         fail_fast,
         show_all_errors,
+        show_discovered_tests,
         cancel,
         shutdown_timeout,
     }: RunConfig,
 ) -> Result<()> {
-    let test_databases = test_db_names(files)?;
+    let test_databases = test_db_names(files, show_discovered_tests)?;
     let total_tests = test_databases.len();
 
     let (job_tx, job_rx) = mpsc::channel::<TestJob>(jobs);
@@ -856,6 +872,7 @@ async fn run_serial(
         junit,
         fail_fast,
         show_all_errors,
+        show_discovered_tests: _,
         cancel,
         shutdown_timeout,
     }: RunConfig,
@@ -954,6 +971,7 @@ async fn update_test_files(
     jobs: Option<usize>,
     keep_db_on_failure: bool,
     labels: Vec<String>,
+    show_discovered_tests: bool,
 ) -> Result<()> {
     let temp_dir = TempDirGuard::new().context("failed to create temp directory for overrides")?;
 
@@ -961,7 +979,7 @@ async fn update_test_files(
 
     let mut db = engines::connect(engine, &config, SslMode::Disable, DBPort::Plain).await?;
     let test_databases = if jobs.is_some() {
-        test_db_names(files)?
+        test_db_names(files, show_discovered_tests)?
     } else {
         files
             .iter()
