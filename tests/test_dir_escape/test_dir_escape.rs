@@ -27,7 +27,10 @@ impl sqllogictest::DB for FakeDB {
 
 #[test]
 fn test() {
-    let mut tester = sqllogictest::Runner::new(|_ssl_mode, _port| async { Ok(FakeDB) });
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
 
     tester
         .run_file_test("./test_dir_escape/test_dir_escape.slt")
