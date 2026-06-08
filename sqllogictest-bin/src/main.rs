@@ -1011,6 +1011,7 @@ impl Drop for TempDirGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_test_files(
     files: Vec<PathBuf>,
     engine: &EngineConfig,

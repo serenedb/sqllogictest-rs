@@ -158,12 +158,21 @@ impl<P: sealed::Protocol> Postgres<P> {
     /// Gracefully shuts down the Postgres connection.
     pub async fn shutdown(&mut self) {
         if let Some(ActiveConn { client, handle }) = self.conn.take() {
-            if let Err(e) = client
-                .cancel_token()
-                .cancel_query(tokio_postgres::NoTls)
-                .await
-            {
-                log::warn!("Failed to cancel query during shutdown: {:?}", e);
+            if handle.is_finished() {
+                drop(client);
+                handle.await.ok();
+                return;
+            }
+            let token = client.cancel_token();
+            let cancel = token.cancel_query(tokio_postgres::NoTls);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), cancel).await {
+                Ok(Err(e)) => {
+                    log::warn!("Failed to cancel query during shutdown: {:?}", e);
+                }
+                Err(_) => {
+                    log::warn!("Timed out cancelling query during shutdown");
+                }
+                Ok(Ok(())) => {}
             }
             drop(client);
             handle.await.ok();
@@ -176,5 +185,65 @@ impl<P: sealed::Protocol> Drop for Postgres<P> {
         if let Some(ActiveConn { handle, .. }) = &self.conn {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_postgres::config::SslMode;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_skips_cancel_after_connection_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = stream.unwrap();
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut len = [0u8; 4];
+                    s.read_exact(&mut len).unwrap();
+                    let mut rest = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+                    s.read_exact(&mut rest).unwrap();
+                    s.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).unwrap();
+                    s.write_all(&[b'Z', 0, 0, 0, 5, b'I']).unwrap();
+                    s.flush().unwrap();
+                }
+            }
+        });
+
+        let mut cfg = PostgresConfig::new();
+        cfg.host("127.0.0.1")
+            .port(port)
+            .user("postgres")
+            .dbname("postgres")
+            .ssl_mode(SslMode::Disable);
+        let mut pg = PostgresSimple::connect(cfg).await.expect("connect");
+
+        let mut finished = false;
+        for _ in 0..200 {
+            if pg.conn.as_ref().is_none_or(|c| c.handle.is_finished()) {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(finished, "connection task never observed the drop");
+
+        tokio::time::timeout(Duration::from_secs(5), pg.shutdown())
+            .await
+            .expect("shutdown stalled");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "shutdown reconnected to cancel a dead connection"
+        );
     }
 }
