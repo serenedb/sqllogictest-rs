@@ -212,8 +212,8 @@ mod shutdown_tests {
                     s.read_exact(&mut len).unwrap();
                     let mut rest = vec![0u8; u32::from_be_bytes(len) as usize - 4];
                     s.read_exact(&mut rest).unwrap();
-                    s.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).unwrap(); // AuthenticationOk
-                    s.write_all(&[b'Z', 0, 0, 0, 5, b'I']).unwrap(); // ReadyForQuery
+                    s.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).unwrap();
+                    s.write_all(&[b'Z', 0, 0, 0, 5, b'I']).unwrap();
                     s.flush().unwrap();
                 }
             }
@@ -229,7 +229,7 @@ mod shutdown_tests {
 
         let mut finished = false;
         for _ in 0..200 {
-            if pg.conn.as_ref().map_or(true, |c| c.handle.is_finished()) {
+            if pg.conn.as_ref().is_none_or(|c| c.handle.is_finished()) {
                 finished = true;
                 break;
             }
