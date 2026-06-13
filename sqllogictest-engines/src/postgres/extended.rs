@@ -184,6 +184,46 @@ impl fmt::Display for UuidValue {
     }
 }
 
+// BIT / BIT VARYING. tokio-postgres has no builtin FromSql for these without
+// the optional `bit-vec` feature, so decode the binary wire format directly:
+// a 4-byte big-endian bit length followed by ceil(len/8) bytes, MSB-first.
+// Rendered as a '0'/'1' string (e.g. BIT(3) '101' -> "101").
+#[derive(Debug)]
+struct BitValue(String);
+
+impl<'a> FromSql<'a> for BitValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err("bit value: missing length header".into());
+        }
+        let bit_len = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        let bytes = &raw[4..];
+        let n_bytes = (bit_len + 7) / 8;
+        if bytes.len() < n_bytes {
+            return Err("bit value: truncated payload".into());
+        }
+        let padding = n_bytes * 8 - bit_len;
+        let mut s = String::with_capacity(bit_len);
+        for i in 0..bit_len {
+            let pos = padding + i;
+            let bit = (bytes[pos / 8] >> (7 - (pos % 8))) & 1;
+            s.push(if bit == 1 { '1' } else { '0' });
+        }
+        Ok(BitValue(s))
+    }
+
+    accepts!(BIT, VARBIT);
+}
+
+impl fmt::Display for BitValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // Composite/record values. The server may send composite either as text
 // (`(f1,f2,...)`) when negotiated, or as PG's binary record format when the
 // client (tokio-postgres by default) requests binary. We handle both: try
@@ -1016,6 +1056,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     ) =>
                     {
                         array_process!(row, row_vec, idx, RecordValue);
+                    }
+                    Type::BIT | Type::VARBIT => {
+                        single_process!(row, row_vec, idx, BitValue);
+                    }
+                    Type::BIT_ARRAY | Type::VARBIT_ARRAY => {
+                        array_process!(row, row_vec, idx, BitValue);
                     }
                     _ => {
                         todo!("Don't support {} type now.", column.type_().name())
