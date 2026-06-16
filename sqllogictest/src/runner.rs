@@ -671,9 +671,20 @@ pub(crate) struct RunnerLocals {
 
 impl RunnerLocals {
     pub fn test_dir(&self) -> String {
-        let test_dir = self
-            .test_dir
-            .get_or_init(|| TempDir::new().expect("failed to create testdir"));
+        let test_dir = self.test_dir.get_or_init(|| {
+            let dir = TempDir::new().expect("failed to create testdir");
+            // When the runner and the database server run in separate containers,
+            // server-side ops (COPY TO/FROM, ATTACH) write into __TEST_DIR__ as a
+            // different uid. SLT_TEST_DIR_SHARED relaxes the dir to 0777 so any uid
+            // sharing the mount can use it; TempDir's default 0700 would deny them.
+            #[cfg(unix)]
+            if std::env::var_os("SLT_TEST_DIR_SHARED").is_some() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+                    .expect("failed to relax testdir permissions");
+            }
+            dir
+        });
         test_dir.path().to_string_lossy().into_owned()
     }
 
