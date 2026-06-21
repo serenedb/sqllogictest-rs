@@ -38,7 +38,14 @@ fn now_string() -> String {
 impl Substitution<'_> {
     pub fn substitute(&self, input: &str) -> Result<String, SubstError> {
         if self.subst_env_vars {
-            subst::substitute(input, self).map_err(SubstError)
+            // `subst` treats `\` as an escape character and rejects sequences
+            // like `\t` ("Invalid escape sequence"). But the input is SQL, where
+            // a backslash is just a backslash (e.g. `e'a\tb'`, `'\\'`), never a
+            // substitution escape. Pre-double every backslash so `subst` passes
+            // it through verbatim while still expanding `$VAR` / `${VAR}` /
+            // `${VAR:-default}`.
+            let escaped = input.replace('\\', "\\\\");
+            subst::substitute(&escaped, self).map_err(SubstError)
         } else {
             Ok(self.simple_replace(input))
         }
