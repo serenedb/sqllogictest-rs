@@ -205,11 +205,9 @@ impl<'a> FromSql<'a> for BitValue {
         if bytes.len() < n_bytes {
             return Err("bit value: truncated payload".into());
         }
-        let padding = n_bytes * 8 - bit_len;
         let mut s = String::with_capacity(bit_len);
         for i in 0..bit_len {
-            let pos = padding + i;
-            let bit = (bytes[pos / 8] >> (7 - (pos % 8))) & 1;
+            let bit = (bytes[i / 8] >> (7 - (i % 8))) & 1;
             s.push(if bit == 1 { '1' } else { '0' });
         }
         Ok(BitValue(s))
