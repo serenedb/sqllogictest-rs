@@ -35,16 +35,39 @@ fn now_string() -> String {
         .to_string()
 }
 
+/// Prefix every `$` that does NOT begin a `subst` variable reference (`${` or
+/// `$letter`/`$_`) with a backslash, so `subst` keeps it literal instead of
+/// rejecting it. Runs after backslashes have already been doubled, so the
+/// backslash inserted here is the single one `subst` consumes as `\$` -> `$`.
+fn escape_bare_dollars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$'
+            && !matches!(chars.peek(), Some(&('{' | 'a'..='z' | 'A'..='Z' | '_')))
+        {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl Substitution<'_> {
     pub fn substitute(&self, input: &str) -> Result<String, SubstError> {
         if self.subst_env_vars {
-            // `subst` treats `\` as an escape character and rejects sequences
-            // like `\t` ("Invalid escape sequence"). But the input is SQL, where
-            // a backslash is just a backslash (e.g. `e'a\tb'`, `'\\'`), never a
-            // substitution escape. Pre-double every backslash so `subst` passes
-            // it through verbatim while still expanding `$VAR` / `${VAR}` /
-            // `${VAR:-default}`.
+            // The input is SQL, where `\` is just a backslash (`e'a\tb'`, `'\\'`)
+            // and a `$` is only a variable when it starts a reference. `subst`
+            // disagrees on both: it treats `\` as an escape (rejecting `\t` as an
+            // invalid sequence) and a lone `$` as a malformed variable ("Missing
+            // variable name", e.g. a regex end-anchor `[a-z]+$`). Pre-process so
+            // `subst` still expands `$VAR` / `${VAR}` / `${VAR:-default}` but
+            // passes everything else through verbatim:
+            //   * double every backslash, so each survives subst's un-escaping;
+            //   * escape (with subst's `\$`) every `$` that does NOT begin a
+            //     reference (`${` or `$letter`/`$_`), so it stays literal.
             let escaped = input.replace('\\', "\\\\");
+            let escaped = escape_bare_dollars(&escaped);
             subst::substitute(&escaped, self).map_err(SubstError)
         } else {
             Ok(self.simple_replace(input))
