@@ -222,6 +222,83 @@ impl fmt::Display for BitValue {
     }
 }
 
+// TIMESTAMP can be ±infinity (i64::MAX / i64::MIN microseconds since 2000-01-01),
+// which chrono's NaiveDateTime can't represent. Decode the sentinels explicitly
+// and fall back to NaiveDateTime for finite values.
+#[derive(Debug)]
+struct TimestampValue(String);
+
+impl<'a> FromSql<'a> for TimestampValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() == 8 {
+            let micros = i64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]);
+            if micros == i64::MAX {
+                return Ok(TimestampValue("infinity".into()));
+            }
+            if micros == i64::MIN {
+                return Ok(TimestampValue("-infinity".into()));
+            }
+        }
+        Ok(TimestampValue(NaiveDateTime::from_sql(ty, raw)?.to_string()))
+    }
+
+    accepts!(TIMESTAMP);
+}
+
+impl fmt::Display for TimestampValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// TIME WITH TIME ZONE: 12-byte binary (i64 microseconds-of-day + i32 zone in
+// seconds west of UTC). postgres-types has no FromSql for timetz, so decode it
+// by hand and render as serened does, e.g. "11:30:00.123456+00:00".
+#[derive(Debug)]
+struct TimeTzValue(String);
+
+impl<'a> FromSql<'a> for TimeTzValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 12 {
+            return Err("timetz value: expected 12 bytes".into());
+        }
+        let micros = i64::from_be_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]);
+        let zone = i32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        let secs = (micros / 1_000_000) as u32;
+        let nanos = ((micros % 1_000_000) * 1_000) as u32;
+        let time = NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+            .ok_or("timetz value: time out of range")?;
+        let off = -zone; // UTC offset (east-positive)
+        let sign = if off < 0 { '-' } else { '+' };
+        let off = off.abs();
+        Ok(TimeTzValue(format!(
+            "{}{}{:02}:{:02}",
+            time,
+            sign,
+            off / 3600,
+            (off % 3600) / 60
+        )))
+    }
+
+    accepts!(TIMETZ);
+}
+
+impl fmt::Display for TimeTzValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // INET / CIDR. tokio-postgres only decodes these with the optional
 // `with-ipnetwork`/`with-cidr` features, so decode PG's binary wire format
 // directly. The layout (see PG `network_send`) is:
@@ -997,11 +1074,17 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::TIME_ARRAY => {
                         array_process!(row, row_vec, idx, NaiveTime);
                     }
+                    Type::TIMETZ => {
+                        single_process!(row, row_vec, idx, TimeTzValue);
+                    }
+                    Type::TIMETZ_ARRAY => {
+                        array_process!(row, row_vec, idx, TimeTzValue);
+                    }
                     Type::TIMESTAMP => {
-                        single_process!(row, row_vec, idx, NaiveDateTime);
+                        single_process!(row, row_vec, idx, TimestampValue);
                     }
                     Type::TIMESTAMP_ARRAY => {
-                        array_process!(row, row_vec, idx, NaiveDateTime);
+                        array_process!(row, row_vec, idx, TimestampValue);
                     }
                     Type::BOOL => {
                         single_process!(row, row_vec, idx, bool, bool_to_str);
