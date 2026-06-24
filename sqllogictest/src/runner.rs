@@ -670,8 +670,8 @@ pub(crate) struct RunnerLocals {
 }
 
 impl RunnerLocals {
-    pub fn test_dir(&self) -> String {
-        let test_dir = self.test_dir.get_or_init(|| {
+    fn test_dir_handle(&self) -> &TempDir {
+        self.test_dir.get_or_init(|| {
             let dir = TempDir::new().expect("failed to create testdir");
             // When the runner and the database server run in separate containers,
             // server-side ops (COPY TO/FROM, ATTACH) write into __TEST_DIR__ as a
@@ -684,8 +684,30 @@ impl RunnerLocals {
                     .expect("failed to relax testdir permissions");
             }
             dir
-        });
-        test_dir.path().to_string_lossy().into_owned()
+        })
+    }
+
+    pub fn test_dir(&self) -> String {
+        self.test_dir_handle().path().to_string_lossy().into_owned()
+    }
+
+    /// A short alphanumeric token unique to this runner instance (derived from the
+    /// random temp-dir name), stable for the whole run. DuckDB derives an attached
+    /// database's name from the file basename only, ignoring the directory, so the
+    /// same test re-run against a shared server (e.g. once per engine) would reuse
+    /// the basename and collide ("database already exists"). Embedding `__RUN_ID__`
+    /// in the file name makes the derived name unique per run.
+    pub fn run_id(&self) -> String {
+        self.test_dir_handle()
+            .path()
+            .file_name()
+            .map(|name| {
+                name.to_string_lossy()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn set_var(&mut self, key: String, value: String) {
