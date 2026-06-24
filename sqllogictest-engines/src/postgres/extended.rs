@@ -201,7 +201,7 @@ impl<'a> FromSql<'a> for BitValue {
         }
         let bit_len = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
         let bytes = &raw[4..];
-        let n_bytes = (bit_len + 7) / 8;
+        let n_bytes = bit_len.div_ceil(8);
         if bytes.len() < n_bytes {
             return Err("bit value: truncated payload".into());
         }
@@ -217,6 +217,63 @@ impl<'a> FromSql<'a> for BitValue {
 }
 
 impl fmt::Display for BitValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// INET / CIDR. tokio-postgres only decodes these with the optional
+// `with-ipnetwork`/`with-cidr` features, so decode PG's binary wire format
+// directly. The layout (see PG `network_send`) is:
+//   u8 family   (2 = IPv4, 3 = IPv6; PGSQL_AF_INET / PGSQL_AF_INET6)
+//   u8 bits     (netmask length)
+//   u8 is_cidr  (1 for cidr, 0 for inet)
+//   u8 nb       (address byte count: 4 for IPv4, 16 for IPv6)
+//   nb bytes    (address, network byte order)
+// Rendered via std::net for canonical text, with the `/bits` suffix omitted
+// for a full host mask on `inet` (matching PG's text output), always kept for
+// `cidr`.
+#[derive(Debug)]
+struct InetValue(String);
+
+impl<'a> FromSql<'a> for InetValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err("inet value: missing header".into());
+        }
+        let bits = raw[1];
+        let is_cidr = raw[2] != 0;
+        let nb = raw[3] as usize;
+        let addr = &raw[4..];
+        if addr.len() < nb {
+            return Err("inet value: truncated address".into());
+        }
+        let (ip, full_bits): (std::net::IpAddr, u8) = match nb {
+            4 => {
+                let octets: [u8; 4] = addr[..4].try_into()?;
+                (std::net::Ipv4Addr::from(octets).into(), 32)
+            }
+            16 => {
+                let octets: [u8; 16] = addr[..16].try_into()?;
+                (std::net::Ipv6Addr::from(octets).into(), 128)
+            }
+            other => return Err(format!("inet value: unexpected address size {other}").into()),
+        };
+        let rendered = if is_cidr || bits != full_bits {
+            format!("{ip}/{bits}")
+        } else {
+            ip.to_string()
+        };
+        Ok(InetValue(rendered))
+    }
+
+    accepts!(INET, CIDR);
+}
+
+impl fmt::Display for InetValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -379,6 +436,9 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                     let _ = write!(s, "{:02x}", b);
                 }
                 return Some(s);
+            }
+            Type::INET | Type::CIDR => {
+                return InetValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::RECORD => {
                 return parse_record_binary(bytes);
@@ -1061,6 +1121,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::BIT_ARRAY | Type::VARBIT_ARRAY => {
                         array_process!(row, row_vec, idx, BitValue);
                     }
+                    Type::INET | Type::CIDR => {
+                        single_process!(row, row_vec, idx, InetValue);
+                    }
+                    Type::INET_ARRAY | Type::CIDR_ARRAY => {
+                        array_process!(row, row_vec, idx, InetValue);
+                    }
                     _ => {
                         todo!("Don't support {} type now.", column.type_().name())
                     }
@@ -1108,5 +1174,57 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
 
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         err.code().map(|s| s.code().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod inet_tests {
+    use super::*;
+
+    fn decode(raw: &[u8]) -> String {
+        InetValue::from_sql(&Type::INET, raw).unwrap().0
+    }
+
+    #[test]
+    fn ipv4_with_mask() {
+        // family=2, bits=24, is_cidr=0, nb=4, 192.168.0.1
+        assert_eq!(decode(&[2, 24, 0, 4, 192, 168, 0, 1]), "192.168.0.1/24");
+    }
+
+    #[test]
+    fn ipv4_full_mask_omitted() {
+        // bits=32 (host mask) on inet -> no /32 suffix
+        assert_eq!(decode(&[2, 32, 0, 4, 10, 0, 0, 1]), "10.0.0.1");
+    }
+
+    #[test]
+    fn ipv6_full_mask_omitted() {
+        let mut raw = vec![3, 128, 0, 16];
+        raw.extend_from_slice(&[0; 15]);
+        raw.push(1); // ::1
+        assert_eq!(decode(&raw), "::1");
+    }
+
+    #[test]
+    fn ipv6_with_mask_canonical_compression() {
+        // 2001:db8::1/64
+        let mut raw = vec![3, 64, 0, 16];
+        raw.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        raw.extend_from_slice(&[0; 11]);
+        raw.push(1);
+        assert_eq!(decode(&raw), "2001:db8::1/64");
+    }
+
+    #[test]
+    fn cidr_keeps_full_mask() {
+        // is_cidr=1 -> always show /bits, even a full host mask
+        assert_eq!(decode(&[2, 32, 1, 4, 10, 0, 0, 1]), "10.0.0.1/32");
+        assert_eq!(decode(&[2, 24, 1, 4, 192, 168, 0, 0]), "192.168.0.0/24");
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        assert!(InetValue::from_sql(&Type::INET, &[2, 24, 0]).is_err());
+        assert!(InetValue::from_sql(&Type::INET, &[2, 24, 0, 4, 192, 168]).is_err());
     }
 }
