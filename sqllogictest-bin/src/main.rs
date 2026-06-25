@@ -508,17 +508,48 @@ fn test_db_name(test_case_name: String) -> String {
     format!("{test_case_prefix}_{random_id}")
 }
 
+/// Length of the directory prefix shared by every name, trimmed back to the
+/// last `/` so a path component is never split (`a/b/c1/d` and `a/b/c2/d` share
+/// `a/b/`, not `a/b/c`). Stripping it keeps the part of the path that actually
+/// distinguishes a test, which matters because `test_db_name` truncates the
+/// suffix to fit the 63-char limit -- a long shared prefix would otherwise
+/// crowd the distinctive part out.
+fn common_dir_prefix_len(names: &[&str]) -> usize {
+    let Some(first) = names.first() else {
+        return 0;
+    };
+    let first = first.as_bytes();
+    let mut lcp = first.len();
+    for n in &names[1..] {
+        let b = n.as_bytes();
+        let mut i = 0;
+        while i < lcp && i < b.len() && b[i] == first[i] {
+            i += 1;
+        }
+        lcp = i;
+    }
+    // `/` is ASCII, so this is always a valid UTF-8 boundary.
+    first[..lcp]
+        .iter()
+        .rposition(|&c| c == b'/')
+        .map_or(0, |p| p + 1)
+}
+
 fn test_db_names(
     files: Vec<PathBuf>,
     show_discovered_tests: bool,
 ) -> Result<Vec<(String, PathBuf)>> {
-    let mut test_databases = Vec::new();
+    let filenames = files
+        .iter()
+        .map(|f| f.to_str().ok_or_else(|| anyhow!("not a UTF-8 filename")))
+        .collect::<Result<Vec<_>>>()?;
+    let prefix_len = common_dir_prefix_len(&filenames);
+
+    let mut test_databases = Vec::with_capacity(files.len());
     let mut test_cases = HashSet::new();
-    for file in files {
-        let filename = file
-            .to_str()
-            .ok_or_else(|| anyhow!("not a UTF-8 filename"))?;
-        let test_case_name = filename.to_test_case_name();
+    for (file, filename) in files.iter().zip(filenames) {
+        let stripped: &str = &filename[prefix_len..];
+        let test_case_name = stripped.to_test_case_name();
 
         if show_discovered_tests {
             eprintln!("+ Discovered Test: {test_case_name}");
@@ -528,7 +559,7 @@ fn test_db_names(
         }
 
         let db_name = test_db_name(test_case_name);
-        test_databases.push((db_name, file));
+        test_databases.push((db_name, file.clone()));
     }
     Ok(test_databases)
 }
