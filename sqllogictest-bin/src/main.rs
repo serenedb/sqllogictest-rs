@@ -850,12 +850,21 @@ async fn drop_task(
 ) -> Result<()> {
     const MAX_RETRIES: usize = 1;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
-    // Recovery tests intentionally crash the server (crash_on_packet). The
-    // dropper's startup connect runs concurrently with the test and can be in
+    // Recovery tests intentionally crash the server (crash_on_packet), and the
+    // dropper's startup connect runs concurrently with the test -- it can be in
     // flight when that crash kills the server, surfacing as a one-off
-    // "connection closed" -- the one un-retried step on this task, so it would
-    // fail the whole run even though the DROP below is already retried. Retry
-    // the connect across the crash/restart window instead of propagating.
+    // "connection closed". That's the only un-retried step on this task, so
+    // without a retry it fails the whole run even though the DROP below already
+    // retries.
+    //
+    // CONNECT_RETRIES is deliberately much larger than MAX_RETRIES because the
+    // two cover different situations. The DROP runs *after* the test, when the
+    // server is already back up -- its only failure mode is a stale connection,
+    // so a single reconnect to the live server suffices (MAX_RETRIES = 1). This
+    // connect can instead land *during* the crash/restart window, when the
+    // server is genuinely down, so it must keep trying long enough to outlast a
+    // full restart -- many more attempts than reconnecting to an already-up
+    // server.
     const CONNECT_RETRIES: usize = 10;
     let mut connect_attempts = 0;
     let mut db = loop {
