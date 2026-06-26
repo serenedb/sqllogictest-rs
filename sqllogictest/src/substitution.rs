@@ -44,9 +44,7 @@ fn escape_bare_dollars(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '$'
-            && !matches!(chars.peek(), Some(&('{' | 'a'..='z' | 'A'..='Z' | '_')))
-        {
+        if c == '$' && !matches!(chars.peek(), Some(&('{' | 'a'..='z' | 'A'..='Z' | '_'))) {
             out.push('\\');
         }
         out.push(c);

@@ -853,7 +853,7 @@ async fn drop_task(
     // Recovery tests intentionally crash the server, and the
     // dropper's startup connect runs concurrently with the test -- it can be in
     // flight when that crash kills the server, surfacing as a one-off
-    // "connection closed". 
+    // "connection closed".
     // CONNECT_RETRIES is deliberately much larger than MAX_RETRIES because the
     // two cover different situations. The DROP runs *after* the test, when the
     // server is already back up. This
