@@ -850,7 +850,31 @@ async fn drop_task(
 ) -> Result<()> {
     const MAX_RETRIES: usize = 1;
     const RETRY_DELAY: Duration = Duration::from_secs(1);
-    let mut db = engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain).await?;
+    // Recovery tests intentionally crash the server, and the
+    // dropper's startup connect runs concurrently with the test -- it can be in
+    // flight when that crash kills the server, surfacing as a one-off
+    // "connection closed".
+    // CONNECT_RETRIES is deliberately much larger than MAX_RETRIES because the
+    // two cover different situations. The DROP runs *after* the test, when the
+    // server is already back up. This
+    // connect can instead land *during* the crash/restart window, when the
+    // server is genuinely down, so it must keep trying long enough to outlast a
+    // full restart -- many more attempts than reconnecting to an already-up
+    // server.
+    const CONNECT_RETRIES: usize = 10;
+    let mut connect_attempts = 0;
+    let mut db = loop {
+        match engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain).await {
+            Ok(conn) => break conn,
+            Err(e) => {
+                connect_attempts += 1;
+                if connect_attempts > CONNECT_RETRIES {
+                    return Err(e.into());
+                }
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
 
     while let Some(message) = drop_rx.recv().await {
         match message {

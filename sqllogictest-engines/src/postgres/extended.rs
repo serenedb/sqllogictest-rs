@@ -244,7 +244,9 @@ impl<'a> FromSql<'a> for TimestampValue {
                 return Ok(TimestampValue("-infinity".into()));
             }
         }
-        Ok(TimestampValue(NaiveDateTime::from_sql(ty, raw)?.to_string()))
+        Ok(TimestampValue(
+            NaiveDateTime::from_sql(ty, raw)?.to_string(),
+        ))
     }
 
     accepts!(TIMESTAMP);
