@@ -1118,6 +1118,16 @@ impl<D: AsyncDB> ConnectionTask<D> {
                         }
                     }
                 }
+                Record::Let { conditions, .. } => {
+                    if should_skip(&self.context.vars.labels, "", &conditions) {
+                        RecordOutput::Nothing
+                    } else {
+                        RecordOutput::Let {
+                            values: vec![],
+                            error: Some(LetError::Fail(err)),
+                        }
+                    }
+                }
                 _ => RecordOutput::Nothing,
             };
         }
@@ -1789,9 +1799,9 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         record: Record<D::ColumnType>,
     ) -> RecordOutput<D::ColumnType> {
         let maybe_conn_name = match &record {
-            Record::Statement { connection, .. } | Record::Query { connection, .. } => {
-                Some(connection.clone())
-            }
+            Record::Statement { connection, .. }
+            | Record::Query { connection, .. }
+            | Record::Let { connection, .. } => Some(connection.clone()),
             _ => None,
         };
 
