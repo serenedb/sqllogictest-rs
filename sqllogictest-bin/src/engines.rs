@@ -64,6 +64,8 @@ fn make_connect_opts(
     config: &DBConfig,
     ssl_mode: SslMode,
     port_override: DBPort,
+    user_override: Option<&str>,
+    password_override: Option<&str>,
 ) -> PostgresConfig {
     let (host, port) = config.random_addr();
     let port = if port_override == DBPort::Ssl && config.ssl_port != 0 {
@@ -77,8 +79,14 @@ fn make_connect_opts(
         .host(host)
         .port(port)
         .dbname(&config.db)
-        .user(&config.user)
-        .password(&config.pass);
+        // A per-connection `user=` override (from a `connection ... user=role`
+        // record) lets a test authenticate as a second role; otherwise the
+        // runner's configured default user is used.
+        .user(user_override.unwrap_or(&config.user))
+        // A per-connection `password=` override lets a test authenticate (or
+        // deliberately fail) with a specific password; otherwise the runner's
+        // configured default password is used.
+        .password(password_override.unwrap_or(&config.pass));
     if let Some(options) = &config.options {
         pg_config.options(options);
     }
@@ -88,7 +96,7 @@ fn make_connect_opts(
 
 impl From<&DBConfig> for PostgresConfig {
     fn from(config: &DBConfig) -> Self {
-        make_connect_opts(config, SslMode::Disable, DBPort::Plain)
+        make_connect_opts(config, SslMode::Disable, DBPort::Plain, None, None)
     }
 }
 
@@ -97,7 +105,11 @@ pub(crate) async fn connect(
     config: &DBConfig,
     ssl_mode: SslMode,
     port: DBPort,
+    user: Option<String>,
+    password: Option<String>,
 ) -> Result<Engines, EnginesError> {
+    let user = user.as_deref();
+    let password = password.as_deref();
     Ok(match engine {
         EngineConfig::MySql => Engines::MySql(
             MySql::connect(config.into())
@@ -105,12 +117,12 @@ pub(crate) async fn connect(
                 .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::Postgres => Engines::Postgres(
-            PostgresSimple::connect(make_connect_opts(config, ssl_mode, port))
+            PostgresSimple::connect(make_connect_opts(config, ssl_mode, port, user, password))
                 .await
                 .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::PostgresExtended => Engines::PostgresExtended(
-            PostgresExtended::connect(make_connect_opts(config, ssl_mode, port))
+            PostgresExtended::connect(make_connect_opts(config, ssl_mode, port, user, password))
                 .await
                 .map_err(EnginesError::without_state)?,
         ),
@@ -120,8 +132,8 @@ pub(crate) async fn connect(
                 .replace("{db}", &config.db)
                 .replace("{host}", host)
                 .replace("{port}", &port.to_string())
-                .replace("{user}", &config.user)
-                .replace("{pass}", &config.pass);
+                .replace("{user}", user.unwrap_or(&config.user))
+                .replace("{pass}", password.unwrap_or(&config.pass));
             let mut cmd = Command::new("bash");
             cmd.args(["-c", &cmd_str]);
             Engines::External(

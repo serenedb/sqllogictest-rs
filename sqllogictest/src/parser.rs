@@ -461,6 +461,8 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     name,
                     ssl_mode,
                     port,
+                    user,
+                    password,
                 } = conn
                 {
                     write!(f, "connection {name}")?;
@@ -472,6 +474,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     // Only emit port when explicitly set.
                     if !matches!(port, DBPort::Plain) {
                         write!(f, " port={}", port.as_str())?;
+                    }
+                    if let Some(user) = user {
+                        write!(f, " user={user}")?;
+                    }
+                    if let Some(password) = password {
+                        write!(f, " password={password}")?;
                     }
                 }
                 Ok(())
@@ -931,24 +939,40 @@ pub enum Connection {
     /// The default connection if not specified or if the name is "default".
     #[default]
     Default,
-    /// A named connection with an optional SSL mode and port override.
+    /// A named connection with an optional SSL mode, port, and user override.
     Named {
         name: String,
         /// SSL mode for this connection. Defaults to [`SslMode::Disable`].
         ssl_mode: SslMode,
         /// Port to use
         port: DBPort,
+        /// Login user override (e.g. `user=alice`). `None` uses the runner's
+        /// configured default user. Lets a test run statements as a second
+        /// role, which is required to exercise authorization/RBAC.
+        user: Option<String>,
+        /// Login password override (e.g. `password=secret`). `None` uses the
+        /// runner's configured default password. Lets a test authenticate (or
+        /// deliberately fail to authenticate) with a specific password.
+        password: Option<String>,
     },
 }
 
 impl Connection {
-    fn new(name: impl AsRef<str>, ssl_mode: SslMode, port: DBPort) -> Self {
+    fn new(
+        name: impl AsRef<str>,
+        ssl_mode: SslMode,
+        port: DBPort,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Self {
         match name.as_ref() {
             "default" => Self::Default,
             name => Self::Named {
                 name: name.to_owned(),
                 ssl_mode,
                 port,
+                user,
+                password,
             },
         }
     }
@@ -1202,7 +1226,15 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let conn = Connection::new(name, ssl_mode, port);
+                let user = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("user="))
+                    .map(|val| val.to_owned());
+                let password = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("password="))
+                    .map(|val| val.to_owned());
+                let conn = Connection::new(name, ssl_mode, port, user, password);
                 connection = conn.clone();
                 records.push(Record::Connection(conn));
             }
