@@ -463,6 +463,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     port,
                     user,
                     password,
+                    database,
                 } = conn
                 {
                     write!(f, "connection {name}")?;
@@ -480,6 +481,9 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                     }
                     if let Some(password) = password {
                         write!(f, " password={password}")?;
+                    }
+                    if let Some(database) = database {
+                        write!(f, " database={database}")?;
                     }
                 }
                 Ok(())
@@ -954,6 +958,11 @@ pub enum Connection {
         /// runner's configured default password. Lets a test authenticate (or
         /// deliberately fail to authenticate) with a specific password.
         password: Option<String>,
+        /// Target database override (e.g. `database=other`). `None` uses the
+        /// runner's configured default database. Lets a test open a specific
+        /// database, which is required to exercise per-database privileges
+        /// (e.g. CONNECT).
+        database: Option<String>,
     },
 }
 
@@ -964,6 +973,7 @@ impl Connection {
         port: DBPort,
         user: Option<String>,
         password: Option<String>,
+        database: Option<String>,
     ) -> Self {
         match name.as_ref() {
             "default" => Self::Default,
@@ -973,6 +983,7 @@ impl Connection {
                 port,
                 user,
                 password,
+                database,
             },
         }
     }
@@ -1234,7 +1245,11 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     .iter()
                     .find_map(|token| token.strip_prefix("password="))
                     .map(|val| val.to_owned());
-                let conn = Connection::new(name, ssl_mode, port, user, password);
+                let database = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("database="))
+                    .map(|val| val.to_owned());
+                let conn = Connection::new(name, ssl_mode, port, user, password, database);
                 connection = conn.clone();
                 records.push(Record::Connection(conn));
             }
