@@ -761,7 +761,7 @@ async fn create_task(
     config: DBConfig,
     job_tx: mpsc::Sender<TestJob>,
 ) -> Result<()> {
-    let mut db = engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain, None).await?;
+    let mut db = engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain, None, None).await?;
 
     for (db_name, filename) in tests {
         let query = format!("CREATE DATABASE {db_name};");
@@ -864,7 +864,7 @@ async fn drop_task(
     const CONNECT_RETRIES: usize = 10;
     let mut connect_attempts = 0;
     let mut db = loop {
-        match engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain, None).await {
+        match engines::connect(&engine, &config, SslMode::Disable, DBPort::Plain, None, None).await {
             Ok(conn) => break conn,
             Err(e) => {
                 connect_attempts += 1;
@@ -938,7 +938,7 @@ async fn drop_database_with_retry(
                         attempt, max_retries
                     );
                     tokio::time::sleep(retry_delay).await;
-                    match engines::connect(engine, config, SslMode::Disable, DBPort::Plain, None).await {
+                    match engines::connect(engine, config, SslMode::Disable, DBPort::Plain, None, None).await {
                         Ok(new_db) => {
                             *db = new_db;
                             continue;
@@ -1081,7 +1081,7 @@ async fn update_test_files(
 
     eprintln!("staging override output in {}", temp_dir.path().display());
 
-    let mut db = engines::connect(engine, &config, SslMode::Disable, DBPort::Plain, None).await?;
+    let mut db = engines::connect(engine, &config, SslMode::Disable, DBPort::Plain, None, None).await?;
     let test_databases = if jobs.is_some() {
         test_db_names(files, show_discovered_tests)?
     } else {
@@ -1118,7 +1118,7 @@ async fn update_test_files(
             let labels = &labels;
             async move {
                 let mut runner =
-                    Runner::new(|ssl_mode, port, user| engines::connect(engine, &config, ssl_mode, port, user));
+                    Runner::new(|ssl_mode, port, user, password| engines::connect(engine, &config, ssl_mode, port, user, password));
                 for label in labels {
                     runner.add_label(label);
                 }
@@ -1296,7 +1296,7 @@ async fn connect_and_run_test_file(
     // Hold until the current test is finished or cancelled.
     let _running = RUNNING_TESTS.read().await;
     let mut runner =
-        Runner::new(|ssl_mode, port, user| engines::connect(engine, &config, ssl_mode, port, user));
+        Runner::new(|ssl_mode, port, user, password| engines::connect(engine, &config, ssl_mode, port, user, password));
     for label in labels {
         runner.add_label(label);
     }

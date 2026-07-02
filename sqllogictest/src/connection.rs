@@ -17,27 +17,38 @@ pub trait MakeConnection {
     type MakeFuture: Future<Output = Result<Self::Conn, <Self::Conn as AsyncDB>::Error>>;
 
     /// Creates a new connection to the database using the given [`SslMode`],
-    /// optional port override, and optional login-user override.
-    fn make(&mut self, ssl_mode: SslMode, port: DBPort, user: Option<String>)
-        -> Self::MakeFuture;
+    /// optional port override, and optional login-user / login-password
+    /// override.
+    fn make(
+        &mut self,
+        ssl_mode: SslMode,
+        port: DBPort,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Self::MakeFuture;
 }
 
 /// Make connections directly from a closure returning a future.
 ///
 /// The closure receives the [`SslMode`], optional port override, and optional
-/// login-user override so callers can configure TLS, routing, and the
-/// authenticating role per connection.
+/// login-user / login-password override so callers can configure TLS, routing,
+/// and the authenticating credentials per connection.
 impl<D: AsyncDB, F, Fut> MakeConnection for F
 where
-    F: FnMut(SslMode, DBPort, Option<String>) -> Fut,
+    F: FnMut(SslMode, DBPort, Option<String>, Option<String>) -> Fut,
     Fut: IntoFuture<Output = Result<D, D::Error>>,
 {
     type Conn = D;
     type MakeFuture = Fut::IntoFuture;
 
-    fn make(&mut self, ssl_mode: SslMode, port: DBPort, user: Option<String>)
-        -> Self::MakeFuture {
-        self(ssl_mode, port, user).into_future()
+    fn make(
+        &mut self,
+        ssl_mode: SslMode,
+        port: DBPort,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> Self::MakeFuture {
+        self(ssl_mode, port, user, password).into_future()
     }
 }
 
@@ -63,20 +74,27 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
     pub async fn get(&mut self, name: ConnectionName) -> Result<D, D::Error> {
         use std::collections::hash_map::Entry;
 
-        // Extract ssl_mode, port, and user before moving `name` into the entry API.
-        let (ssl_mode, port, user) = match &name {
+        // Extract ssl_mode, port, user, and password before moving `name` into
+        // the entry API.
+        let (ssl_mode, port, user, password) = match &name {
             ConnectionName::Named {
                 ssl_mode,
                 port,
                 user,
+                password,
                 ..
-            } => (ssl_mode.clone(), port.clone(), user.clone()),
-            ConnectionName::Default => (SslMode::Disable, DBPort::Plain, None),
+            } => (
+                ssl_mode.clone(),
+                port.clone(),
+                user.clone(),
+                password.clone(),
+            ),
+            ConnectionName::Default => (SslMode::Disable, DBPort::Plain, None, None),
         };
 
         let conn = match self.conns.entry(name) {
             Entry::Occupied(o) => o.remove(),
-            Entry::Vacant(_) => self.make_conn.make(ssl_mode, port, user).await?,
+            Entry::Vacant(_) => self.make_conn.make(ssl_mode, port, user, password).await?,
         };
 
         Ok(conn)
@@ -88,7 +106,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Connections<D, M> {
 
     pub async fn make_new(&mut self) -> Result<D, D::Error> {
         self.make_conn
-            .make(SslMode::Disable, DBPort::Plain, None)
+            .make(SslMode::Disable, DBPort::Plain, None, None)
             .await
     }
 
