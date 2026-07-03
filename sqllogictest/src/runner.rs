@@ -595,12 +595,22 @@ pub fn default_validator(
     const IGNORE_MARKER: &str = "<slt:ignore>";
     let contains_ignore_marker = expected.iter().any(|line| line.contains(IGNORE_MARKER));
 
-    // If ignore marker present, perform fragment-based matching on the full snapshot.
-    // The actual results might contain \n, and may not be a normal "row", which is not suitable
-    // to normalize.
+    // If ignore marker present, match row-by-row when the row counts line up so an
+    // ignored cell can't match a repeated fragment on an adjacent row; otherwise
+    // (an actual value contains \n, so it isn't a normal row) match the full snapshot.
     if contains_ignore_marker {
+        let actual_rows = actual
+            .iter()
+            .map(|strs| strs.iter().join("\t"))
+            .collect_vec();
+        if expected.len() == actual_rows.len() {
+            return expected
+                .iter()
+                .zip(actual_rows.iter())
+                .all(|(e, a)| match_with_ignore_marker(e, a));
+        }
         let expected_snapshot = expected.join("\n");
-        let actual_snapshot = actual.iter().map(|strs| strs.iter().join("\t")).join("\n");
+        let actual_snapshot = actual_rows.join("\n");
         return match_with_ignore_marker(&expected_snapshot, &actual_snapshot);
     }
 
@@ -2556,12 +2566,27 @@ pub fn update_record_with_output<T: ColumnType>(
                         results: expected_results,
                         ..
                     } if expected_results.iter().any(|l| contains_ignore_marker(l)) => {
-                        let expected_snapshot = expected_results.join("\n");
-                        let actual_snapshot =
-                            rows.iter().map(|cols| cols.join(col_separator)).join("\n");
-                        let aligned =
-                            align_with_ignore_marker_checked(&expected_snapshot, &actual_snapshot);
-                        aligned.split('\n').map(|s| s.to_string()).collect()
+                        let actual_rows = rows
+                            .iter()
+                            .map(|cols| cols.join(col_separator))
+                            .collect_vec();
+                        // Mirror default_validator: align each row independently when the
+                        // counts match, so an ignored cell can't absorb an adjacent row.
+                        if expected_results.len() == actual_rows.len() {
+                            expected_results
+                                .iter()
+                                .zip(actual_rows.iter())
+                                .map(|(e, a)| align_with_ignore_marker_checked(e, a))
+                                .collect()
+                        } else {
+                            let expected_snapshot = expected_results.join("\n");
+                            let actual_snapshot = actual_rows.join("\n");
+                            let aligned = align_with_ignore_marker_checked(
+                                &expected_snapshot,
+                                &actual_snapshot,
+                            );
+                            aligned.split('\n').map(|s| s.to_string()).collect()
+                        }
                     }
                     // Otherwise, regenerate with proper formatting.
                     _ => rows.iter().map(|cols| cols.join(col_separator)).collect(),

@@ -45,7 +45,7 @@ impl sqllogictest::DB for FakeDB {
 macro_rules! runner {
     ($log:expr) => {{
         let log = $log.clone();
-        sqllogictest::Runner::new(move |_, _| {
+        sqllogictest::Runner::new(move |_, _, _, _, _| {
             let db = FakeDB { log: log.clone() };
             async move { Ok(db) }
         })
@@ -465,7 +465,7 @@ fn test_async_statement_with_retry_succeeds() {
     let log = Arc::new(Mutex::new(vec![]));
     let r = remaining.clone();
     let l = log.clone();
-    sqllogictest::Runner::new(move |_, _| {
+    sqllogictest::Runner::new(move |_, _, _, _, _| {
         let db = FailNTimes {
             remaining: r.clone(),
             log: l.clone(),
@@ -495,7 +495,7 @@ fn test_async_statement_with_retry_exhausted() {
     let log = Arc::new(Mutex::new(vec![]));
     let r = remaining.clone();
     let l = log.clone();
-    let err = sqllogictest::Runner::new(move |_, _| {
+    let err = sqllogictest::Runner::new(move |_, _, _, _, _| {
         let db = FailNTimes {
             remaining: r.clone(),
             log: l.clone(),
@@ -524,7 +524,7 @@ fn test_async_query_with_retry_succeeds() {
     let log = Arc::new(Mutex::new(vec![]));
     let r = remaining.clone();
     let l = log.clone();
-    sqllogictest::Runner::new(move |_, _| {
+    sqllogictest::Runner::new(move |_, _, _, _, _| {
         let db = FailNTimes {
             remaining: r.clone(),
             log: l.clone(),
@@ -977,7 +977,7 @@ fn test_max_async_connections_limits_peak_concurrency() {
     let a = active.clone();
     let p = peak.clone();
 
-    sqllogictest::Runner::new(move |_, _| {
+    sqllogictest::Runner::new(move |_, _, _, _, _| {
         let db = ConcurrentDB {
             active: a.clone(),
             peak: p.clone(),
