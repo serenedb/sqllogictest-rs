@@ -60,3 +60,16 @@ tracing = "=0.1.41"
 tracing-subscriber = "=0.3.20"
 tokio-postgres-rustls = "=0.13.0"
 rustls                = "=0.23.37"
+
+# MaterializeInc's maintained rust-postgres fork, same crate versions as
+# upstream 0.7.15 but with the "bigger-channels" fix (their PR #33): the
+# per-request response channel is 1024 instead of 1, closing the
+# channel-full path where Connection::poll_read stops draining the socket
+# (upstream deadlock, reproduced in rust-postgres#1348; unmerged fixes
+# rust-postgres#1348/#1349). Same pin Windmill ships (windmill#9106).
+# Drop this whole [patch.crates-io] section and return to the crates.io
+# releases once upstream rust-postgres merges the fix.
+[patch.crates-io]
+tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
+postgres-types = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
+postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "78c1222577bb091d69bc22b1bc7ad01c14675abe" }
