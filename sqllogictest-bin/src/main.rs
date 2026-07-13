@@ -491,6 +491,20 @@ struct RunConfig {
     shutdown_timeout: Option<Duration>,
 }
 
+fn to_relative_path_display(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_relative() {
+        return path.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => p
+            .strip_prefix(&cwd)
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|_| path.to_string()),
+        Err(_) => path.to_string(),
+    }
+}
+
 fn test_db_name(test_case_name: String) -> String {
     // Because PostgreSQL database names are < 64
     const MAX_DATABASE_NAME_LEN: usize = 63;
@@ -702,7 +716,7 @@ async fn run_parallel(
                     cancel.cancel();
                 }
 
-                failed_cases.push(test_case_name.clone());
+                failed_cases.push(to_relative_path_display(&file));
                 failed_dbs.insert(db_name.clone());
             }
             RunResult::Skipped | RunResult::Cancelled => {}
@@ -1043,7 +1057,7 @@ async fn run_serial(
                     cancel.cancel();
                 }
 
-                failed_cases.push(test_case_name.clone());
+                failed_cases.push(to_relative_path_display(&path));
             }
             RunResult::Skipped | RunResult::Cancelled => {}
         };
