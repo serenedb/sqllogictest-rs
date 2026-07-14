@@ -258,6 +258,107 @@ impl fmt::Display for TimestampValue {
     }
 }
 
+// TIMESTAMPTZ carries the same ±infinity sentinels as TIMESTAMP, which
+// chrono's DateTime<Utc> can't represent. Decode the sentinels explicitly and
+// render finite values in UTC with the fixed "+00" suffix (same shape as the
+// binary record path above).
+#[derive(Debug)]
+struct TimestampTzValue(String);
+
+impl<'a> FromSql<'a> for TimestampTzValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() == 8 {
+            let micros = i64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]);
+            if micros == i64::MAX {
+                return Ok(TimestampTzValue("infinity".into()));
+            }
+            if micros == i64::MIN {
+                return Ok(TimestampTzValue("-infinity".into()));
+            }
+        }
+        let dt = DateTime::<chrono::Utc>::from_sql(ty, raw)?;
+        Ok(TimestampTzValue(
+            format_naive_timestamp(dt.naive_utc()) + "+00",
+        ))
+    }
+
+    accepts!(TIMESTAMPTZ);
+}
+
+impl fmt::Display for TimestampTzValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// TIME can be the 24:00:00 day boundary (86400000000 micros), which chrono's
+// NaiveTime wraps to 00:00:00. Decode it explicitly.
+#[derive(Debug)]
+struct TimeValue(String);
+
+impl<'a> FromSql<'a> for TimeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() == 8 {
+            let micros = i64::from_be_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]);
+            if micros == 86_400_000_000 {
+                return Ok(TimeValue("24:00:00".into()));
+            }
+        }
+        let t = NaiveTime::from_sql(ty, raw)?;
+        Ok(TimeValue(format_naive_time(t)))
+    }
+
+    accepts!(TIME);
+}
+
+impl fmt::Display for TimeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// DATE carries ±infinity as i32::MAX / i32::MIN days since 2000-01-01, which
+// chrono's NaiveDate can't represent. Decode the sentinels explicitly.
+#[derive(Debug)]
+struct DateValue(String);
+
+impl<'a> FromSql<'a> for DateValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() == 4 {
+            let days = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            if days == i32::MAX {
+                return Ok(DateValue("infinity".into()));
+            }
+            if days == i32::MIN {
+                return Ok(DateValue("-infinity".into()));
+            }
+        }
+        let d = NaiveDate::from_sql(ty, raw)?;
+        Ok(DateValue(d.format("%Y-%m-%d").to_string()))
+    }
+
+    accepts!(DATE);
+}
+
+impl fmt::Display for DateValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // TIME WITH TIME ZONE: 12-byte binary (i64 microseconds-of-day + i32 zone in
 // seconds west of UTC). postgres-types has no FromSql for timetz, so decode it
 // by hand and render as serened does, e.g. "11:30:00.123456+00:00".
@@ -283,13 +384,16 @@ impl<'a> FromSql<'a> for TimeTzValue {
         let off = -zone; // UTC offset (east-positive)
         let sign = if off < 0 { '-' } else { '+' };
         let off = off.abs();
-        Ok(TimeTzValue(format!(
-            "{}{}{:02}:{:02}",
-            time,
-            sign,
-            off / 3600,
-            (off % 3600) / 60
-        )))
+        let (h, m, s) = (off / 3600, (off % 3600) / 60, off % 60);
+        // Minutes/seconds only when nonzero, matching PG's EncodeTimezone.
+        let suffix = if s != 0 {
+            format!("{sign}{h:02}:{m:02}:{s:02}")
+        } else if m != 0 {
+            format!("{sign}{h:02}:{m:02}")
+        } else {
+            format!("{sign}{h:02}")
+        };
+        Ok(TimeTzValue(format!("{}{}", time, suffix)))
     }
 
     accepts!(TIMETZ);
@@ -1065,13 +1169,13 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(row, row_vec, idx, Decimal);
                     }
                     Type::DATE => {
-                        single_process!(row, row_vec, idx, NaiveDate);
+                        single_process!(row, row_vec, idx, DateValue);
                     }
                     Type::DATE_ARRAY => {
-                        array_process!(row, row_vec, idx, NaiveDate);
+                        array_process!(row, row_vec, idx, DateValue);
                     }
                     Type::TIME => {
-                        single_process!(row, row_vec, idx, NaiveTime);
+                        single_process!(row, row_vec, idx, TimeValue);
                     }
                     Type::TIME_ARRAY => {
                         array_process!(row, row_vec, idx, NaiveTime);
@@ -1125,17 +1229,10 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(self, row, row_vec, idx, Interval, INTERVAL);
                     }
                     Type::TIMESTAMPTZ => {
-                        single_process!(
-                            self,
-                            row,
-                            row_vec,
-                            idx,
-                            DateTime<chrono::Utc>,
-                            TIMESTAMPTZ
-                        );
+                        single_process!(row, row_vec, idx, TimestampTzValue);
                     }
                     Type::TIMESTAMPTZ_ARRAY => {
-                        array_process!(self, row, row_vec, idx, DateTime<chrono::Utc>, TIMESTAMPTZ);
+                        array_process!(row, row_vec, idx, TimestampTzValue);
                     }
                     Type::BYTEA => {
                         single_process!(row, row_vec, idx, &[u8], bytea_to_str);
