@@ -18,9 +18,10 @@ use super::{Extended, Postgres, Result};
 // Inspired by postgres_type::Array implementation of Display trait
 fn print_array<T: std::fmt::Display>(
     arr: &postgres_array::Array<Option<T>>,
+    delim: char,
     fmt: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
-    print_array_helper(0, arr.dimensions(), &mut arr.iter(), fmt)
+    print_array_helper(0, arr.dimensions(), &mut arr.iter(), delim, fmt)
 }
 
 // See https://www.postgresql.org/docs/current/arrays.html#ARRAYS-IO
@@ -63,6 +64,7 @@ fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Opti
     depth: usize,
     dims: &[postgres_array::Dimension],
     data: &mut I,
+    delim: char,
     fmt: &mut std::fmt::Formatter<'_>,
 ) -> std::fmt::Result {
     if dims.is_empty() {
@@ -87,18 +89,18 @@ fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Opti
     write!(fmt, "{{")?;
     for i in 0..dims[depth].len {
         if i != 0 {
-            write!(fmt, ",")?;
+            fmt.write_char(delim)?;
         }
-        print_array_helper(depth + 1, dims, data, fmt)?;
+        print_array_helper(depth + 1, dims, data, delim, fmt)?;
     }
     write!(fmt, "}}")
 }
 
-struct ArrayFmt<'a, T>(&'a postgres_array::Array<Option<T>>);
+struct ArrayFmt<'a, T>(&'a postgres_array::Array<Option<T>>, char);
 
 impl<'a, T: std::fmt::Display> std::fmt::Display for ArrayFmt<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        print_array(self.0, f)
+        print_array(self.0, self.1, f)
     }
 }
 
@@ -454,6 +456,34 @@ impl<'a> FromSql<'a> for InetValue {
     }
 
     accepts!(INET, CIDR);
+}
+
+#[derive(Debug)]
+struct GeometryValue(String);
+
+impl<'a> FromSql<'a> for GeometryValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        // Binary format carries the WKB bytes; the text format spells the same
+        // bytes as upper-case hex, so render them identically.
+        let mut hex = String::with_capacity(raw.len() * 2);
+        for byte in raw {
+            hex.push_str(&format!("{byte:02X}"));
+        }
+        Ok(GeometryValue(hex))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        ty.name() == "geometry"
+    }
+}
+
+impl fmt::Display for GeometryValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 impl fmt::Display for InetValue {
@@ -950,6 +980,9 @@ impl fmt::Display for Regtype {
 // See: https://github.com/rust-postgres/rust-postgres/issues/1186
 macro_rules! array_process {
     ($row:ident, $row_vec:ident, $idx:ident, $t:ty) => {
+        array_process!($row, $row_vec, $idx, $t, delim = ',');
+    };
+    ($row:ident, $row_vec:ident, $idx:ident, $t:ty, delim = $delim:expr) => {
         let value: Option<postgres_array::Array<Option<$t>>> = $row.get($idx);
         match value {
             Some(value) => {
@@ -959,7 +992,7 @@ macro_rules! array_process {
                     .map(|opt| opt.map(|v| format!("{}", v)))
                     .collect();
                 let value = postgres_array::Array::from_parts(data, dimensions);
-                let value = ArrayFmt(&value);
+                let value = ArrayFmt(&value, $delim);
                 let mut output = String::new();
                 write!(output, "{value}").unwrap();
                 $row_vec.push(output);
@@ -979,7 +1012,7 @@ macro_rules! array_process {
                     .map(|opt| opt.map(|v| $convert(&v).to_string()))
                     .collect();
                 let value = postgres_array::Array::from_parts(data, dimensions);
-                let value = ArrayFmt(&value);
+                let value = ArrayFmt(&value, ',');
                 let mut output = String::new();
                 write!(output, "{value}").unwrap();
                 $row_vec.push(output);
@@ -1010,7 +1043,7 @@ macro_rules! array_process {
                     }
                 }
                 let value = postgres_array::Array::from_parts(data, dimensions);
-                let value = ArrayFmt(&value);
+                let value = ArrayFmt(&value, ',');
                 let mut output = String::new();
                 write!(output, "{value}").unwrap();
                 $row_vec.push(output);
@@ -1308,6 +1341,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
+                    }
+                    _ if column.type_().name() == "geometry" => {
+                        single_process!(row, row_vec, idx, GeometryValue);
+                    }
+                    _ if column.type_().name() == "_geometry" => {
+                        array_process!(row, row_vec, idx, GeometryValue, delim = ':');
                     }
                     _ => {
                         todo!("Don't support {} type now.", column.type_().name())
