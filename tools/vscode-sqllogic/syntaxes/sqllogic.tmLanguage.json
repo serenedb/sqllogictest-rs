@@ -1,0 +1,67 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "SQLLogicTest",
+  "scopeName": "source.sqllogic",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#results" },
+    { "include": "#record-sql" },
+    { "include": "#record-system" },
+    { "include": "#directive" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.sqllogic",
+      "match": "^#.*$"
+    },
+    "results": {
+      "name": "meta.results.sqllogic",
+      "begin": "^(----)[ \\t]*$",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.results-delimiter.sqllogic" }
+      },
+      "end": "^(?=$)",
+      "contentName": "meta.results.content.sqllogic"
+    },
+    "record-sql": {
+      "name": "meta.record.sql.sqllogic",
+      "begin": "^(statement|query|let)\\b([^\\n]*)$",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.record.sqllogic" },
+        "2": { "patterns": [{ "include": "#arguments" }] }
+      },
+      "end": "^(?=$|----[ \\t]*$)",
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [{ "include": "source.sql" }]
+    },
+    "record-system": {
+      "name": "meta.record.system.sqllogic",
+      "begin": "^(system)\\b([^\\n]*)$",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.record.sqllogic" },
+        "2": { "patterns": [{ "include": "#arguments" }] }
+      },
+      "end": "^(?=$|----[ \\t]*$)",
+      "contentName": "meta.command.sqllogic"
+    },
+    "directive": {
+      "match": "^(control|hash-threshold|show-column-names|flat-values|subtest|include|sleep|print|halt|wait|skipif|onlyif|connection)\\b([^\\n]*)$",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqllogic" },
+        "2": { "patterns": [{ "include": "#arguments" }] }
+      }
+    },
+    "arguments": {
+      "patterns": [
+        {
+          "name": "keyword.other.argument.sqllogic",
+          "match": "\\b(?:always-async|max-async-connections|async|ok|error|count|retry|backoff|nosort|rowsort|valuesort|rowwise|valuewise|resultmode|sortmode|substitution|sslmode|port|user|password|database|on|off|true|false)\\b"
+        },
+        {
+          "name": "keyword.other.value.sqllogic",
+          "match": "\\S+"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "sqllogic",
+  "displayName": "SQLLogicTest",
+  "description": "Syntax highlighting for sqllogictest-rs test files",
+  "version": "0.1.0",
+  "publisher": "serenedb",
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sqllogic",
+        "aliases": ["SQLLogicTest", "sqllogic"],
+        "extensions": [".slt"],
+        "filenamePatterns": [
+          "**/sqllogic/**/*.test",
+          "**/test/sql/**/*.test"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "sqllogic",
+        "scopeName": "source.sqllogic",
+        "path": "./syntaxes/sqllogic.tmLanguage.json",
+        "embeddedLanguages": { "meta.embedded.block.sql": "sql" }
+      }
+    ]
+  }
+}
