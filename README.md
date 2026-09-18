@@ -268,3 +268,36 @@ in their commits. Use `git commit -s` to sign off commits.
 ## License
 
 This project is available under the terms of either the [Apache 2.0 license](LICENSE-APACHE) or the [MIT license](LICENSE-MIT).
+
+## Editor syntax highlighting
+
+`tools/vscode-sqllogic/` is a small declarative VSCode extension that colors
+`.test` files: SQL bodies as SQL, sqllogictest-rs directives as keywords, `#`
+comments as comments. It lives here rather than in a consuming repository
+because the directives it highlights are this crate's syntax.
+
+Build and install it, then reload the window:
+
+```bash
+tools/vscode-sqllogic/package.sh
+code --install-extension tools/vscode-sqllogic/sqllogic-0.1.0.vsix
+```
+
+From a repository that vendors this crate as a submodule, prefix both paths
+with the submodule directory -- in SereneDB, `third_party/sqllogictest-rs/`.
+
+The `code` CLI is only on `$PATH` inside VSCode's own integrated terminal. Over
+SSH, or in any other shell, call the server's own copy instead:
+
+```bash
+"$(ls -td ~/.vscode-server/cli/servers/*/server | head -1)/bin/code-server" \
+  --install-extension tools/vscode-sqllogic/sqllogic-0.1.0.vsix --force
+```
+
+Dropping the folder into `~/.vscode-server/extensions/` does **not** work --
+VSCode only loads extensions recorded in the `extensions.json` beside them,
+which is what the CLI install writes.
+
+`tools/vscode-sqllogic/README.md` covers the rest: which scopes get which
+color, how to set file associations outside the default globs, and how to swap
+in a different SQL grammar.
