@@ -89,4 +89,8 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         err.code().map(|s| s.code().to_owned())
     }
+
+    fn is_connection_error(err: &Self::Error) -> bool {
+        err.is_connection_error()
+    }
 }

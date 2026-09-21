@@ -159,6 +159,7 @@ pub(crate) async fn connect(
 pub(crate) struct EnginesError {
     error: anyhow::Error,
     sqlstate: Option<String>,
+    connection_error: bool,
 }
 
 impl EnginesError {
@@ -166,6 +167,7 @@ impl EnginesError {
         Self {
             error: error.into(),
             sqlstate: None,
+            connection_error: false,
         }
     }
 }
@@ -197,6 +199,10 @@ fn error_sql_state<E: AsyncDB>(_engine: &E, error: &E::Error) -> Option<String> 
     E::error_sql_state(error)
 }
 
+fn is_connection_error<E: AsyncDB>(_engine: &E, error: &E::Error) -> bool {
+    E::is_connection_error(error)
+}
+
 #[async_trait]
 impl AsyncDB for Engines {
     type Error = EnginesError;
@@ -206,6 +212,7 @@ impl AsyncDB for Engines {
         dispatch_engines!(self, e, {
             e.run(sql).await.map_err(|error| EnginesError {
                 sqlstate: error_sql_state(e, &error),
+                connection_error: is_connection_error(e, &error),
                 error: anyhow::Error::from(error),
             })
         })
@@ -229,5 +236,9 @@ impl AsyncDB for Engines {
 
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         err.sqlstate.clone()
+    }
+
+    fn is_connection_error(err: &Self::Error) -> bool {
+        err.connection_error
     }
 }

@@ -141,6 +141,10 @@ pub trait AsyncDB {
     fn error_sql_state(_err: &Self::Error) -> Option<String> {
         None
     }
+
+    fn is_connection_error(_err: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// The database to be tested.
@@ -164,6 +168,10 @@ pub trait DB {
     /// Extract the SQL state from the error.
     fn error_sql_state(_err: &Self::Error) -> Option<String> {
         None
+    }
+
+    fn is_connection_error(_err: &Self::Error) -> bool {
+        false
     }
 }
 
@@ -190,6 +198,10 @@ where
 
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         D::error_sql_state(err)
+    }
+
+    fn is_connection_error(err: &Self::Error) -> bool {
+        D::is_connection_error(err)
     }
 }
 
@@ -829,6 +841,69 @@ fn resolve_retry_params(retry: &Option<RetryConfig>, vars: &RunVariables) -> (us
             .unwrap_or(Duration::ZERO),
     };
     (attempts, backoff)
+}
+
+fn resolve_retry(
+    retry: &RetryConfig,
+    vars: &RunVariables,
+    loc: &Location,
+) -> Result<(usize, Duration), TestError> {
+    let attempts = match &retry.attempts {
+        RetryAttempts::Count(n) => *n,
+        RetryAttempts::EnvVar(var) => {
+            let resolved = may_substitute(vars, var.clone(), true).map_err(|e| {
+                TestErrorKind::RetrySubstitutionFailure {
+                    variable: var.clone(),
+                    err: e,
+                }
+                .at(loc.clone())
+            })?;
+
+            let count = resolved.parse::<usize>().map_err(|_| {
+                TestErrorKind::ParseError(ParseErrorKind::InvalidNumber(resolved.clone()))
+                    .at(loc.clone())
+            })?;
+
+            if count == 0 {
+                return Err(
+                    TestErrorKind::ParseError(ParseErrorKind::InvalidRetryConfig(
+                        "attempt must be greater than 0".to_string(),
+                    ))
+                    .at(loc.clone()),
+                );
+            }
+
+            count
+        }
+    };
+
+    let backoff = match &retry.backoff {
+        RetryBackoff::Duration(d) => *d,
+        RetryBackoff::EnvVar(var) => {
+            let resolved = may_substitute(vars, var.clone(), true).map_err(|e| {
+                TestErrorKind::RetrySubstitutionFailure {
+                    variable: var.clone(),
+                    err: e,
+                }
+                .at(loc.clone())
+            })?;
+
+            humantime::parse_duration(&resolved).map_err(|_| {
+                TestErrorKind::ParseError(ParseErrorKind::InvalidDuration(resolved)).at(loc.clone())
+            })?
+        }
+    };
+
+    Ok((attempts, backoff))
+}
+
+fn is_connection_failure<D: AsyncDB>(err: &TestError) -> bool {
+    match err.kind() {
+        TestErrorKind::Fail { err, .. } | TestErrorKind::ErrorMismatch { err, .. } => err
+            .downcast_ref::<D::Error>()
+            .is_some_and(D::is_connection_error),
+        _ => false,
+    }
 }
 
 pub struct TaskContext<D: AsyncDB> {
@@ -1658,56 +1733,7 @@ impl<D: AsyncDB> ConnectionTask<D> {
             return self.run_record_async_no_retry(record).await;
         };
 
-        // Resolve attempts from either direct value or environment variable
-        let attempts = match &retry.attempts {
-            RetryAttempts::Count(n) => *n,
-            RetryAttempts::EnvVar(var) => {
-                let resolved =
-                    may_substitute(&self.context.vars, var.clone(), true).map_err(|e| {
-                        TestErrorKind::RetrySubstitutionFailure {
-                            variable: var.clone(),
-                            err: e,
-                        }
-                        .at(loc.clone())
-                    })?;
-
-                let count = resolved.parse::<usize>().map_err(|_| {
-                    TestErrorKind::ParseError(ParseErrorKind::InvalidNumber(resolved.clone()))
-                        .at(loc.clone())
-                })?;
-
-                if count == 0 {
-                    return Err(
-                        TestErrorKind::ParseError(ParseErrorKind::InvalidRetryConfig(
-                            "attempt must be greater than 0".to_string(),
-                        ))
-                        .at(loc.clone()),
-                    );
-                }
-
-                count
-            }
-        };
-
-        // Resolve backoff from either direct value or environment variable
-        let backoff = match &retry.backoff {
-            RetryBackoff::Duration(d) => *d,
-            RetryBackoff::EnvVar(var) => {
-                let resolved =
-                    may_substitute(&self.context.vars, var.clone(), true).map_err(|e| {
-                        TestErrorKind::RetrySubstitutionFailure {
-                            variable: var.clone(),
-                            err: e,
-                        }
-                        .at(loc.clone())
-                    })?;
-
-                humantime::parse_duration(&resolved).map_err(|_| {
-                    TestErrorKind::ParseError(ParseErrorKind::InvalidDuration(resolved))
-                        .at(loc.clone())
-                })?
-            }
-        };
+        let (attempts, backoff) = resolve_retry(&retry, &self.context.vars, &loc)?;
 
         // Retry for `attempts` times
         let mut last_error = None;
@@ -2068,37 +2094,71 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                             }
                         }
                     } else {
-                        // Sync: get the named connection, waiting for any in-flight task on it first.
-                        // If connection establishment fails, propagate the error via pending_error
-                        // so `query error` / `statement error` records can match it.
-                        let mut task = match self
-                            .get_or_resume_named_conn(
-                                conn_name.clone(),
-                                &mut pending,
-                                loc,
-                                sql,
-                                retry,
-                            )
-                            .await
-                        {
-                            Ok(task) => task,
-                            Err(conn_err) => match conn_err.kind() {
-                                TestErrorKind::Fail { err, .. } => ConnectionTask {
-                                    conn: None,
-                                    context: TaskContext {
-                                        vars: self.vars.clone(),
-                                        check_options: self.check_options.clone(),
-                                    },
-                                    pending_error: Some(err),
-                                },
-                                _ => return Err(conn_err),
-                            },
+                        let (attempts, backoff) = match retry {
+                            Some(rc) => resolve_retry(rc, &self.vars, loc)?,
+                            None => (1, Duration::ZERO),
                         };
-                        task.run_record(record).await?;
-                        self.vars = task.context.vars.clone();
-                        self.check_options = task.context.check_options.clone();
-                        if let Some(conn) = task.conn {
-                            self.conn.add(conn_name, conn);
+                        let mut last_error = None;
+                        for attempt in 0..attempts {
+                            let mut task = match self
+                                .get_or_resume_named_conn(
+                                    conn_name.clone(),
+                                    &mut pending,
+                                    loc,
+                                    sql,
+                                    &None,
+                                )
+                                .await
+                            {
+                                Ok(task) => task,
+                                Err(conn_err) => match conn_err.kind() {
+                                    TestErrorKind::Fail { err, .. } => ConnectionTask {
+                                        conn: None,
+                                        context: TaskContext {
+                                            vars: self.vars.clone(),
+                                            check_options: self.check_options.clone(),
+                                        },
+                                        pending_error: Some(err),
+                                    },
+                                    _ => return Err(conn_err),
+                                },
+                            };
+                            let result = task.run_record_async_no_retry(record.clone()).await;
+                            self.vars = task.context.vars.clone();
+                            self.check_options = task.context.check_options.clone();
+                            match result {
+                                Ok(_) => {
+                                    if let Some(conn) = task.conn {
+                                        self.conn.add(conn_name.clone(), conn);
+                                    }
+                                    last_error = None;
+                                    break;
+                                }
+                                Err(err) => {
+                                    if let Some(conn) = task.conn {
+                                        if is_connection_failure::<D>(&err) {
+                                            drop(conn);
+                                        } else {
+                                            self.conn.add(conn_name.clone(), conn);
+                                        }
+                                    }
+                                    if attempt + 1 < attempts {
+                                        tracing::warn!(
+                                            target: "sqllogictest::retry",
+                                            attempt = attempt + 1,
+                                            attempts,
+                                            backoff = ?backoff,
+                                            error = ?err,
+                                            "retrying"
+                                        );
+                                        D::sleep(backoff).await;
+                                    }
+                                    last_error = Some(err);
+                                }
+                            }
+                        }
+                        if let Some(err) = last_error {
+                            return Err(err);
                         }
                     }
                 }

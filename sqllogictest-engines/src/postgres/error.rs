@@ -20,6 +20,15 @@ impl PgDriverError {
             Self::Internal(_) => None,
         }
     }
+
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            Self::Postgres(e) => {
+                e.is_closed() || e.source().is_some_and(|cause| cause.is::<std::io::Error>())
+            }
+            Self::Internal(_) => true,
+        }
+    }
 }
 
 impl std::fmt::Display for PgDriverError {
