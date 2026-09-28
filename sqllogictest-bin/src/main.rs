@@ -246,6 +246,7 @@ fn import_partition_config_from_ci() {
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
+    let _suite_dir = sqllogictest::SuiteDirGuard;
     tracing_subscriber::fmt::init();
 
     import_partition_config_from_ci();

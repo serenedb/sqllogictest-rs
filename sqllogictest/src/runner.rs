@@ -3,9 +3,9 @@
 use futures::executor::block_on;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::vec;
 
@@ -682,11 +682,38 @@ pub fn default_partitioner(_file_name: &str) -> bool {
     true
 }
 
+// When the runner and the database server run in separate containers,
+// server-side ops (COPY TO/FROM, ATTACH) write into __TEST_DIR__ as a
+// different uid. SLT_TEST_DIR_SHARED relaxes the dir to 0777 so any uid
+// sharing the mount can use it; TempDir's default 0700 would deny them.
+fn relax_shared_permissions(path: &Path) {
+    #[cfg(unix)]
+    if std::env::var_os("SLT_TEST_DIR_SHARED").is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
+            .expect("failed to relax testdir permissions");
+    }
+}
+
+static SUITE_DIRS: Mutex<Vec<TempDir>> = Mutex::new(Vec::new());
+
+pub struct SuiteDirGuard;
+
+impl Drop for SuiteDirGuard {
+    fn drop(&mut self) {
+        SUITE_DIRS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct RunnerLocals {
     /// The temporary directory. Test cases can use `__TEST_DIR__` to refer to this directory.
     /// Lazily initialized and cleaned up when dropped.
     test_dir: Arc<OnceLock<TempDir>>,
+    suite_dir: Arc<OnceLock<PathBuf>>,
     /// Runtime variables for substitution.
     variables: BTreeMap<String, String>,
 }
@@ -695,22 +722,29 @@ impl RunnerLocals {
     fn test_dir_handle(&self) -> &TempDir {
         self.test_dir.get_or_init(|| {
             let dir = TempDir::new().expect("failed to create testdir");
-            // When the runner and the database server run in separate containers,
-            // server-side ops (COPY TO/FROM, ATTACH) write into __TEST_DIR__ as a
-            // different uid. SLT_TEST_DIR_SHARED relaxes the dir to 0777 so any uid
-            // sharing the mount can use it; TempDir's default 0700 would deny them.
-            #[cfg(unix)]
-            if std::env::var_os("SLT_TEST_DIR_SHARED").is_some() {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
-                    .expect("failed to relax testdir permissions");
-            }
+            relax_shared_permissions(dir.path());
             dir
         })
     }
 
     pub fn test_dir(&self) -> String {
         self.test_dir_handle().path().to_string_lossy().into_owned()
+    }
+
+    pub fn suite_dir(&self) -> String {
+        self.suite_dir
+            .get_or_init(|| {
+                let dir = TempDir::new().expect("failed to create suite dir");
+                relax_shared_permissions(dir.path());
+                let path = dir.path().to_path_buf();
+                SUITE_DIRS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(dir);
+                path
+            })
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// A short alphanumeric token unique to this runner instance (derived from the
