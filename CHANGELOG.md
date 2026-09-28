@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+* runner: Add `$__SUITE_DIR__`, a second per-test directory removed when the runner exits instead of when the test case ends.
+
 ## [0.29.1] - 2026-02-13
 
 * parser/runner: Add `let` record for binding query results to variables.

@@ -198,6 +198,9 @@ FROM baz;
 Besides, there're some special variables supported:
 - `$__TEST_DIR__`: the path to a temporary directory specific to the current test case. 
   This can be helpful if you need to manipulate some external resources during the test.
+- `$__SUITE_DIR__`: the path to a second temporary directory specific to the current test case. Unlike
+  `$__TEST_DIR__`, it is not removed when the test case ends but when the runner exits, after all test cases. Use it
+  for files the database may still hold open after the test, such as attached database files.
 - `$__NOW__`: the current Unix timestamp in nanoseconds.
 - `$__DATABASE__`: the name of the current database.
 

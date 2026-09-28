@@ -4,6 +4,7 @@ use crate::RunnerLocals;
 
 pub mod well_known {
     pub const TEST_DIR: &str = "__TEST_DIR__";
+    pub const SUITE_DIR: &str = "__SUITE_DIR__";
     pub const RUN_ID: &str = "__RUN_ID__";
     pub const NOW: &str = "__NOW__";
     pub const DATABASE: &str = "__DATABASE__";
@@ -84,6 +85,10 @@ impl Substitution<'_> {
                 &self.runner_locals.run_id(),
             )
             .replace(&format!("${}", well_known::NOW), &now_string());
+        let suite_dir_var = format!("${}", well_known::SUITE_DIR);
+        if res.contains(&suite_dir_var) {
+            res = res.replace(&suite_dir_var, &self.runner_locals.suite_dir());
+        }
         for (key, value) in self.runner_locals.vars() {
             res = res.replace(&format!("${}", key), value);
         }
@@ -97,6 +102,7 @@ impl<'a> subst::VariableMap<'a> for Substitution<'a> {
     fn get(&'a self, key: &str) -> Option<Self::Value> {
         match key {
             well_known::TEST_DIR => self.runner_locals.test_dir().into(),
+            well_known::SUITE_DIR => self.runner_locals.suite_dir().into(),
             well_known::RUN_ID => self.runner_locals.run_id().into(),
             well_known::NOW => now_string().into(),
             key => self
