@@ -1,6 +1,6 @@
 mod engines;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, stdout, Read, Seek, SeekFrom, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -157,6 +157,12 @@ struct Opt {
     #[clap(long = "shutdown-timeout", env = "SLT_SHUTDOWN_TIMEOUT")]
     shutdown_timeout_secs: Option<u64>,
 
+    /// Timeout in seconds for a single test file. By default this is unspecified,
+    /// meaning a wedged test blocks the whole run forever: the result channel
+    /// never sees its message and the receive loop cannot make progress.
+    #[clap(long = "test-timeout", env = "SLT_TEST_TIMEOUT")]
+    test_timeout_secs: Option<u64>,
+
     /// Skip tests that matches the given regex.
     #[clap(long)]
     skip: Option<String>,
@@ -282,6 +288,7 @@ pub async fn main() -> Result<()> {
         partition_count,
         partition_id,
         shutdown_timeout_secs,
+        test_timeout_secs,
         skip,
         show_discovered_tests,
     } = Opt::from_arg_matches(&matches)
@@ -455,6 +462,7 @@ pub async fn main() -> Result<()> {
         show_discovered_tests,
         cancel,
         shutdown_timeout: shutdown_timeout_secs.map(Duration::from_secs),
+        test_timeout: test_timeout_secs.map(Duration::from_secs),
     };
 
     let result = if let Some(jobs) = jobs {
@@ -489,6 +497,7 @@ struct RunConfig {
     show_discovered_tests: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
+    test_timeout: Option<Duration>,
 }
 
 fn to_relative_path_display(path: &str) -> String {
@@ -636,14 +645,32 @@ async fn run_parallel(
         show_discovered_tests,
         cancel,
         shutdown_timeout,
+        test_timeout,
     }: RunConfig,
 ) -> Result<()> {
     let test_databases = test_db_names(files, show_discovered_tests)?;
     let total_tests = test_databases.len();
+    // Which tests have not reported yet. Without this, a wedged test leaves the
+    // loop below blocked on `recv()` with no indication of which file it is.
+    let mut outstanding: HashMap<String, PathBuf> = test_databases
+        .iter()
+        .map(|(db, file)| (db.clone(), file.clone()))
+        .collect();
+
+    // db_name -> when the test actually began running. Written by each test task,
+    // read only when the watchdog fires. A plain std Mutex: the critical sections
+    // are two map operations with no await inside, so it never blocks the runtime.
+    let in_flight: Arc<std::sync::Mutex<HashMap<String, Instant>>> = Arc::default();
 
     let (job_tx, job_rx) = mpsc::channel::<TestJob>(jobs);
     let (result_tx, mut result_rx) = mpsc::channel::<TestResultMessage>(jobs);
-    let (drop_tx, drop_rx) = mpsc::channel::<DropMessage>(jobs);
+    // Unbounded on purpose. The dropper is a single task issuing DROP DATABASE
+    // serially, so it is far slower than 128 tests finishing in parallel. On a
+    // bounded channel the loop below blocks in `drop_tx.send().await`, stops
+    // draining `result_rx`, and the whole pipeline stalls behind cleanup:
+    // finished tests block sending results while still holding their semaphore
+    // permits, which starves `execution_task` of new jobs.
+    let (drop_tx, drop_rx) = mpsc::unbounded_channel::<DropMessage>();
 
     let labels = Arc::new(labels);
 
@@ -652,16 +679,19 @@ async fn run_parallel(
         let config = config.clone();
         let labels = Arc::clone(&labels);
         let result_tx = result_tx.clone();
+        let in_flight = Arc::clone(&in_flight);
         tokio::spawn(execution_task(
             jobs,
             job_rx,
             result_tx,
+            in_flight,
             engine,
             config,
             labels,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
+            test_timeout,
         ))
     };
 
@@ -689,11 +719,98 @@ async fn run_parallel(
 
     let start = Instant::now();
 
-    while processed < total_tests {
-        let Some(message) = result_rx.recv().await else {
-            break;
+    // Progress is checked on a fixed tick rather than only when `recv()` times
+    // out: any result at all used to reset that timeout, so a wedged test stayed
+    // invisible as long as its 127 neighbours kept finishing.
+    const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+    // A test still running after this long is worth naming even while the run is
+    // otherwise making progress.
+    // Observed legitimate durations reach ~1700s under a sanitizer build, so this
+    // is deliberately generous; each test is named at most once (`warned_slow`)
+    // rather than every tick.
+    const SLOW_TEST_AGE: Duration = Duration::from_secs(900);
+
+    let mut ticker = tokio::time::interval(STALL_CHECK_INTERVAL);
+    // `biased` polls `recv()` first, so a steady stream of results starves the
+    // ticker; the default Burst behaviour would then fire every missed tick at
+    // once and print a run of identical reports.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick completes immediately; discard it
+    let mut last_result = Instant::now();
+    let mut warned_slow: HashSet<String> = HashSet::new();
+
+    'outer: while processed < total_tests {
+        let message = loop {
+            tokio::select! {
+                biased;
+                res = result_rx.recv() => match res {
+                    Some(message) => break message,
+                    // All senders dropped: nothing more will arrive.
+                    None => break 'outer,
+                },
+                _ = ticker.tick() => {
+                    let quiet = last_result.elapsed();
+                    let started = in_flight.lock().map(|m| m.clone()).unwrap_or_default();
+                    // Split what has not reported into tests that are actually
+                    // running (with how long they have been) and tests still
+                    // waiting for a slot. Without the split a wedged test looks
+                    // the same as one that never started.
+                    let mut running: Vec<(Duration, String, String)> = outstanding
+                        .iter()
+                        .filter_map(|(db, file)| {
+                            started.get(db).map(|t| {
+                                (
+                                    t.elapsed(),
+                                    to_relative_path_display(&file.to_string_lossy()),
+                                    db.clone(),
+                                )
+                            })
+                        })
+                        .collect();
+                    // Longest-running first: that is the one to look at.
+                    running.sort_by_key(|a| std::cmp::Reverse(a.0));
+                    // Only tests not already named, so a genuinely long test is
+                    // reported once instead of on every tick.
+                    let slow = running
+                        .iter()
+                        .filter(|(d, _, db)| *d >= SLOW_TEST_AGE && !warned_slow.contains(db))
+                        .count();
+                    for (d, _, db) in &running {
+                        if *d >= SLOW_TEST_AGE {
+                            warned_slow.insert(db.clone());
+                        }
+                    }
+
+                    // Either the whole run went quiet, or something is dragging.
+                    if quiet >= STALL_CHECK_INTERVAL || slow > 0 {
+                        let queued = outstanding.len() - running.len();
+                        let shown: Vec<String> = running
+                            .iter()
+                            .take(10)
+                            .map(|(d, f, _)| format!("{f} ({}s)", d.as_secs()))
+                            .collect();
+                        eprintln!(
+                            "{} {}; {}/{} done, {} running, {} queued{}{}",
+                            style("[STALLED]").yellow().bold(),
+                            if quiet >= STALL_CHECK_INTERVAL {
+                                format!("no result for {}s", quiet.as_secs())
+                            } else {
+                                format!("{slow} test(s) running over {}s", SLOW_TEST_AGE.as_secs())
+                            },
+                            processed,
+                            total_tests,
+                            running.len(),
+                            queued,
+                            if shown.is_empty() { "" } else { "; longest: " },
+                            shown.join(", ")
+                        );
+                    }
+                }
+            }
         };
         processed += 1;
+        last_result = Instant::now();
+        outstanding.remove(&message.db_name);
 
         let TestResultMessage {
             db_name,
@@ -723,7 +840,7 @@ async fn run_parallel(
         };
 
         if connection_refused && !connection_refused_notified {
-            let _ = drop_tx.send(DropMessage::ConnectionRefused).await;
+            let _ = drop_tx.send(DropMessage::ConnectionRefused);
             connection_refused_notified = true;
         }
 
@@ -738,7 +855,7 @@ async fn run_parallel(
                     .bold()
                 );
             } else {
-                let _ = drop_tx.send(DropMessage::Drop(db_name.clone())).await;
+                let _ = drop_tx.send(DropMessage::Drop(db_name.clone()));
             }
         }
     }
@@ -807,12 +924,14 @@ async fn execution_task(
     concurrency: usize,
     mut job_rx: mpsc::Receiver<TestJob>,
     result_tx: mpsc::Sender<TestResultMessage>,
+    in_flight: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
     engine: EngineConfig,
     config: DBConfig,
     labels: Arc<Vec<String>>,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
+    test_timeout: Option<Duration>,
 ) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut join_set = JoinSet::new();
@@ -824,9 +943,13 @@ async fn execution_task(
         let config = config.clone();
         let labels = Arc::clone(&labels);
         let cancel = cancel.clone();
+        let in_flight = Arc::clone(&in_flight);
 
         join_set.spawn(async move {
             let TestJob { db_name, filename } = job;
+            if let Ok(mut m) = in_flight.lock() {
+                m.insert(db_name.clone(), Instant::now());
+            }
             let mut job_config = config;
             job_config.db = db_name.clone();
 
@@ -839,6 +962,7 @@ async fn execution_task(
                 show_all_errors,
                 cancel,
                 shutdown_timeout,
+                test_timeout,
             )
             .await;
 
@@ -852,6 +976,9 @@ async fn execution_task(
                 result,
             };
 
+            if let Ok(mut m) = in_flight.lock() {
+                m.remove(&message.db_name);
+            }
             let _ = result_tx.send(message).await;
             drop(permit);
         });
@@ -867,7 +994,7 @@ async fn execution_task(
 }
 
 async fn drop_task(
-    mut drop_rx: mpsc::Receiver<DropMessage>,
+    mut drop_rx: mpsc::UnboundedReceiver<DropMessage>,
     engine: EngineConfig,
     config: DBConfig,
 ) -> Result<()> {
@@ -1017,6 +1144,7 @@ async fn run_serial(
         show_discovered_tests: _,
         cancel,
         shutdown_timeout,
+        test_timeout,
     }: RunConfig,
 ) -> Result<()> {
     let mut failed_cases = vec![];
@@ -1035,6 +1163,7 @@ async fn run_serial(
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
+            test_timeout,
         )
         .await;
         stdout().flush()?;
@@ -1320,6 +1449,7 @@ async fn connect_and_run_test_file(
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
+    test_timeout: Option<Duration>,
 ) -> RunResult {
     struct OutputGuard<O: Output>(O);
     impl<O: Output> Drop for OutputGuard<O> {
@@ -1358,6 +1488,17 @@ async fn connect_and_run_test_file(
 
     let begin = Instant::now();
 
+    // A test that never resolves would otherwise hang the entire run: its task
+    // never sends a TestResultMessage, so the receive loop in `run_parallel`
+    // waits forever on a channel whose senders are all still alive.
+    let test_timer = async {
+        match test_timeout {
+            Some(d) => tokio::time::sleep(d).await,
+            // No timeout configured: never fire.
+            None => std::future::pending::<()>().await,
+        }
+    };
+
     // Note: we don't use `CancellationToken::run_until_cancelled` here because it always
     // poll the wrapped future first, while we want cancellation to be more responsive.
     let result = tokio::select! {
@@ -1371,6 +1512,20 @@ async fn connect_and_run_test_file(
             )
             .unwrap();
             RunResult::Cancelled
+        }
+        _ = test_timer => {
+            let secs = test_timeout.map(|d| d.as_secs()).unwrap_or_default();
+            writeln!(
+                out.0,
+                "{} after {} ms",
+                style("[TIMEOUT]").red().bold(),
+                begin.elapsed().as_millis(),
+            )
+            .unwrap();
+            RunResult::Err(anyhow!(
+                "test file {} exceeded --test-timeout of {secs}s",
+                filename.display()
+            ))
         }
         result = run_test_file(&mut out.0, &mut runner, filename.clone(), show_all_errors) => {
             if let Err(err) = &result {
