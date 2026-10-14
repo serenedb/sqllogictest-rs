@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use futures::{pin_mut, StreamExt};
 use pg_interval::Interval;
-use postgres_types::{accepts, FromSql, Kind, ToSql, Type};
+use postgres_types::{accepts, FromSql, Kind, PgLsn, ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
@@ -1324,6 +1324,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::UUID_ARRAY => {
                         array_process!(row, row_vec, idx, UuidValue);
+                    }
+                    Type::PG_LSN => {
+                        single_process!(row, row_vec, idx, PgLsn);
+                    }
+                    Type::PG_LSN_ARRAY => {
+                        array_process!(row, row_vec, idx, PgLsn);
                     }
                     _ if matches!(column.type_().kind(), Kind::Enum(_)) => {
                         single_process!(row, row_vec, idx, EnumValue);
