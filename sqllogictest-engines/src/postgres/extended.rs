@@ -492,6 +492,26 @@ impl fmt::Display for InetValue {
     }
 }
 
+#[derive(Debug)]
+struct Refcursor(String);
+
+impl<'a> FromSql<'a> for Refcursor {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Refcursor(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    accepts!(REFCURSOR);
+}
+
+impl fmt::Display for Refcursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // Composite/record values. The server may send composite either as text
 // (`(f1,f2,...)`) when negotiated, or as PG's binary record format when the
 // client (tokio-postgres by default) requests binary. We handle both: try
@@ -602,7 +622,7 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
             Type::FLOAT8 if bytes.len() == 8 => {
                 return Some(f64::from_be_bytes(bytes.try_into().ok()?).to_string());
             }
-            Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR => {
+            Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR | Type::REFCURSOR => {
                 return Some(std::str::from_utf8(bytes).ok()?.to_string());
             }
             Type::BYTEA => {
@@ -1349,6 +1369,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::INET | Type::CIDR => {
                         single_process!(row, row_vec, idx, InetValue);
+                    }
+                    Type::REFCURSOR => {
+                        single_process!(row, row_vec, idx, Refcursor);
+                    }
+                    Type::REFCURSOR_ARRAY => {
+                        array_process!(row, row_vec, idx, Refcursor);
                     }
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
