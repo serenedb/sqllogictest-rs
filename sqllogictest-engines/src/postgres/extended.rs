@@ -1045,6 +1045,30 @@ impl fmt::Display for Regtype {
     }
 }
 
+struct RegOid(u32);
+
+impl<'a> FromSql<'a> for RegOid {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RegOid(<u32 as FromSql>::from_sql(ty, raw)?))
+    }
+
+    accepts!(
+        REGPROC,
+        REGPROCEDURE,
+        REGOPER,
+        REGOPERATOR,
+        REGCLASS,
+        REGNAMESPACE,
+        REGROLE,
+        REGCONFIG,
+        REGDICTIONARY,
+        REGCOLLATION
+    );
+}
+
 // It's required to use postgres_array::Array instead of Vec.
 // See: https://github.com/rust-postgres/rust-postgres/issues/1186
 macro_rules! array_process {
@@ -1332,6 +1356,30 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::REGTYPE => {
                         single_process!(row, row_vec, idx, Regtype);
+                    }
+                    Type::REGPROC
+                    | Type::REGPROCEDURE
+                    | Type::REGOPER
+                    | Type::REGOPERATOR
+                    | Type::REGCLASS
+                    | Type::REGNAMESPACE
+                    | Type::REGROLE
+                    | Type::REGCONFIG
+                    | Type::REGDICTIONARY
+                    | Type::REGCOLLATION => {
+                        let value: Option<RegOid> = row.get(idx);
+                        match value {
+                            Some(RegOid(oid)) => {
+                                let sql =
+                                    format!("select ($1::oid)::{}::varchar", column.type_().name());
+                                let tmp_rows = self.client()?.query(&sql, &[&oid]).await?;
+                                let text: &str = tmp_rows[0].get(0);
+                                row_vec.push(placeholder_if_empty(text.to_string()));
+                            }
+                            None => {
+                                row_vec.push("NULL".to_string());
+                            }
+                        }
                     }
                     Type::VARCHAR_ARRAY
                     | Type::TEXT_ARRAY
