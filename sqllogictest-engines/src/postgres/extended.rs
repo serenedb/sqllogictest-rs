@@ -512,6 +512,96 @@ impl fmt::Display for Refcursor {
     }
 }
 
+#[derive(Debug)]
+struct TidValue(u32, u16);
+
+impl<'a> FromSql<'a> for TidValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 6 {
+            return Err(format!("invalid tid length {}", raw.len()).into());
+        }
+        Ok(TidValue(
+            u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            u16::from_be_bytes([raw[4], raw[5]]),
+        ))
+    }
+
+    accepts!(TID);
+}
+
+impl fmt::Display for TidValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({},{})", self.0, self.1)
+    }
+}
+
+// int2vector and oidvector travel in the binary array format but print as
+// space-separated numbers.
+#[derive(Debug)]
+struct VectorValue(Vec<String>);
+
+impl<'a> FromSql<'a> for VectorValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let read_i32 = |at: usize| -> std::result::Result<i32, String> {
+            raw.get(at..at + 4)
+                .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                .ok_or_else(|| "truncated vector".to_string())
+        };
+        let ndim = read_i32(0)?;
+        let mut pos = 12usize;
+        let count = if ndim > 0 { read_i32(pos)? as usize } else { 0 };
+        pos += 8 * ndim.max(0) as usize;
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = read_i32(pos)? as usize;
+            pos += 4;
+            let data = raw.get(pos..pos + len).ok_or("truncated vector item")?;
+            pos += len;
+            items.push(if *ty == Type::INT2_VECTOR {
+                i16::from_be_bytes([data[0], data[1]]).to_string()
+            } else {
+                u32::from_be_bytes([data[0], data[1], data[2], data[3]]).to_string()
+            });
+        }
+        Ok(VectorValue(items))
+    }
+
+    accepts!(INT2_VECTOR, OID_VECTOR);
+}
+
+impl fmt::Display for VectorValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.join(" "))
+    }
+}
+
+#[derive(Debug)]
+struct MacaddrValue(Vec<u8>);
+
+impl<'a> FromSql<'a> for MacaddrValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(MacaddrValue(raw.to_vec()))
+    }
+
+    accepts!(MACADDR, MACADDR8);
+}
+
+impl fmt::Display for MacaddrValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let octets: Vec<String> = self.0.iter().map(|b| format!("{b:02x}")).collect();
+        write!(f, "{}", octets.join(":"))
+    }
+}
+
 // Composite/record values. The server may send composite either as text
 // (`(f1,f2,...)`) when negotiated, or as PG's binary record format when the
 // client (tokio-postgres by default) requests binary. We handle both: try
@@ -927,7 +1017,7 @@ impl fmt::Display for Char {
                 write!(f, "{}", self.0 as char)
             }
             0x80..=0xff => {
-                write!(f, "{:o}", self.0)
+                write!(f, "\\{:03o}", self.0)
             }
         }
     }
@@ -1356,6 +1446,21 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::REFCURSOR_ARRAY => {
                         array_process!(row, row_vec, idx, Refcursor);
+                    }
+                    Type::MACADDR | Type::MACADDR8 => {
+                        single_process!(row, row_vec, idx, MacaddrValue);
+                    }
+                    Type::TID => {
+                        single_process!(row, row_vec, idx, TidValue);
+                    }
+                    Type::TID_ARRAY => {
+                        array_process!(row, row_vec, idx, TidValue);
+                    }
+                    Type::INT2_VECTOR | Type::OID_VECTOR => {
+                        single_process!(row, row_vec, idx, VectorValue);
+                    }
+                    Type::MACADDR_ARRAY | Type::MACADDR8_ARRAY => {
+                        array_process!(row, row_vec, idx, MacaddrValue);
                     }
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
