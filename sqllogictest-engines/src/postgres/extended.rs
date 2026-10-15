@@ -707,10 +707,10 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(i64::from_be_bytes(bytes.try_into().ok()?).to_string());
             }
             Type::FLOAT4 if bytes.len() == 4 => {
-                return Some(f32::from_be_bytes(bytes.try_into().ok()?).to_string());
+                return Some(float4_to_str(&f32::from_be_bytes(bytes.try_into().ok()?)));
             }
             Type::FLOAT8 if bytes.len() == 8 => {
-                return Some(f64::from_be_bytes(bytes.try_into().ok()?).to_string());
+                return Some(float8_to_str(&f64::from_be_bytes(bytes.try_into().ok()?)));
             }
             Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR | Type::REFCURSOR => {
                 return Some(std::str::from_utf8(bytes).ok()?.to_string());
@@ -1193,6 +1193,19 @@ fn bytea_to_str(value: &[u8]) -> String {
     result
 }
 
+fn shortest_float_to_str(exponential: String, fixed: String, fixed_below: i32) -> String {
+    let (mantissa, exponent) = exponential
+        .split_once('e')
+        .expect("exponential float formatting has an exponent");
+    let exponent: i32 = exponent.parse().expect("float exponent is a number");
+    if (-4..fixed_below).contains(&exponent) {
+        fixed
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    }
+}
+
 fn float4_to_str(value: &f32) -> String {
     if value.is_nan() {
         "NaN".to_string()
@@ -1201,7 +1214,7 @@ fn float4_to_str(value: &f32) -> String {
     } else if *value == f32::NEG_INFINITY {
         "-Infinity".to_string()
     } else {
-        value.to_string()
+        shortest_float_to_str(format!("{value:e}"), value.to_string(), 6)
     }
 }
 
@@ -1213,7 +1226,7 @@ fn float8_to_str(value: &f64) -> String {
     } else if *value == f64::NEG_INFINITY {
         "-Infinity".to_string()
     } else {
-        value.to_string()
+        shortest_float_to_str(format!("{value:e}"), value.to_string(), 15)
     }
 }
 
@@ -1574,5 +1587,39 @@ mod inet_tests {
     fn rejects_truncated() {
         assert!(InetValue::from_sql(&Type::INET, &[2, 24, 0]).is_err());
         assert!(InetValue::from_sql(&Type::INET, &[2, 24, 0, 4, 192, 168]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+
+    #[test]
+    fn float4_like_postgres() {
+        assert_eq!(float4_to_str(&999999.0), "999999");
+        assert_eq!(float4_to_str(&1e6), "1e+06");
+        assert_eq!(float4_to_str(&-1223768.0), "-1.223768e+06");
+        assert_eq!(float4_to_str(&0.0001), "0.0001");
+        assert_eq!(float4_to_str(&0.00001), "1e-05");
+        assert_eq!(float4_to_str(&1.5), "1.5");
+        assert_eq!(float4_to_str(&-0.0), "-0");
+        assert_eq!(float4_to_str(&3.4e38), "3.4e+38");
+        assert_eq!(float4_to_str(&f32::NAN), "NaN");
+        assert_eq!(float4_to_str(&f32::NEG_INFINITY), "-Infinity");
+    }
+
+    #[test]
+    fn float8_like_postgres() {
+        assert_eq!(float8_to_str(&999999999999999.0), "999999999999999");
+        assert_eq!(float8_to_str(&1e15), "1e+15");
+        assert_eq!(float8_to_str(&1223768.0), "1223768");
+        assert_eq!(float8_to_str(&0.1), "0.1");
+        assert_eq!(float8_to_str(&1.5e-7), "1.5e-07");
+        assert_eq!(float8_to_str(&-0.0), "-0");
+        assert_eq!(
+            float8_to_str(&1.7976931348623157e308),
+            "1.7976931348623157e+308"
+        );
+        assert_eq!(float8_to_str(&f64::INFINITY), "Infinity");
     }
 }
