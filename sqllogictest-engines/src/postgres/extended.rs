@@ -672,6 +672,39 @@ impl fmt::Display for MacaddrValue {
     }
 }
 
+#[derive(Debug)]
+struct MoneyValue(i64);
+
+impl<'a> FromSql<'a> for MoneyValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let cents: [u8; 8] = raw
+            .try_into()
+            .map_err(|_| format!("invalid money length {}", raw.len()))?;
+        Ok(MoneyValue(i64::from_be_bytes(cents)))
+    }
+
+    accepts!(MONEY);
+}
+
+impl fmt::Display for MoneyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cents = self.0.unsigned_abs();
+        let units = (cents / 100).to_string();
+        let mut grouped = String::with_capacity(units.len() + units.len() / 3);
+        for (i, digit) in units.chars().enumerate() {
+            if i > 0 && (units.len() - i) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(digit);
+        }
+        let sign = if self.0 < 0 { "-" } else { "" };
+        write!(f, "{sign}${grouped}.{:02}", cents % 100)
+    }
+}
+
 // Composite/record values. The server may send composite either as text
 // (`(f1,f2,...)`) when negotiated, or as PG's binary record format when the
 // client (tokio-postgres by default) requests binary. We handle both: try
@@ -831,6 +864,17 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
             }
             Type::INET | Type::CIDR => {
                 return InetValue::from_sql(&t, bytes).ok().map(|v| v.0);
+            }
+            Type::TID => {
+                return TidValue::from_sql(&t, bytes).ok().map(|v| v.to_string());
+            }
+            Type::MONEY => {
+                return MoneyValue::from_sql(&t, bytes).ok().map(|v| v.to_string());
+            }
+            Type::MACADDR | Type::MACADDR8 => {
+                return MacaddrValue::from_sql(&t, bytes)
+                    .ok()
+                    .map(|v| v.to_string());
             }
             Type::RECORD => {
                 return parse_record_binary(bytes);
@@ -1562,6 +1606,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::MACADDR_ARRAY | Type::MACADDR8_ARRAY => {
                         array_process!(row, row_vec, idx, MacaddrValue);
+                    }
+                    Type::MONEY => {
+                        single_process!(row, row_vec, idx, MoneyValue);
+                    }
+                    Type::MONEY_ARRAY => {
+                        array_process!(row, row_vec, idx, MoneyValue);
                     }
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
