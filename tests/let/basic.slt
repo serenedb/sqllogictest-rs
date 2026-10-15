@@ -20,7 +20,7 @@ select_pair hello 123
 query TT
 select $name, $value
 ----
-hello 123
+hello	123
 
 # Override an existing variable
 let id

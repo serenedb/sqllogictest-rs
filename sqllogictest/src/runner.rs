@@ -1,6 +1,7 @@
 //! Sqllogictest runner.
 
-use std::collections::{BTreeMap, HashSet};
+use futures::executor::block_on;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Output};
@@ -9,18 +10,25 @@ use std::time::Duration;
 use std::vec;
 
 use async_trait::async_trait;
-use futures::executor::block_on;
-use futures::{stream, Future, FutureExt, StreamExt};
 use itertools::Itertools;
+
+// Only for testing
+#[cfg(any(test, feature = "testing"))]
+fn block_on_tokio<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(fut)
+}
 use md5::Digest;
 use owo_colors::OwoColorize;
-use rand::Rng;
 use similar::{Change, ChangeTag, TextDiff};
 use tempfile::TempDir;
 
 use crate::parser::*;
 use crate::substitution::Substitution;
-use crate::{ColumnType, Connections, MakeConnection};
+use crate::{ColumnType, Connection as ConnectionName, Connections, MakeConnection};
 
 /// Type-erased error type.
 type AnyError = Arc<dyn std::error::Error + Send + Sync>;
@@ -46,7 +54,7 @@ pub enum RecordOutput<T: ColumnType> {
     /// The output of a `query`.
     Query {
         types: Vec<T>,
-        rows: Vec<Vec<String>>,
+        rows: Vec<Vec<String>>, // inner vector - columns items
         error: Option<AnyError>,
     },
     /// The output of a `statement`.
@@ -133,6 +141,10 @@ pub trait AsyncDB {
     fn error_sql_state(_err: &Self::Error) -> Option<String> {
         None
     }
+
+    fn is_connection_error(_err: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// The database to be tested.
@@ -156,6 +168,10 @@ pub trait DB {
     /// Extract the SQL state from the error.
     fn error_sql_state(_err: &Self::Error) -> Option<String> {
         None
+    }
+
+    fn is_connection_error(_err: &Self::Error) -> bool {
+        false
     }
 }
 
@@ -183,6 +199,10 @@ where
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         D::error_sql_state(err)
     }
+
+    fn is_connection_error(err: &Self::Error) -> bool {
+        D::is_connection_error(err)
+    }
 }
 
 /// The error type for running sqllogictest.
@@ -200,6 +220,24 @@ impl TestError {
         TestErrorDisplay {
             err: self,
             colorize,
+        }
+    }
+    pub fn new_composite(reasons: Vec<TestErrorKind>, locations: Vec<Location>) -> TestError {
+        assert!(reasons.len() == locations.len());
+        assert!(!locations.is_empty());
+
+        let mut chain: Option<Arc<Location>> = None;
+
+        for mut loc in locations.into_iter().rev() {
+            if let Some(parent) = chain {
+                loc.add_next_location(parent);
+            }
+            chain = Some(Arc::new(loc));
+        }
+
+        TestError {
+            kind: Box::new(TestErrorKind::CompositeMismatch { kinds: reasons }),
+            loc: Arc::as_ref(chain.as_ref().expect("Locations are not empty")).clone(),
         }
     }
 }
@@ -360,6 +398,10 @@ pub enum TestErrorKind {
         expected: String,
         actual: String,
     },
+    #[error("Multiple record mismatches ({} errors)\n", kinds.len())]
+    CompositeMismatch { kinds: Vec<TestErrorKind> },
+    #[error("retry configuration substitution failed: {variable}\n{err}")]
+    RetrySubstitutionFailure { variable: String, err: AnyError },
     #[error("let failed: {err}\n[SQL] {sql}")]
     LetFail { sql: String, err: LetError },
 }
@@ -453,6 +495,19 @@ impl Display for TestErrorKindDisplay<'_> {
                         .format_with("\n", |diff, f|{ format_diff(&diff, f, true)})
                 )
             }
+            TestErrorKind::CompositeMismatch { kinds } => {
+                writeln!(f, "Multiple record mismatches ({} errors)", kinds.len())?;
+                // ("Multiple record mismatches ({} errors)", kinds.len());
+                let mut first = true;
+                for x in kinds {
+                    if !first {
+                        write!(f, "\n\n")?;
+                    }
+                    first = false;
+                    write!(f, "{}", x.display(self.colorize))?;
+                }
+                writeln!(f)
+            }
             _ => write!(f, "{}", self.error),
         }
     }
@@ -523,10 +578,16 @@ fn format_column_diff(expected: &str, actual: &str, colorize: bool) -> String {
 /// By default, the ([`default_normalizer`]) will be used to normalize values.
 pub type Normalizer = fn(s: &String) -> String;
 
-/// Trim and replace multiple whitespaces with one.
+/// Trim and replace multiple whitespaces with single tab.
 #[allow(clippy::ptr_arg)]
 pub fn default_normalizer(s: &String) -> String {
-    s.trim().split_ascii_whitespace().join(" ")
+    s.trim().split_ascii_whitespace().join("\t")
+}
+
+/// Just trim. We expected strict format with tab-separated columns.
+#[allow(clippy::ptr_arg)]
+pub fn trim_normalizer(s: &String) -> String {
+    s.trim().to_string()
 }
 
 /// Validator will be used by [`Runner`] to validate the output.
@@ -546,45 +607,30 @@ pub fn default_validator(
     const IGNORE_MARKER: &str = "<slt:ignore>";
     let contains_ignore_marker = expected.iter().any(|line| line.contains(IGNORE_MARKER));
 
-    // Normalize expected lines.
-    // If ignore marker present, perform fragment-based matching on the full snapshot.
+    // If ignore marker present, match row-by-row when the row counts line up so an
+    // ignored cell can't match a repeated fragment on an adjacent row; otherwise
+    // (an actual value contains \n, so it isn't a normal row) match the full snapshot.
     if contains_ignore_marker {
-        // If ignore marker present, perform fragment-based matching on the full snapshot.
-        // The actual results might contain \n, and may not be a normal "row", which is not suitable to normalize.
-        let expected_results = expected;
         let actual_rows = actual
             .iter()
-            .map(|strs| strs.iter().join(" "))
+            .map(|strs| strs.iter().join("\t"))
             .collect_vec();
-
-        let expected_snapshot = expected_results.join("\n");
-        let actual_snapshot = actual_rows.join("\n");
-        let fragments: Vec<&str> = expected_snapshot.split(IGNORE_MARKER).collect();
-        let mut pos = 0;
-        for frag in fragments {
-            if frag.is_empty() {
-                continue;
-            }
-            if let Some(idx) = actual_snapshot[pos..].find(frag) {
-                pos += idx + frag.len();
-            } else {
-                tracing::error!(
-                    "mismatch at: {}\nexpected: {}\nactual: {}",
-                    pos,
-                    frag,
-                    &actual_snapshot[pos..]
-                );
-                return false;
-            }
+        if expected.len() == actual_rows.len() {
+            return expected
+                .iter()
+                .zip(actual_rows.iter())
+                .all(|(e, a)| match_with_ignore_marker(e, a));
         }
-        return true;
+        let expected_snapshot = expected.join("\n");
+        let actual_snapshot = actual_rows.join("\n");
+        return match_with_ignore_marker(&expected_snapshot, &actual_snapshot);
     }
 
     let expected_results = expected.iter().map(normalizer).collect_vec();
     // Default, we compare normalized results. Whitespace characters are ignored.
     let normalized_rows = actual
         .iter()
-        .map(|strs| strs.iter().map(normalizer).join(" "))
+        .map(|strs| strs.iter().map(normalizer).join("\t"))
         .collect_vec();
 
     normalized_rows == expected_results
@@ -636,21 +682,54 @@ pub fn default_partitioner(_file_name: &str) -> bool {
     true
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct RunnerLocals {
     /// The temporary directory. Test cases can use `__TEST_DIR__` to refer to this directory.
     /// Lazily initialized and cleaned up when dropped.
-    test_dir: OnceLock<TempDir>,
+    test_dir: Arc<OnceLock<TempDir>>,
     /// Runtime variables for substitution.
     variables: BTreeMap<String, String>,
 }
 
 impl RunnerLocals {
+    fn test_dir_handle(&self) -> &TempDir {
+        self.test_dir.get_or_init(|| {
+            let dir = TempDir::new().expect("failed to create testdir");
+            // When the runner and the database server run in separate containers,
+            // server-side ops (COPY TO/FROM, ATTACH) write into __TEST_DIR__ as a
+            // different uid. SLT_TEST_DIR_SHARED relaxes the dir to 0777 so any uid
+            // sharing the mount can use it; TempDir's default 0700 would deny them.
+            #[cfg(unix)]
+            if std::env::var_os("SLT_TEST_DIR_SHARED").is_some() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777))
+                    .expect("failed to relax testdir permissions");
+            }
+            dir
+        })
+    }
+
     pub fn test_dir(&self) -> String {
-        let test_dir = self
-            .test_dir
-            .get_or_init(|| TempDir::new().expect("failed to create testdir"));
-        test_dir.path().to_string_lossy().into_owned()
+        self.test_dir_handle().path().to_string_lossy().into_owned()
+    }
+
+    /// A short alphanumeric token unique to this runner instance (derived from the
+    /// random temp-dir name), stable for the whole run. DuckDB derives an attached
+    /// database's name from the file basename only, ignoring the directory, so the
+    /// same test re-run against a shared server (e.g. once per engine) would reuse
+    /// the basename and collide ("database already exists"). Embedding `__RUN_ID__`
+    /// in the file name makes the derived name unique per run.
+    pub fn run_id(&self) -> String {
+        self.test_dir_handle()
+            .path()
+            .file_name()
+            .map(|name| {
+                name.to_string_lossy()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn set_var(&mut self, key: String, value: String) {
@@ -666,101 +745,408 @@ impl RunnerLocals {
     }
 }
 
-/// Sqllogictest runner.
-pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
-    conn: Connections<D, M>,
+pub struct CheckOptions<D: AsyncDB> {
     // validator is used for validate if the result of query equals to expected.
     validator: Validator,
     // normalizer is used to normalize the result text
     normalizer: Normalizer,
     column_type_validator: ColumnTypeValidator<D::ColumnType>,
-    partitioner: Arc<dyn Partitioner>,
-    substitution_on: bool,
     sort_mode: Option<SortMode>,
     result_mode: Option<ResultMode>,
     /// 0 means never hashing
     hash_threshold: usize,
-    /// Labels for condition `skipif` and `onlyif`.
-    labels: HashSet<String>,
-    /// Local variables/context for the runner.
-    locals: RunnerLocals,
+    show_column_names: bool,
+    flat_values: bool,
+    /// When true, all statement/query/system records are treated as async
+    /// without needing `async` on each one.
+    always_async: bool,
+    /// Maximum number of concurrently executing async tasks.
+    /// Controlled by `control max-async-connections N` (0 resets to the default of 10).
+    max_async_connections: usize,
 }
 
-impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
-    /// Create a new test runner on the database, with the given connection maker.
-    ///
-    /// See [`MakeConnection`] for more details.
-    pub fn new(make_conn: M) -> Self {
-        Runner {
-            validator: default_validator,
-            normalizer: default_normalizer,
-            column_type_validator: default_column_validator,
-            partitioner: Arc::new(default_partitioner),
-            substitution_on: false,
-            sort_mode: None,
-            result_mode: None,
-            hash_threshold: 0,
-            labels: HashSet::new(),
-            conn: Connections::new(make_conn),
-            locals: RunnerLocals::default(),
+impl<D: AsyncDB> Clone for CheckOptions<D> {
+    fn clone(&self) -> Self {
+        Self {
+            validator: self.validator,
+            normalizer: self.normalizer,
+            column_type_validator: self.column_type_validator,
+            sort_mode: self.sort_mode,
+            result_mode: self.result_mode,
+            hash_threshold: self.hash_threshold,
+            show_column_names: self.show_column_names,
+            flat_values: self.flat_values,
+            always_async: self.always_async,
+            max_async_connections: self.max_async_connections,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RunVariables {
+    /// Labels for condition `skipif` and `onlyif`.
+    labels: HashSet<String>,
+    /// Local variables/context for the task.
+    locals: RunnerLocals,
+    substitution_on: bool,
+}
+
+/// Substitute the input SQL or command with [`Substitution`], if enabled by `control
+/// substitution`.
+///
+/// If `subst_env_vars`, we will use the `subst` crate to support extensive substitutions, incl.
+/// `$NAME`, `${NAME}`, `${NAME:default}`. The cost is that we will have to use escape
+/// characters, e.g., `\$` & `\\`.
+///
+/// Otherwise, we just do simple string substitution for `__TEST_DIR__` and `__NOW__`.
+/// This is useful for `system` commands: The shell can do the environment variables, and we can
+/// write strings like `\n` without escaping.
+fn may_substitute(
+    vars: &RunVariables,
+    input: String,
+    subst_env_vars: bool,
+) -> Result<String, AnyError> {
+    if vars.substitution_on {
+        Substitution::new(&vars.locals, subst_env_vars)
+            .substitute(&input)
+            .map_err(|e| Arc::new(e) as AnyError)
+    } else {
+        Ok(input)
+    }
+}
+
+const DEFAULT_MAX_ASYNC_CONNECTIONS: usize = 10;
+
+/// Resolve retry attempts and backoff from a `RetryConfig`, substituting any env-var references.
+///
+/// Returns `(1, Duration::ZERO)` when no retry config is present or when resolution fails,
+/// so callers always get a safe default (one attempt, no sleep).
+fn resolve_retry_params(retry: &Option<RetryConfig>, vars: &RunVariables) -> (usize, Duration) {
+    let Some(rc) = retry else {
+        return (1, Duration::ZERO);
+    };
+    let attempts = match &rc.attempts {
+        RetryAttempts::Count(n) => *n,
+        RetryAttempts::EnvVar(var) => may_substitute(vars, var.clone(), true)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1),
+    };
+    let backoff = match &rc.backoff {
+        RetryBackoff::Duration(d) => *d,
+        RetryBackoff::EnvVar(var) => may_substitute(vars, var.clone(), true)
+            .ok()
+            .and_then(|s| humantime::parse_duration(&s).ok())
+            .unwrap_or(Duration::ZERO),
+    };
+    (attempts, backoff)
+}
+
+fn resolve_retry(
+    retry: &RetryConfig,
+    vars: &RunVariables,
+    loc: &Location,
+) -> Result<(usize, Duration), TestError> {
+    let attempts = match &retry.attempts {
+        RetryAttempts::Count(n) => *n,
+        RetryAttempts::EnvVar(var) => {
+            let resolved = may_substitute(vars, var.clone(), true).map_err(|e| {
+                TestErrorKind::RetrySubstitutionFailure {
+                    variable: var.clone(),
+                    err: e,
+                }
+                .at(loc.clone())
+            })?;
+
+            let count = resolved.parse::<usize>().map_err(|_| {
+                TestErrorKind::ParseError(ParseErrorKind::InvalidNumber(resolved.clone()))
+                    .at(loc.clone())
+            })?;
+
+            if count == 0 {
+                return Err(
+                    TestErrorKind::ParseError(ParseErrorKind::InvalidRetryConfig(
+                        "attempt must be greater than 0".to_string(),
+                    ))
+                    .at(loc.clone()),
+                );
+            }
+
+            count
+        }
+    };
+
+    let backoff = match &retry.backoff {
+        RetryBackoff::Duration(d) => *d,
+        RetryBackoff::EnvVar(var) => {
+            let resolved = may_substitute(vars, var.clone(), true).map_err(|e| {
+                TestErrorKind::RetrySubstitutionFailure {
+                    variable: var.clone(),
+                    err: e,
+                }
+                .at(loc.clone())
+            })?;
+
+            humantime::parse_duration(&resolved).map_err(|_| {
+                TestErrorKind::ParseError(ParseErrorKind::InvalidDuration(resolved)).at(loc.clone())
+            })?
+        }
+    };
+
+    Ok((attempts, backoff))
+}
+
+fn is_connection_failure<D: AsyncDB>(err: &TestError) -> bool {
+    match err.kind() {
+        TestErrorKind::Fail { err, .. } | TestErrorKind::ErrorMismatch { err, .. } => err
+            .downcast_ref::<D::Error>()
+            .is_some_and(D::is_connection_error),
+        _ => false,
+    }
+}
+
+pub struct TaskContext<D: AsyncDB> {
+    vars: RunVariables,
+    check_options: CheckOptions<D>,
+}
+
+pub struct ConnectionTask<D: AsyncDB> {
+    conn: Option<D>,
+    context: TaskContext<D>,
+    /// Connection-time error to propagate as a query/statement error.
+    /// Set when connection establishment fails, allowing `query error` /
+    /// `statement error` records to match the connection error.
+    pending_error: Option<AnyError>,
+}
+
+/// Sqllogictest runner.
+pub struct Runner<D: AsyncDB, M: MakeConnection<Conn = D>> {
+    conn: Connections<D, M>,
+    partitioner: Arc<dyn Partitioner>,
+    check_options: CheckOptions<D>,
+    vars: RunVariables,
+}
+
+async fn acquire_permit(
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) -> tokio::sync::OwnedSemaphorePermit {
+    Arc::clone(semaphore)
+        .acquire_owned()
+        .await
+        .expect("semaphore closed")
+}
+
+fn escape(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    rows.iter_mut().for_each(|row| {
+        row.iter_mut().for_each(|cell| {
+            *cell = cell.replace("\\", "\\\\");
+
+            *cell = cell
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+        });
+    });
+    rows
+}
+
+/// Process raw query rows: strip header, sort, flatten, hash, and escape.
+/// `sort_mode` should already be the merged value (record-level `.or(runner-level)`).
+fn process_query_rows(
+    mut rows: Vec<Vec<String>>,
+    sort_mode: Option<SortMode>,
+    show_column_names: bool,
+    flat_values: bool,
+    hash_threshold: usize,
+    num_types: usize,
+) -> Vec<Vec<String>> {
+    let mut column_names_present = true;
+    if !show_column_names {
+        rows = rows[1..].into();
+        column_names_present = false;
+    }
+    if column_names_present && flat_values {
+        rows = rows[1..].into();
+        column_names_present = false;
+    }
+
+    let mut value_sort = false;
+    match sort_mode {
+        None | Some(SortMode::NoSort) => {}
+        Some(SortMode::RowSort) => {
+            // TODO(mkornaukhov) all protocols except from Postgres one should
+            // return column names by default
+            if column_names_present {
+                assert!(!rows.is_empty());
+                rows[1..].sort_unstable();
+            } else {
+                rows.sort_unstable();
+            }
+        }
+        Some(SortMode::ValueSort) => {
+            if column_names_present {
+                // Column names are useless
+                rows = rows[1..].into();
+            }
+            rows = rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|s| vec![s.to_owned()])
+                .collect();
+            rows.sort_unstable();
+            value_sort = true;
         }
     }
 
-    /// Add a label for condition `skipif` and `onlyif`.
-    pub fn add_label(&mut self, label: &str) {
-        self.labels.insert(label.to_string());
+    if !value_sort && flat_values {
+        rows = rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|s| vec![s.to_owned()])
+            .collect();
     }
 
-    /// Set a local variable for substitution.
-    pub fn set_var(&mut self, key: String, value: String) {
-        self.locals.set_var(key, value);
+    let num_values = if value_sort || flat_values {
+        rows.len()
+    } else {
+        rows.len() * num_types
+    };
+
+    if hash_threshold > 0 && num_values > hash_threshold {
+        let mut md5 = md5::Md5::new();
+        for line in &rows {
+            for value in line {
+                md5.update(value.as_bytes());
+                md5.update(b"\n");
+            }
+        }
+        let hash = format!("{:2x}", md5.finalize());
+        rows = vec![vec![format!(
+            "{} values hashing to {}",
+            rows.len() * rows[0].len(),
+            hash
+        )]];
     }
 
-    pub fn with_normalizer(&mut self, normalizer: Normalizer) {
-        self.normalizer = normalizer;
-    }
-    pub fn with_validator(&mut self, validator: Validator) {
-        self.validator = validator;
+    escape(rows)
+}
+
+impl<D: AsyncDB> ConnectionTask<D> {
+    /// Compare processed query rows (or an error) against the expected outcome.
+    /// `rows` must already be processed and escaped via [`process_query_rows`].
+    fn compare_query_result(
+        &self,
+        sql: String,
+        loc: Location,
+        types: &Vec<D::ColumnType>,
+        rows: &[Vec<String>],
+        error: Option<Arc<dyn std::error::Error + Send + Sync>>,
+        expected: QueryExpect<D::ColumnType>,
+    ) -> Result<(), TestError> {
+        match (error, expected) {
+            (None, QueryExpect::Error(_)) => {
+                return Err(TestErrorKind::Ok {
+                    sql,
+                    kind: RecordKind::Query,
+                }
+                .at(loc));
+            }
+            (Some(e), QueryExpect::Error(expected_error)) => {
+                let sqlstate = e
+                    .downcast_ref::<D::Error>()
+                    .and_then(|concrete_err| D::error_sql_state(concrete_err));
+                if !expected_error.is_match(&e.to_string(), sqlstate.as_deref()) {
+                    return Err(TestErrorKind::ErrorMismatch {
+                        sql,
+                        err: e,
+                        expected_err: expected_error.to_string(),
+                        kind: RecordKind::Query,
+                        actual_sqlstate: sqlstate,
+                    }
+                    .at(loc));
+                }
+            }
+            (Some(e), QueryExpect::Results { .. }) => {
+                return Err(TestErrorKind::Fail {
+                    sql,
+                    err: e,
+                    kind: RecordKind::Query,
+                }
+                .at(loc));
+            }
+            (
+                None,
+                QueryExpect::Results {
+                    types: expected_types,
+                    results: expected_results,
+                    ..
+                },
+            ) => {
+                if !(self.context.check_options.column_type_validator)(types, &expected_types) {
+                    return Err(TestErrorKind::QueryResultColumnsMismatch {
+                        sql,
+                        expected: expected_types.iter().map(|c| c.to_char()).join(""),
+                        actual: types.iter().map(|c| c.to_char()).join(""),
+                    }
+                    .at(loc));
+                }
+
+                let actual_results = match self.context.check_options.result_mode {
+                    Some(ResultMode::ValueWise) => rows
+                        .iter()
+                        .flat_map(|strs| strs.iter())
+                        .map(|str| vec![str.to_string()])
+                        .collect_vec(),
+                    // default to rowwise
+                    _ => rows.to_vec(),
+                };
+
+                if !(self.context.check_options.validator)(
+                    self.context.check_options.normalizer,
+                    &actual_results,
+                    &expected_results,
+                ) {
+                    let output_rows = rows.iter().map(|strs| strs.iter().join("\t")).collect_vec();
+                    let expected_snapshot = expected_results.join("\n");
+                    let actual_snapshot = output_rows.join("\n");
+                    let actual = if contains_ignore_marker(&expected_snapshot) {
+                        align_with_ignore_marker_checked(&expected_snapshot, &actual_snapshot)
+                    } else {
+                        actual_snapshot
+                    };
+                    return Err(TestErrorKind::QueryResultMismatch {
+                        sql,
+                        expected: expected_snapshot,
+                        actual,
+                    }
+                    .at(loc));
+                }
+            }
+        }
+        Ok(())
     }
 
-    pub fn with_column_validator(&mut self, validator: ColumnTypeValidator<D::ColumnType>) {
-        self.column_type_validator = validator;
-    }
-
-    /// Set the partitioner for the runner. Only files that match the partitioner will be run.
-    ///
-    /// This only takes effect when running tests in parallel.
-    pub fn with_partitioner(&mut self, partitioner: impl Partitioner + 'static) {
-        self.partitioner = Arc::new(partitioner);
-    }
-
-    pub fn with_hash_threshold(&mut self, hash_threshold: usize) {
-        self.hash_threshold = hash_threshold;
-    }
-
-    /// Helper to run a SQL query with common setup (substitution, connection, skip check).
     async fn run_query_inner(
         &mut self,
         sql: &str,
-        connection: Connection,
         conditions: &[Condition],
         should_skip: &impl Fn(&HashSet<String>, &str, &[Condition]) -> bool,
     ) -> QueryResult<D::ColumnType> {
-        let sql = match self.may_substitute(sql.to_string(), true) {
+        let sql = match may_substitute(&self.context.vars, sql.to_string(), true) {
             Ok(sql) => sql,
             Err(error) => return QueryResult::Err(error),
         };
 
-        let conn = match self.conn.get(connection).await {
-            Ok(conn) => conn,
-            Err(e) => return QueryResult::Err(Arc::new(e)),
-        };
-
-        if should_skip(&self.labels, conn.engine_name(), conditions) {
+        if should_skip(
+            &self.context.vars.labels,
+            self.conn.as_ref().unwrap().engine_name(),
+            conditions,
+        ) {
             return QueryResult::Skipped;
         }
 
-        match conn.run(&sql).await {
+        match self.conn.as_mut().unwrap().run(&sql).await {
             Ok(DBOutput::Rows { types, rows }) => QueryResult::Rows { types, rows },
             Ok(DBOutput::StatementComplete(count)) => QueryResult::StatementComplete(count),
             Err(e) => QueryResult::Err(Arc::new(e)),
@@ -789,18 +1175,61 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             })
         }
 
+        // If connection establishment failed, propagate it as a query/statement error so
+        // `query error` / `statement error` records can match connection-time failures
+        // (e.g., TLS handshake errors when connecting with sslmode=require to a plain port).
+        // Clone rather than take: retry loops call apply_record multiple times, and conn
+        // stays None across attempts, so later attempts would hit an unwrap panic below.
+        if let Some(err) = self.pending_error.clone() {
+            return match record {
+                Record::Statement { conditions, .. } => {
+                    if should_skip(&self.context.vars.labels, "", &conditions) {
+                        RecordOutput::Nothing
+                    } else {
+                        RecordOutput::Statement {
+                            count: 0,
+                            error: Some(err),
+                        }
+                    }
+                }
+                Record::Query { conditions, .. } => {
+                    if should_skip(&self.context.vars.labels, "", &conditions) {
+                        RecordOutput::Nothing
+                    } else {
+                        RecordOutput::Query {
+                            types: vec![],
+                            rows: vec![],
+                            error: Some(err),
+                        }
+                    }
+                }
+                Record::Let { conditions, .. } => {
+                    if should_skip(&self.context.vars.labels, "", &conditions) {
+                        RecordOutput::Nothing
+                    } else {
+                        RecordOutput::Let {
+                            values: vec![],
+                            error: Some(LetError::Fail(err)),
+                        }
+                    }
+                }
+                _ => RecordOutput::Nothing,
+            };
+        }
+
         match record {
             Record::Statement {
                 conditions,
-                connection,
+                connection: _,
                 sql,
 
                 // compare result in run_async
                 expected: _,
                 loc: _,
                 retry: _,
+                exec_async: _,
             } => {
-                let sql = match self.may_substitute(sql, true) {
+                let sql = match may_substitute(&self.context.vars, sql, true) {
                     Ok(sql) => sql,
                     Err(error) => {
                         return RecordOutput::Statement {
@@ -810,25 +1239,20 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     }
                 };
 
-                let conn = match self.conn.get(connection).await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        return RecordOutput::Statement {
-                            count: 0,
-                            error: Some(Arc::new(e)),
-                        }
-                    }
-                };
-                if should_skip(&self.labels, conn.engine_name(), &conditions) {
+                if should_skip(
+                    &self.context.vars.labels,
+                    self.conn.as_ref().unwrap().engine_name(),
+                    &conditions,
+                ) {
                     return RecordOutput::Nothing;
                 }
 
-                let ret = conn.run(&sql).await;
+                let ret = self.conn.as_mut().unwrap().run(&sql).await;
                 match ret {
                     Ok(out) => match out {
                         DBOutput::Rows { types, rows } => RecordOutput::Query {
                             types,
-                            rows,
+                            rows: escape(rows),
                             error: None,
                         },
                         DBOutput::StatementComplete(count) => {
@@ -847,12 +1271,13 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 loc: _,
                 stdout: expected_stdout,
                 retry: _,
+                exec_async: _,
             } => {
-                if should_skip(&self.labels, "", &conditions) {
+                if should_skip(&self.context.vars.labels, "", &conditions) {
                     return RecordOutput::Nothing;
                 }
 
-                let mut command = match self.may_substitute(command, false) {
+                let mut command = match may_substitute(&self.context.vars, command, false) {
                     Ok(command) => command,
                     Err(error) => {
                         return RecordOutput::System {
@@ -941,119 +1366,110 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
             Record::Query {
                 conditions,
-                connection,
+                connection: _,
                 sql,
 
                 // compare result in run_async
                 expected,
                 loc: _,
                 retry: _,
+                exec_async: _,
             } => {
-                let (types, mut rows) = match self
-                    .run_query_inner(&sql, connection, &conditions, &should_skip)
-                    .await
-                {
-                    QueryResult::Rows { types, rows } => (types, rows),
-                    QueryResult::StatementComplete(count) => {
-                        return RecordOutput::Statement { count, error: None };
-                    }
-                    QueryResult::Skipped => return RecordOutput::Nothing,
-                    QueryResult::Err(e) => {
-                        return RecordOutput::Query {
-                            error: Some(e),
-                            types: vec![],
-                            rows: vec![],
-                        };
-                    }
-                };
+                let (types, rows) =
+                    match self.run_query_inner(&sql, &conditions, &should_skip).await {
+                        QueryResult::Rows { types, rows } => (types, rows),
+                        QueryResult::StatementComplete(count) => {
+                            return RecordOutput::Statement { count, error: None };
+                        }
+                        QueryResult::Skipped => return RecordOutput::Nothing,
+                        QueryResult::Err(e) => {
+                            return RecordOutput::Query {
+                                error: Some(e),
+                                types: vec![],
+                                rows: vec![],
+                            };
+                        }
+                    };
 
-                let sort_mode = match expected {
-                    QueryExpect::Results { sort_mode, .. } => sort_mode,
+                let sort_mode = match &expected {
+                    QueryExpect::Results { sort_mode, .. } => *sort_mode,
                     QueryExpect::Error(_) => None,
                 }
-                .or(self.sort_mode);
+                .or(self.context.check_options.sort_mode);
 
-                let mut value_sort = false;
-                match sort_mode {
-                    None | Some(SortMode::NoSort) => {}
-                    Some(SortMode::RowSort) => {
-                        rows.sort_unstable();
-                    }
-                    Some(SortMode::ValueSort) => {
-                        rows = rows
-                            .iter()
-                            .flat_map(|row| row.iter())
-                            .map(|s| vec![s.to_owned()])
-                            .collect();
-                        rows.sort_unstable();
-                        value_sort = true;
-                    }
-                };
-
-                let num_values = if value_sort {
-                    rows.len()
-                } else {
-                    rows.len() * types.len()
-                };
-
-                if self.hash_threshold > 0 && num_values > self.hash_threshold {
-                    let mut md5 = md5::Md5::new();
-                    for line in &rows {
-                        for value in line {
-                            md5.update(value.as_bytes());
-                            md5.update(b"\n");
-                        }
-                    }
-                    let hash = format!("{:2x}", md5.finalize());
-                    rows = vec![vec![format!(
-                        "{} values hashing to {}",
-                        rows.len() * rows[0].len(),
-                        hash
-                    )]];
-                }
-
+                let num_types = types.len();
                 RecordOutput::Query {
                     error: None,
                     types,
-                    rows,
+                    rows: process_query_rows(
+                        rows,
+                        sort_mode,
+                        self.context.check_options.show_column_names,
+                        self.context.check_options.flat_values,
+                        self.context.check_options.hash_threshold,
+                        num_types,
+                    ),
                 }
             }
             Record::Sleep { duration, .. } => {
                 D::sleep(duration).await;
                 RecordOutput::Nothing
             }
+            Record::Print { text, .. } => {
+                println!("{text}");
+                RecordOutput::Nothing
+            }
             Record::Control(control) => {
                 match control {
                     Control::SortMode(sort_mode) => {
-                        self.sort_mode = Some(sort_mode);
+                        self.context.check_options.sort_mode = Some(sort_mode);
                     }
                     Control::ResultMode(result_mode) => {
-                        self.result_mode = Some(result_mode);
+                        self.context.check_options.result_mode = Some(result_mode);
                     }
-                    Control::Substitution(on_off) => self.substitution_on = on_off,
+                    Control::Substitution(on_off) => self.context.vars.substitution_on = on_off,
+                    Control::AlwaysAsync(on_off) => {
+                        self.context.check_options.always_async = on_off
+                    }
+                    Control::MaxAsyncConnections(n) => {
+                        self.context.check_options.max_async_connections = if n == 0 {
+                            DEFAULT_MAX_ASYNC_CONNECTIONS
+                        } else {
+                            n
+                        };
+                    }
                 }
 
                 RecordOutput::Nothing
             }
             Record::HashThreshold { loc: _, threshold } => {
-                self.hash_threshold = threshold as usize;
+                self.context.check_options.hash_threshold = threshold as usize;
+                RecordOutput::Nothing
+            }
+            Record::ShowColumnNames { loc: _, value } => {
+                self.context.check_options.show_column_names = value;
+                RecordOutput::Nothing
+            }
+            Record::FlatValues { loc: _, value } => {
+                self.context.check_options.flat_values = value;
                 RecordOutput::Nothing
             }
             Record::Halt { loc: _ } => {
                 tracing::error!("halt record encountered. It's likely a bug of the runtime.");
                 RecordOutput::Nothing
             }
+            Record::Wait { loc: _ } => {
+                tracing::error!("wait record encountered outside of run_multi_records. It's likely a bug of the runtime.");
+                RecordOutput::Nothing
+            }
             Record::Let {
                 conditions,
-                connection,
+                connection: _,
                 variables,
                 sql,
                 loc: _,
             } => {
-                let rows = match self
-                    .run_query_inner(&sql, connection, &conditions, &should_skip)
-                    .await
-                {
+                let rows = match self.run_query_inner(&sql, &conditions, &should_skip).await {
                     QueryResult::Rows { rows, .. } => rows,
                     QueryResult::StatementComplete(_) => {
                         #[derive(thiserror::Error, Debug)]
@@ -1096,7 +1512,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
 
                 // Set variables in locals
                 for (var, value) in variables.iter().zip(row.iter()) {
-                    self.locals.set_var(var.clone(), value.clone());
+                    self.context.vars.locals.set_var(var.clone(), value.clone());
                 }
 
                 RecordOutput::Let {
@@ -1114,39 +1530,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         }
     }
 
-    /// Run a single record.
-    pub async fn run_async(
-        &mut self,
-        record: Record<D::ColumnType>,
-    ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        let retry = match &record {
-            Record::Statement { retry, .. } => retry.clone(),
-            Record::Query { retry, .. } => retry.clone(),
-            Record::System { retry, .. } => retry.clone(),
-            _ => None,
-        };
-        if retry.is_none() {
-            return self.run_async_no_retry(record).await;
-        }
-
-        // Retry for `retry.attempts` times. The parser ensures that `retry.attempts` must > 0.
-        let retry = retry.unwrap();
-        let mut last_error = None;
-        for _ in 0..retry.attempts {
-            let result = self.run_async_no_retry(record.clone()).await;
-            if result.is_ok() {
-                return result;
-            }
-            tracing::warn!(target:"sqllogictest::retry", backoff = ?retry.backoff, error = ?result, "retrying");
-            D::sleep(retry.backoff).await;
-            last_error = result.err();
-        }
-
-        Err(last_error.unwrap())
-    }
-
-    /// Run a single record without retry.
-    async fn run_async_no_retry(
+    async fn run_record_async_no_retry(
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
@@ -1212,6 +1596,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     sql,
                     expected,
                     retry: _,
+                    exec_async: _,
                 },
                 RecordOutput::Statement { count, error },
             ) => match (error, expected) {
@@ -1265,79 +1650,20 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     sql,
                     expected,
                     retry: _,
+                    exec_async: _,
                 },
                 RecordOutput::Query { types, rows, error },
             ) => {
-                match (error, expected) {
-                    (None, QueryExpect::Error(_)) => {
-                        return Err(TestErrorKind::Ok {
-                            sql,
-                            kind: RecordKind::Query,
-                        }
-                        .at(loc));
-                    }
-                    (Some(e), QueryExpect::Error(expected_error)) => {
-                        let sqlstate = e
-                            .downcast_ref::<D::Error>()
-                            .and_then(|concrete_err| D::error_sql_state(concrete_err));
-                        if !expected_error.is_match(&e.to_string(), sqlstate.as_deref()) {
-                            return Err(TestErrorKind::ErrorMismatch {
-                                sql,
-                                err: Arc::clone(e),
-                                expected_err: expected_error.to_string(),
-                                kind: RecordKind::Query,
-                                actual_sqlstate: sqlstate,
-                            }
-                            .at(loc));
-                        }
-                    }
-                    (Some(e), QueryExpect::Results { .. }) => {
-                        return Err(TestErrorKind::Fail {
-                            sql,
-                            err: Arc::clone(e),
-                            kind: RecordKind::Query,
-                        }
-                        .at(loc));
-                    }
-                    (
-                        None,
-                        QueryExpect::Results {
-                            types: expected_types,
-                            results: expected_results,
-                            ..
-                        },
-                    ) => {
-                        if !(self.column_type_validator)(types, &expected_types) {
-                            return Err(TestErrorKind::QueryResultColumnsMismatch {
-                                sql,
-                                expected: expected_types.iter().map(|c| c.to_char()).join(""),
-                                actual: types.iter().map(|c| c.to_char()).join(""),
-                            }
-                            .at(loc));
-                        }
-
-                        let actual_results = match self.result_mode {
-                            Some(ResultMode::ValueWise) => rows
-                                .iter()
-                                .flat_map(|strs| strs.iter())
-                                .map(|str| vec![str.to_string()])
-                                .collect_vec(),
-                            // default to rowwise
-                            _ => rows.clone(),
-                        };
-
-                        if !(self.validator)(self.normalizer, &actual_results, &expected_results) {
-                            let output_rows =
-                                rows.iter().map(|strs| strs.iter().join(" ")).collect_vec();
-                            return Err(TestErrorKind::QueryResultMismatch {
-                                sql,
-                                expected: expected_results.join("\n"),
-                                actual: output_rows.join("\n"),
-                            }
-                            .at(loc));
-                        }
-                    }
-                };
+                self.compare_query_result(
+                    sql,
+                    loc,
+                    types,
+                    rows,
+                    error
+                        .clone()
+                        .map(|e| e as Arc<dyn std::error::Error + Send + Sync>),
+                    expected,
+                )?;
             }
             (
                 Record::System {
@@ -1346,6 +1672,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                     command,
                     stdout: expected_stdout,
                     retry: _,
+                    exec_async: _,
                 },
                 RecordOutput::System {
                     error,
@@ -1391,31 +1718,515 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         Ok(result)
     }
 
-    /// Run a single record.
-    ///
-    /// Returns the output of the record if successful.
-    pub fn run(
+    pub async fn run_record(
         &mut self,
         record: Record<D::ColumnType>,
     ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        futures::executor::block_on(self.run_async(record))
+        let (retry, loc) = match &record {
+            Record::Statement { retry, loc, .. } => (retry.clone(), loc.clone()),
+            Record::Query { retry, loc, .. } => (retry.clone(), loc.clone()),
+            Record::System { retry, loc, .. } => (retry.clone(), loc.clone()),
+            _ => return self.run_record_async_no_retry(record).await,
+        };
+
+        let Some(retry) = retry else {
+            return self.run_record_async_no_retry(record).await;
+        };
+
+        let (attempts, backoff) = resolve_retry(&retry, &self.context.vars, &loc)?;
+
+        // Retry for `attempts` times
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            let result = self.run_record_async_no_retry(record.clone()).await;
+            if result.is_ok() {
+                return result;
+            }
+            tracing::warn!(
+                target: "sqllogictest::retry",
+                attempt = attempt + 1,
+                attempts,
+                backoff = ?backoff,
+                error = ?result,
+                "retrying"
+            );
+            D::sleep(backoff).await;
+            last_error = result.err();
+        }
+
+        Err(last_error.unwrap())
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_record_test(
+        &mut self,
+        record: Record<D::ColumnType>,
+    ) -> Result<RecordOutput<D::ColumnType>, TestError> {
+        block_on_tokio(self.run_record(record))
+    }
+}
+
+impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
+    /// Create a new test runner on the database, with the given connection maker.
+    ///
+    /// See [`MakeConnection`] for more details.
+    pub fn new(make_conn: M) -> Self {
+        Runner {
+            partitioner: Arc::new(default_partitioner),
+            conn: Connections::new(make_conn),
+            check_options: CheckOptions {
+                validator: default_validator,
+                normalizer: default_normalizer,
+                column_type_validator: default_column_validator,
+                sort_mode: None,
+                result_mode: None,
+                hash_threshold: 0,
+                show_column_names: true,
+                flat_values: false,
+                always_async: false,
+                max_async_connections: DEFAULT_MAX_ASYNC_CONNECTIONS,
+            },
+            vars: RunVariables {
+                labels: HashSet::new(),
+                locals: RunnerLocals::default(),
+                substitution_on: false,
+            },
+        }
+    }
+
+    /// Add a label for condition `skipif` and `onlyif`.
+    pub fn add_label(&mut self, label: &str) {
+        self.vars.labels.insert(label.to_string());
+    }
+
+    /// Set a local variable for substitution.
+    pub fn set_var(&mut self, key: String, value: String) {
+        self.vars.locals.set_var(key, value);
+    }
+
+    pub fn with_normalizer(&mut self, normalizer: Normalizer) {
+        self.check_options.normalizer = normalizer;
+    }
+    pub fn with_validator(&mut self, validator: Validator) {
+        self.check_options.validator = validator;
+    }
+
+    pub fn with_column_validator(&mut self, validator: ColumnTypeValidator<D::ColumnType>) {
+        self.check_options.column_type_validator = validator;
+    }
+
+    /// Set the partitioner for the runner. Only files that match the partitioner will be run.
+    ///
+    /// This only takes effect when running tests in parallel.
+    pub fn with_partitioner(&mut self, partitioner: impl Partitioner + 'static) {
+        self.partitioner = Arc::new(partitioner);
+    }
+
+    pub fn with_hash_threshold(&mut self, hash_threshold: usize) {
+        self.check_options.hash_threshold = hash_threshold;
+    }
+
+    pub fn with_show_column_names(&mut self, show_column_names: bool) {
+        self.check_options.show_column_names = show_column_names;
+    }
+
+    pub fn with_flat_values(&mut self, flat_values: bool) {
+        self.check_options.flat_values = flat_values;
+    }
+
+    /// Run a single record, acquiring and returning a connection as needed.
+    ///
+    /// Returns the raw [`RecordOutput`] without comparing it against any expected value.
+    /// Useful for update modes that rewrite expected values based on actual output.
+    pub async fn run_record(
+        &mut self,
+        record: Record<D::ColumnType>,
+    ) -> RecordOutput<D::ColumnType> {
+        let maybe_conn_name = match &record {
+            Record::Statement { connection, .. }
+            | Record::Query { connection, .. }
+            | Record::Let { connection, .. } => Some(connection.clone()),
+            _ => None,
+        };
+
+        let mut task = if let Some(ref conn_name) = maybe_conn_name {
+            match self.conn.get(conn_name.clone()).await {
+                Ok(conn) => ConnectionTask {
+                    conn: Some(conn),
+                    context: TaskContext {
+                        vars: self.vars.clone(),
+                        check_options: self.check_options.clone(),
+                    },
+                    pending_error: None,
+                },
+                Err(e) => ConnectionTask {
+                    conn: None,
+                    context: TaskContext {
+                        vars: self.vars.clone(),
+                        check_options: self.check_options.clone(),
+                    },
+                    pending_error: Some(Arc::new(e)),
+                },
+            }
+        } else {
+            ConnectionTask {
+                conn: None,
+                context: TaskContext {
+                    vars: self.vars.clone(),
+                    check_options: self.check_options.clone(),
+                },
+                pending_error: None,
+            }
+        };
+
+        let output = task.apply_record(record).await;
+        self.vars = task.context.vars.clone();
+        self.check_options = task.context.check_options.clone();
+        // Return connection to pool
+        if let (Some(conn_name), Some(conn)) = (maybe_conn_name, task.conn) {
+            self.conn.add(conn_name, conn);
+        }
+        output
+    }
+
+    /// Get the named connection from `pending` (if an in-flight task exists for it, wait for it
+    /// first) or from the connection pool (creating one if needed), with optional retry.
+    async fn get_or_resume_named_conn(
+        &mut self,
+        conn_name: ConnectionName,
+        pending: &mut HashMap<
+            ConnectionName,
+            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
+        >,
+        loc: &Location,
+        sql: &str,
+        retry: &Option<RetryConfig>,
+    ) -> Result<ConnectionTask<D>, TestError>
+    where
+        D: Send + 'static,
+    {
+        if let Some(handle) = pending.remove(&conn_name) {
+            tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
+            let mut task = handle
+                .await
+                .expect("Background task panicked or was aborted")?;
+            task.context.vars = self.vars.clone();
+            task.context.check_options = self.check_options.clone();
+            Ok(task)
+        } else {
+            let (attempts, backoff) = resolve_retry_params(retry, &self.vars);
+            let mut last_err = None;
+            let mut conn_opt = None;
+            for attempt in 0..attempts {
+                match self.conn.get(conn_name.clone()).await {
+                    Ok(c) => {
+                        conn_opt = Some(c);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "sqllogictest::retry",
+                            attempt = attempt + 1,
+                            attempts,
+                            backoff = ?backoff,
+                            "retrying connection"
+                        );
+                        last_err = Some(e);
+                        if attempt + 1 < attempts {
+                            D::sleep(backoff).await;
+                        }
+                    }
+                }
+            }
+            let conn = conn_opt.ok_or_else(|| TestError {
+                loc: loc.clone(),
+                kind: Box::new(TestErrorKind::Fail {
+                    sql: sql.to_owned(),
+                    err: Arc::new(last_err.unwrap()),
+                    kind: RecordKind::Statement,
+                }),
+            })?;
+            Ok(ConnectionTask {
+                conn: Some(conn),
+                context: TaskContext {
+                    vars: self.vars.clone(),
+                    check_options: self.check_options.clone(),
+                },
+                pending_error: None,
+            })
+        }
+    }
+
+    /// Drain all in-flight named and anonymous async tasks, returning connections to the pool.
+    async fn drain_all_pending(
+        &mut self,
+        pending: &mut HashMap<
+            ConnectionName,
+            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
+        >,
+        anon_pending: &mut Vec<tokio::task::JoinHandle<Result<(), TestError>>>,
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        for (name, handle) in pending.drain() {
+            tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
+            let task = handle
+                .await
+                .expect("Background task panicked or was aborted")?;
+            tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
+            self.conn.add(name, task.conn.unwrap());
+        }
+        for handle in anon_pending.drain(..) {
+            handle
+                .await
+                .expect("Background task panicked or was aborted")?;
+        }
+        Ok(())
     }
 
     /// Run multiple records.
     ///
     /// The runner will stop early once a halt record is seen.
     ///
-    /// To acquire the result of each record, manually call `run_async` for each record instead.
-    pub async fn run_multi_async(
+    /// Records with the `async` flag are dispatched and run concurrently with subsequent records.
+    /// A `wait` record (or end of input) awaits all pending `async` tasks and returns connections
+    /// to the pool.
+    ///
+    /// Records that do not need a connection (e.g. `system`, `control`) are run with `conn = None`.
+    pub async fn run_multi_records(
         &mut self,
         records: impl IntoIterator<Item = Record<D::ColumnType>>,
-    ) -> Result<(), TestError> {
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        let mut semaphore: Arc<tokio::sync::Semaphore> = Arc::new(tokio::sync::Semaphore::new(
+            self.check_options.max_async_connections,
+        ));
+
+        // exec_async named tasks in-flight, keyed by connection name.
+        let mut pending: HashMap<
+            ConnectionName,
+            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
+        > = HashMap::new();
+
+        // exec_async anonymous tasks in-flight (System or connectionless records).
+        let mut anon_pending: Vec<tokio::task::JoinHandle<Result<(), TestError>>> = Vec::new();
+
         for record in records.into_iter() {
             if let Record::Halt { .. } = record {
                 break;
             }
-            self.run_async(record).await?;
+
+            // Wait drains all in-flight tasks before continuing.
+            if let Record::Wait { .. } = record {
+                self.drain_all_pending(&mut pending, &mut anon_pending)
+                    .await?;
+                continue;
+            }
+
+            let is_exec_async = match &record {
+                Record::Statement { exec_async, .. }
+                | Record::Query { exec_async, .. }
+                | Record::System { exec_async, .. } => {
+                    *exec_async || self.check_options.always_async
+                }
+                _ => false,
+            };
+
+            match record {
+                // ── Statement / Query ────────────────────────────────────────────────────
+                Record::Statement {
+                    ref connection,
+                    ref sql,
+                    ref loc,
+                    ref retry,
+                    ..
+                }
+                | Record::Query {
+                    ref connection,
+                    ref sql,
+                    ref loc,
+                    ref retry,
+                    ..
+                } => {
+                    let conn_name = connection.clone();
+
+                    if is_exec_async {
+                        match &conn_name {
+                            ConnectionName::Named { .. } => {
+                                // Explicitly named connection: wait for any in-flight task on it,
+                                // then spawn the new async task tracked under the same name.
+                                let mut task = self
+                                    .get_or_resume_named_conn(
+                                        conn_name.clone(),
+                                        &mut pending,
+                                        loc,
+                                        sql,
+                                        retry,
+                                    )
+                                    .await?;
+                                let permit = acquire_permit(&semaphore).await;
+                                let handle = tokio::spawn(async move {
+                                    let _permit = permit;
+                                    task.run_record(record).await?;
+                                    Ok(task)
+                                });
+                                pending.insert(conn_name, handle);
+                            }
+                            ConnectionName::Default => {
+                                // No explicit connection: create a fresh anonymous connection.
+                                let conn = self.conn.make_new().await.map_err(|e| TestError {
+                                    loc: loc.clone(),
+                                    kind: Box::new(TestErrorKind::Fail {
+                                        sql: sql.clone(),
+                                        err: Arc::new(e),
+                                        kind: RecordKind::Statement,
+                                    }),
+                                })?;
+                                let mut task = ConnectionTask {
+                                    conn: Some(conn),
+                                    context: TaskContext {
+                                        vars: self.vars.clone(),
+                                        check_options: self.check_options.clone(),
+                                    },
+                                    pending_error: None,
+                                };
+                                let permit = acquire_permit(&semaphore).await;
+                                let handle = tokio::spawn(async move {
+                                    let _permit = permit;
+                                    task.run_record(record).await.map(|_| ())
+                                });
+                                anon_pending.push(handle);
+                            }
+                        }
+                    } else {
+                        let (attempts, backoff) = match retry {
+                            Some(rc) => resolve_retry(rc, &self.vars, loc)?,
+                            None => (1, Duration::ZERO),
+                        };
+                        let mut last_error = None;
+                        for attempt in 0..attempts {
+                            let mut task = match self
+                                .get_or_resume_named_conn(
+                                    conn_name.clone(),
+                                    &mut pending,
+                                    loc,
+                                    sql,
+                                    &None,
+                                )
+                                .await
+                            {
+                                Ok(task) => task,
+                                Err(conn_err) => match conn_err.kind() {
+                                    TestErrorKind::Fail { err, .. } => ConnectionTask {
+                                        conn: None,
+                                        context: TaskContext {
+                                            vars: self.vars.clone(),
+                                            check_options: self.check_options.clone(),
+                                        },
+                                        pending_error: Some(err),
+                                    },
+                                    _ => return Err(conn_err),
+                                },
+                            };
+                            let result = task.run_record_async_no_retry(record.clone()).await;
+                            self.vars = task.context.vars.clone();
+                            self.check_options = task.context.check_options.clone();
+                            match result {
+                                Ok(_) => {
+                                    if let Some(conn) = task.conn {
+                                        self.conn.add(conn_name.clone(), conn);
+                                    }
+                                    last_error = None;
+                                    break;
+                                }
+                                Err(err) => {
+                                    if let Some(conn) = task.conn {
+                                        if is_connection_failure::<D>(&err) {
+                                            drop(conn);
+                                        } else {
+                                            self.conn.add(conn_name.clone(), conn);
+                                        }
+                                    }
+                                    if attempt + 1 < attempts {
+                                        tracing::warn!(
+                                            target: "sqllogictest::retry",
+                                            attempt = attempt + 1,
+                                            attempts,
+                                            backoff = ?backoff,
+                                            error = ?err,
+                                            "retrying"
+                                        );
+                                        D::sleep(backoff).await;
+                                    }
+                                    last_error = Some(err);
+                                }
+                            }
+                        }
+                        if let Some(err) = last_error {
+                            return Err(err);
+                        }
+                    }
+                }
+
+                // ── Let ──────────────────────────────────────────────────────────────────
+                // Let has no exec_async; always runs synchronously on its connection.
+                Record::Let {
+                    ref connection,
+                    ref sql,
+                    ref loc,
+                    ..
+                } => {
+                    let conn_name = connection.clone();
+                    let mut task = self
+                        .get_or_resume_named_conn(conn_name.clone(), &mut pending, loc, sql, &None)
+                        .await?;
+                    task.run_record(record).await?;
+                    self.vars = task.context.vars.clone();
+                    self.check_options = task.context.check_options.clone();
+                    self.conn.add(conn_name, task.conn.unwrap());
+                }
+
+                // ── System ───────────────────────────────────────────────────────────────
+                // System has no connection field; async tasks go into anon_pending.
+                _ => {
+                    let mut task = ConnectionTask {
+                        conn: None,
+                        context: TaskContext {
+                            vars: self.vars.clone(),
+                            check_options: self.check_options.clone(),
+                        },
+                        pending_error: None,
+                    };
+                    if is_exec_async {
+                        let permit = acquire_permit(&semaphore).await;
+                        let handle = tokio::spawn(async move {
+                            let _permit = permit;
+                            task.run_record(record).await.map(|_| ())
+                        });
+                        anon_pending.push(handle);
+                    } else {
+                        task.run_record(record).await?;
+                        self.vars = task.context.vars;
+                        let old_limit = self.check_options.max_async_connections;
+                        self.check_options = task.context.check_options;
+                        // Resync the semaphore if max_async_connections changed (e.g. via a
+                        // `control max-async-connections` record).  No tasks are in-flight when
+                        // a control record is processed so it is safe to replace the semaphore.
+                        if self.check_options.max_async_connections != old_limit {
+                            semaphore = Arc::new(tokio::sync::Semaphore::new(
+                                self.check_options.max_async_connections,
+                            ));
+                        }
+                    }
+                }
+            }
         }
+
+        self.drain_all_pending(&mut pending, &mut anon_pending)
+            .await?;
         Ok(())
     }
 
@@ -1424,314 +2235,77 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     /// The runner will stop early once a halt record is seen.
     ///
     /// To acquire the result of each record, manually call `run` for each record instead.
-    pub fn run_multi(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_multi_test(
         &mut self,
         records: impl IntoIterator<Item = Record<D::ColumnType>>,
-    ) -> Result<(), TestError> {
-        block_on(self.run_multi_async(records))
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        block_on_tokio(self.run_multi_records(records))
     }
 
     /// Run a sqllogictest script.
-    pub async fn run_script_async(&mut self, script: &str) -> Result<(), TestError> {
+    pub async fn run_script(&mut self, script: &str) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         let records = parse(script).expect("failed to parse sqllogictest");
-        self.run_multi_async(records).await
+        self.run_multi_records(records).await
     }
 
     /// Run a sqllogictest script with a given script name.
-    pub async fn run_script_with_name_async(
+    pub async fn run_script_with_name(
         &mut self,
         script: &str,
         name: impl Into<Arc<str>>,
-    ) -> Result<(), TestError> {
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         let records = parse_with_name(script, name).expect("failed to parse sqllogictest");
-        self.run_multi_async(records).await
+        self.run_multi_records(records).await
     }
 
     /// Run a sqllogictest file.
-    pub async fn run_file_async(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError> {
+    pub async fn run_file(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
         let records = parse_file(filename)?;
-        self.run_multi_async(records).await
+        self.run_multi_records(records).await
     }
 
     /// Run a sqllogictest script.
-    pub fn run_script(&mut self, script: &str) -> Result<(), TestError> {
-        block_on(self.run_script_async(script))
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_script_test(&mut self, script: &str) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        block_on_tokio(self.run_script(script))
     }
 
     /// Run a sqllogictest script with a given script name.
-    pub fn run_script_with_name(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_script_with_name_test(
         &mut self,
         script: &str,
         name: impl Into<Arc<str>>,
-    ) -> Result<(), TestError> {
-        block_on(self.run_script_with_name_async(script, name))
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        block_on_tokio(self.run_script_with_name(script, name))
     }
 
     /// Run a sqllogictest file.
-    pub fn run_file(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError> {
-        block_on(self.run_file_async(filename))
-    }
-
-    /// accept the tasks, spawn jobs task to run slt test. the tasks are (AsyncDB, slt filename)
-    /// pairs.
-    // TODO: This is not a good interface, as the `make_conn` passed to `new` is unused but we
-    // accept a new `conn_builder` here. May change `MakeConnection` to support specifying the
-    // database name in the future.
-    pub async fn run_parallel_async<Fut>(
-        &mut self,
-        glob: &str,
-        hosts: Vec<String>,
-        conn_builder: fn(String, String) -> Fut,
-        jobs: usize,
-    ) -> Result<(), ParallelTestError>
+    #[cfg(any(test, feature = "testing"))]
+    pub fn run_file_test(&mut self, filename: impl AsRef<Path>) -> Result<(), TestError>
     where
-        Fut: Future<Output = D>,
+        D: Send + 'static,
     {
-        let files = glob::glob(glob).expect("failed to read glob pattern");
-        let mut tasks = vec![];
-
-        for (idx, file) in files.enumerate() {
-            // for every slt file, we create a database against table conflict
-            let file = file.unwrap();
-            let filename = file.to_str().expect("not a UTF-8 filename");
-
-            // Skip files that don't match the partitioner.
-            if !self.partitioner.matches(filename) {
-                continue;
-            }
-
-            let db_name = filename.replace([' ', '.', '-', '/'], "_");
-
-            self.conn
-                .run_default(&format!("CREATE DATABASE {db_name};"))
-                .await
-                .expect("create db failed");
-            let target = hosts[idx % hosts.len()].clone();
-
-            let mut locals = RunnerLocals::default();
-            locals.set_var("__DATABASE__".to_owned(), db_name.clone());
-
-            let mut tester = Runner {
-                conn: Connections::new(move || {
-                    conn_builder(target.clone(), db_name.clone()).map(Ok)
-                }),
-                validator: self.validator,
-                normalizer: self.normalizer,
-                column_type_validator: self.column_type_validator,
-                partitioner: self.partitioner.clone(),
-                substitution_on: self.substitution_on,
-                sort_mode: self.sort_mode,
-                result_mode: self.result_mode,
-                hash_threshold: self.hash_threshold,
-                labels: self.labels.clone(),
-                locals,
-            };
-
-            tasks.push(async move {
-                let filename = file.to_string_lossy().to_string();
-                tester.run_file_async(filename).await
-            })
-        }
-
-        let tasks = stream::iter(tasks).buffer_unordered(jobs);
-        let errors: Vec<_> = tasks
-            .filter_map(|result| async { result.err() })
-            .collect()
-            .await;
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(ParallelTestError { errors })
-        }
-    }
-
-    /// sync version of `run_parallel_async`
-    pub fn run_parallel<Fut>(
-        &mut self,
-        glob: &str,
-        hosts: Vec<String>,
-        conn_builder: fn(String, String) -> Fut,
-        jobs: usize,
-    ) -> Result<(), ParallelTestError>
-    where
-        Fut: Future<Output = D>,
-    {
-        block_on(self.run_parallel_async(glob, hosts, conn_builder, jobs))
-    }
-
-    /// Substitute the input SQL or command with [`Substitution`], if enabled by `control
-    /// substitution`.
-    ///
-    /// If `subst_env_vars`, we will use the `subst` crate to support extensive substitutions, incl.
-    /// `$NAME`, `${NAME}`, `${NAME:default}`. The cost is that we will have to use escape
-    /// characters, e.g., `\$` & `\\`.
-    ///
-    /// Otherwise, we just do simple string substitution for `__TEST_DIR__` and `__NOW__`.
-    /// This is useful for `system` commands: The shell can do the environment variables, and we can
-    /// write strings like `\n` without escaping.
-    fn may_substitute(&self, input: String, subst_env_vars: bool) -> Result<String, AnyError> {
-        if self.substitution_on {
-            Substitution::new(&self.locals, subst_env_vars)
-                .substitute(&input)
-                .map_err(|e| Arc::new(e) as AnyError)
-        } else {
-            Ok(input)
-        }
-    }
-
-    /// Updates a test file with the output produced by a Database. It is an utility function
-    /// wrapping [`update_test_file_with_runner`].
-    ///
-    /// Specifically, it will create `"{filename}.temp"` to buffer the updated records and then
-    /// override the original file with it.
-    ///
-    /// Some other notes:
-    /// - empty lines at the end of the file are cleaned.
-    /// - `halt` and `include` are correctly handled.
-    pub async fn update_test_file(
-        &mut self,
-        filename: impl AsRef<Path>,
-        col_separator: &str,
-        validator: Validator,
-        normalizer: Normalizer,
-        column_type_validator: ColumnTypeValidator<D::ColumnType>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        use std::path::PathBuf;
-
-        use fs_err::{File, OpenOptions};
-
-        fn create_outfile(filename: impl AsRef<Path>) -> std::io::Result<(PathBuf, File)> {
-            let filename = filename.as_ref();
-            let outfilename = format!(
-                "{}{:010}{}",
-                filename.file_name().unwrap().to_str().unwrap().to_owned(),
-                rand::thread_rng().gen_range(0..10_000_000),
-                ".temp"
-            );
-            let outfilename = filename.parent().unwrap().join(outfilename);
-            // create a temp file in read-write mode
-            let outfile = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .open(&outfilename)?;
-            Ok((outfilename, outfile))
-        }
-
-        fn override_with_outfile(
-            filename: &String,
-            outfilename: &PathBuf,
-            outfile: &mut File,
-        ) -> std::io::Result<()> {
-            // check whether outfile ends with multiple newlines, which happens if
-            // - the last record is statement/query
-            // - the original file ends with multiple newlines
-
-            const N: usize = 8;
-            let mut buf = [0u8; N];
-            loop {
-                outfile.seek(SeekFrom::End(-(N as i64))).unwrap();
-                outfile.read_exact(&mut buf).unwrap();
-                let num_newlines = buf.iter().rev().take_while(|&&b| b == b'\n').count();
-                assert!(num_newlines > 0);
-
-                if num_newlines > 1 {
-                    // if so, remove the last ones
-                    outfile
-                        .set_len(outfile.metadata().unwrap().len() - num_newlines as u64 + 1)
-                        .unwrap();
-                }
-
-                if num_newlines == 1 || num_newlines < N {
-                    break;
-                }
-            }
-
-            outfile.flush()?;
-            fs_err::rename(outfilename, filename)?;
-
-            Ok(())
-        }
-
-        struct Item {
-            filename: String,
-            outfilename: PathBuf,
-            outfile: File,
-            halt: bool,
-        }
-
-        let filename = filename.as_ref();
-        let records = parse_file(filename)?;
-
-        let (outfilename, outfile) = create_outfile(filename)?;
-        let mut stack = vec![Item {
-            filename: filename.to_string_lossy().to_string(),
-            outfilename,
-            outfile,
-            halt: false,
-        }];
-
-        for record in records {
-            let Item {
-                filename,
-                outfilename,
-                outfile,
-                halt,
-            } = stack.last_mut().unwrap();
-
-            match &record {
-                Record::Injected(Injected::BeginInclude(filename)) => {
-                    let (outfilename, outfile) = create_outfile(filename)?;
-                    stack.push(Item {
-                        filename: filename.clone(),
-                        outfilename,
-                        outfile,
-                        halt: false,
-                    });
-                }
-                Record::Injected(Injected::EndInclude(_)) => {
-                    override_with_outfile(filename, outfilename, outfile)?;
-                    stack.pop();
-                }
-                _ => {
-                    if *halt {
-                        writeln!(outfile, "{record}")?;
-                        continue;
-                    }
-                    if matches!(record, Record::Halt { .. }) {
-                        *halt = true;
-                        writeln!(outfile, "{record}")?;
-                        tracing::info!(
-                            "halt record found, all following records will be written AS IS"
-                        );
-                        continue;
-                    }
-                    let record_output = self.apply_record(record.clone()).await;
-                    let record = update_record_with_output(
-                        &record,
-                        &record_output,
-                        col_separator,
-                        validator,
-                        normalizer,
-                        column_type_validator,
-                    )
-                    .unwrap_or(record);
-                    writeln!(outfile, "{record}")?;
-                }
-            }
-        }
-
-        let Item {
-            filename,
-            outfilename,
-            outfile,
-            halt: _,
-        } = stack.last_mut().unwrap();
-        override_with_outfile(filename, outfilename, outfile)?;
-
-        Ok(())
+        block_on_tokio(self.run_file(filename))
     }
 }
 
@@ -1748,6 +2322,19 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     }
 }
 
+/// Mode for updating test files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateMode {
+    /// Update files with actual output, preserving original formatting when content matches.
+    Override,
+    /// Update files with actual output, normalizing formatting even when content matches.
+    OverrideWithFormat,
+    /// Reformat files without running queries.
+    Format,
+    /// When a test fails, prepend a skipif directive with the given label and reason.
+    SkipFailed { label: String, reason: String },
+}
+
 /// Updates the specified [`Record`] with the [`QueryOutput`] produced
 /// by a Database, returning `Some(new_record)`.
 ///
@@ -1759,7 +2346,13 @@ pub fn update_record_with_output<T: ColumnType>(
     validator: Validator,
     normalizer: Normalizer,
     column_type_validator: ColumnTypeValidator<T>,
+    update_mode: &UpdateMode,
 ) -> Option<Record<T>> {
+    let force_override = matches!(update_mode, UpdateMode::OverrideWithFormat);
+    let skip_failed = match update_mode {
+        UpdateMode::SkipFailed { label, reason } => Some((label.as_str(), reason.as_str())),
+        _ => None,
+    };
     match (record.clone(), record_output) {
         (_, RecordOutput::Nothing) => None,
         // statement, query
@@ -1771,6 +2364,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 expected: mut expected @ (StatementExpect::Ok | StatementExpect::Count(_)),
                 retry,
+                exec_async,
             },
             RecordOutput::Query {
                 error: None, rows, ..
@@ -1794,6 +2388,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 expected,
                 retry,
+                exec_async,
             })
         }
         // query, statement
@@ -1805,16 +2400,32 @@ pub fn update_record_with_output<T: ColumnType>(
                 connection,
                 expected: _,
                 retry,
+                exec_async,
             },
             RecordOutput::Statement { error: None, count },
-        ) => Some(Record::Statement {
-            sql,
-            loc,
-            conditions,
-            connection,
-            expected: StatementExpect::Count(*count),
-            retry,
-        }),
+        ) => {
+            if *count > 0 {
+                tracing::warn!(
+                    "DB returned StatementComplete({}) for a Query record; preserving Query with empty results",
+                    count
+                );
+            }
+            Some(Record::Query {
+                sql,
+                loc,
+                conditions,
+                connection,
+                expected: QueryExpect::Results {
+                    results: Vec::new(),
+                    types: Vec::new(),
+                    sort_mode: None,
+                    result_mode: None,
+                    label: None,
+                },
+                retry,
+                exec_async,
+            })
+        }
         // statement, statement
         (
             Record::Statement {
@@ -1824,44 +2435,93 @@ pub fn update_record_with_output<T: ColumnType>(
                 sql,
                 expected,
                 retry,
+                exec_async,
             },
             RecordOutput::Statement { count, error },
         ) => match (error, expected) {
             // Ok
-            (None, expected) => Some(Record::Statement {
-                sql,
-                loc,
-                conditions,
-                connection,
-                expected: match expected {
-                    StatementExpect::Count(_) => StatementExpect::Count(*count),
-                    StatementExpect::Error(_) | StatementExpect::Ok => StatementExpect::Ok,
-                },
-                retry,
-            }),
+            (None, expected) => {
+                // If we expected an error but got success, add skipif in skip_failed mode
+                if matches!(expected, StatementExpect::Error(_)) {
+                    if let Some((label, reason)) = skip_failed {
+                        let mut new_conditions = conditions.clone();
+                        new_conditions.insert(
+                            0,
+                            Condition::SkipIf {
+                                label: label.to_string(),
+                                comments: vec![format!("# {}", reason)],
+                            },
+                        );
+                        return Some(Record::Statement {
+                            sql,
+                            expected,
+                            loc,
+                            conditions: new_conditions,
+                            connection,
+                            retry,
+                            exec_async,
+                        });
+                    }
+                }
+                Some(Record::Statement {
+                    sql,
+                    loc,
+                    conditions,
+                    connection,
+                    expected: match expected {
+                        StatementExpect::Count(_) => StatementExpect::Count(*count),
+                        StatementExpect::Error(_) | StatementExpect::Ok => StatementExpect::Ok,
+                    },
+                    retry,
+                    exec_async,
+                })
+            }
             // Error match
             (Some(e), StatementExpect::Error(expected_error))
                 if expected_error.is_match(&e.to_string(), None) =>
             {
                 None
             }
-            // Error mismatch, update expected error
+            // Error mismatch, update expected error or prepend skipif
             (Some(e), r) => {
-                let reference = match &r {
-                    StatementExpect::Error(e) => Some(e),
-                    StatementExpect::Count(_) | StatementExpect::Ok => None,
-                };
-                Some(Record::Statement {
-                    sql,
-                    expected: StatementExpect::Error(ExpectedError::from_actual_error(
-                        reference,
-                        &e.to_string(),
-                    )),
-                    loc,
-                    conditions,
-                    connection,
-                    retry,
-                })
+                if let Some((label, reason)) = skip_failed {
+                    // Prepend skipif directive
+                    let mut new_conditions = conditions.clone();
+                    new_conditions.insert(
+                        0,
+                        Condition::SkipIf {
+                            label: label.to_string(),
+                            comments: vec![format!("# {}", reason)],
+                        },
+                    );
+                    Some(Record::Statement {
+                        sql,
+                        expected: r,
+                        loc,
+                        conditions: new_conditions,
+                        connection,
+                        retry,
+                        exec_async,
+                    })
+                } else {
+                    // Original behavior: update expected error
+                    let reference = match &r {
+                        StatementExpect::Error(e) => Some(e),
+                        StatementExpect::Count(_) | StatementExpect::Ok => None,
+                    };
+                    Some(Record::Statement {
+                        sql,
+                        expected: StatementExpect::Error(ExpectedError::from_actual_error(
+                            reference,
+                            &e.to_string(),
+                        )),
+                        loc,
+                        conditions,
+                        connection,
+                        retry,
+                        exec_async,
+                    })
+                }
             }
         },
         // query, query
@@ -1873,6 +2533,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 sql,
                 expected,
                 retry,
+                exec_async,
             },
             RecordOutput::Query { types, rows, error },
         ) => match (error, expected) {
@@ -1884,29 +2545,118 @@ pub fn update_record_with_output<T: ColumnType>(
             }
             // Error mismatch
             (Some(e), r) => {
-                let reference = match &r {
-                    QueryExpect::Error(e) => Some(e),
-                    QueryExpect::Results { .. } => None,
-                };
-                Some(Record::Query {
-                    sql,
-                    expected: QueryExpect::Error(ExpectedError::from_actual_error(
-                        reference,
-                        &e.to_string(),
-                    )),
-                    loc,
-                    conditions,
-                    connection,
-                    retry,
-                })
+                if let Some((label, reason)) = skip_failed {
+                    // Prepend skipif directive
+                    let mut new_conditions = conditions.clone();
+                    new_conditions.insert(
+                        0,
+                        Condition::SkipIf {
+                            label: label.to_string(),
+                            comments: vec![format!("# {}", reason)],
+                        },
+                    );
+                    Some(Record::Query {
+                        sql,
+                        expected: r,
+                        loc,
+                        conditions: new_conditions,
+                        connection,
+                        retry,
+                        exec_async,
+                    })
+                } else {
+                    // Original behavior: update expected error
+                    let reference = match &r {
+                        QueryExpect::Error(e) => Some(e),
+                        QueryExpect::Results { .. } => None,
+                    };
+                    Some(Record::Query {
+                        sql,
+                        expected: QueryExpect::Error(ExpectedError::from_actual_error(
+                            reference,
+                            &e.to_string(),
+                        )),
+                        loc,
+                        conditions,
+                        connection,
+                        retry,
+                        exec_async,
+                    })
+                }
             }
             (None, expected) => {
+                let (results_match, types_match) = match &expected {
+                    QueryExpect::Error(_) => (false, false), // Expected error but got success
+                    QueryExpect::Results {
+                        results: expected_results,
+                        types: expected_types,
+                        ..
+                    } => (
+                        validator(normalizer, rows, expected_results),
+                        column_type_validator(types, expected_types),
+                    ),
+                };
+
+                // If there's a mismatch and skip_failed mode is enabled, add skipif
+                if !results_match || !types_match {
+                    if let Some((label, reason)) = skip_failed {
+                        let mut new_conditions = conditions.clone();
+                        new_conditions.insert(
+                            0,
+                            Condition::SkipIf {
+                                label: label.to_string(),
+                                comments: vec![format!("# {}", reason)],
+                            },
+                        );
+                        return Some(Record::Query {
+                            sql,
+                            expected,
+                            loc,
+                            conditions: new_conditions,
+                            connection,
+                            retry,
+                            exec_async,
+                        });
+                    }
+                }
+
+                // Otherwise, update results normally
                 let results = match &expected {
-                    // If validation is successful, we respect the original file's expected results.
+                    // If validation succeeds and formatting normalization is not forced, preserve
+                    // original.
                     QueryExpect::Results {
                         results: expected_results,
                         ..
-                    } if validator(normalizer, rows, expected_results) => expected_results.clone(),
+                    } if results_match && !force_override => expected_results.clone(),
+                    // If the expected snapshot contains `<slt:ignore>` markers, preserve them
+                    // in the override output and only substitute the fragments that diverge.
+                    QueryExpect::Results {
+                        results: expected_results,
+                        ..
+                    } if expected_results.iter().any(|l| contains_ignore_marker(l)) => {
+                        let actual_rows = rows
+                            .iter()
+                            .map(|cols| cols.join(col_separator))
+                            .collect_vec();
+                        // Mirror default_validator: align each row independently when the
+                        // counts match, so an ignored cell can't absorb an adjacent row.
+                        if expected_results.len() == actual_rows.len() {
+                            expected_results
+                                .iter()
+                                .zip(actual_rows.iter())
+                                .map(|(e, a)| align_with_ignore_marker_checked(e, a))
+                                .collect()
+                        } else {
+                            let expected_snapshot = expected_results.join("\n");
+                            let actual_snapshot = actual_rows.join("\n");
+                            let aligned = align_with_ignore_marker_checked(
+                                &expected_snapshot,
+                                &actual_snapshot,
+                            );
+                            aligned.split('\n').map(|s| s.to_string()).collect()
+                        }
+                    }
+                    // Otherwise, regenerate with proper formatting.
                     _ => rows.iter().map(|cols| cols.join(col_separator)).collect(),
                 };
                 let types = match &expected {
@@ -1914,7 +2664,7 @@ pub fn update_record_with_output<T: ColumnType>(
                     QueryExpect::Results {
                         types: expected_types,
                         ..
-                    } if column_type_validator(types, expected_types) => expected_types.clone(),
+                    } if types_match => expected_types.clone(),
                     _ => types.clone(),
                 };
                 Some(Record::Query {
@@ -1944,6 +2694,7 @@ pub fn update_record_with_output<T: ColumnType>(
                         },
                     },
                     retry,
+                    exec_async,
                 })
             }
         },
@@ -1954,6 +2705,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 command,
                 stdout: _,
                 retry,
+                exec_async,
             },
             RecordOutput::System {
                 stdout: actual_stdout,
@@ -1973,6 +2725,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 command,
                 stdout: actual_stdout.clone(),
                 retry,
+                exec_async,
             })
         }
 
@@ -2074,6 +2827,67 @@ mod tests {
     }
 
     #[test]
+    fn test_query_replacement_preserves_ignore_markers() {
+        // From improve_override.md: override must keep `<slt:ignore>` markers and only
+        // substitute fragments that diverge from actual.
+        TestCase {
+            input: "query I\n\
+                    select * from foo;\n\
+                    ----\n\
+                    <slt:ignore>\n\
+                    2\n\
+                    <slt:ignore>\n\
+                    8",
+
+            record_output: query_output(
+                &[&["1"], &["2"], &["3"], &["4"]],
+                vec![DefaultColumnType::Integer],
+            ),
+
+            expected: Some(
+                "query I\n\
+                 select * from foo;\n\
+                 ----\n\
+                 <slt:ignore>\n\
+                 2\n\
+                 <slt:ignore>\n\
+                 4",
+            ),
+        }
+        .run()
+    }
+
+    #[test]
+    fn test_query_replacement_preserves_ignore_markers_when_matching() {
+        // When actual already matches, override preserves the original expected verbatim.
+        TestCase {
+            input: "query I\n\
+                    select * from foo;\n\
+                    ----\n\
+                    <slt:ignore>\n\
+                    2\n\
+                    <slt:ignore>\n\
+                    4",
+
+            record_output: query_output(
+                &[&["1"], &["2"], &["3"], &["4"]],
+                vec![DefaultColumnType::Integer],
+            ),
+
+            expected: Some(
+                "query I\n\
+                 select * from foo;\n\
+                 ----\n\
+                 <slt:ignore>\n\
+                 2\n\
+                 <slt:ignore>\n\
+                 4",
+            ),
+        }
+        .run()
+    }
+
+    #[test]
     fn test_query_replacement_error() {
         TestCase {
             // input has no query results
@@ -2138,18 +2952,25 @@ Caused by:
     }
 
     #[test]
-    fn test_query_statement_output() {
+    fn test_query_no_results_output() {
         TestCase {
             // input has no query results
             input: "query III\n\
                     select * from foo;\n\
                     ----",
 
-            // Model a run that produced a statement output
-            record_output: statement_output(3),
+            // Model a run that produced a query with no results, but scheme is still correct
+            record_output: query_output(
+                &[],
+                vec![
+                    DefaultColumnType::Integer,
+                    DefaultColumnType::Integer,
+                    DefaultColumnType::Integer,
+                ],
+            ),
 
             expected: Some(
-                "statement count 3\n\
+                "query III\n\
                  select * from foo;",
             ),
         }
@@ -2402,6 +3223,7 @@ Caused by:
                 default_validator,
                 default_normalizer,
                 strict_column_validator,
+                &UpdateMode::Override,
             );
 
             assert_eq!(
@@ -2503,5 +3325,25 @@ Caused by:
         ]];
         let expected = vec!["alpha<slt:ignore>delta".to_string()];
         assert!(!default_validator(normalizer, &actual, &expected));
+    }
+
+    #[test]
+    fn test_expected_error_multiline_ignore() {
+        let err = ExpectedError::Multiline(
+            "db error: ERROR: unrecognized configuration <slt:ignore>".to_string(),
+        );
+        assert!(err.is_match(
+            r#"db error: ERROR: unrecognized configuration parameter "non_existed_variable""#,
+            None
+        ));
+        assert!(!err.is_match("some other error", None));
+    }
+
+    #[test]
+    fn test_expected_error_multiline_ignore_trailing() {
+        // Marker at end allows any trailing content
+        let err = ExpectedError::Multiline("db error: ERROR: <slt:ignore>".to_string());
+        assert!(err.is_match("db error: ERROR: something unexpected here", None));
+        assert!(!err.is_match("completely different message", None));
     }
 }

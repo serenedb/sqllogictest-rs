@@ -41,9 +41,12 @@ impl sqllogictest::DB for FakeDB {
 
 #[test]
 fn test() {
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
 
-    if let Err(e) = tester.run_file("./system_command/system_command.slt") {
+    if let Err(e) = tester.run_file_test("./system_command/system_command.slt") {
         println!("{}", e.display(true));
         panic!();
     }
@@ -51,16 +54,19 @@ fn test() {
 
 #[test]
 fn test_fail() {
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
 
     let err = tester
-        .run_file("./system_command/system_command_fail.slt")
+        .run_file_test("./system_command/system_command_fail.slt")
         .unwrap_err();
 
     assert!(err.to_string().contains("system command failed"), "{err}");
 
     let err = tester
-        .run_file("./system_command/system_command_fail_2.slt")
+        .run_file_test("./system_command/system_command_fail_2.slt")
         .unwrap_err();
 
     assert!(

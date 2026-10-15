@@ -1,3 +1,5 @@
+show-column-names false
+
 statement ok
 create table t(v1 int not null, v2 int not null, v3 int not null)
 
@@ -86,3 +88,7 @@ desc table example_basic;
 
 query error The operation \(describe\) is not supported. Did you mean [describe]?
 desc table example_basic;
+
+# print command outputs text to stdout
+print hello world
+print single

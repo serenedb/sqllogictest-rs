@@ -71,8 +71,11 @@ impl sqllogictest::DB for FakeDB {
 
 #[test]
 fn test_let_basic() {
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
-    tester.run_file("./let/basic.slt").unwrap();
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
+    tester.run_file_test("./let/basic.slt").unwrap();
 }
 
 #[test]
@@ -85,8 +88,11 @@ let id
 select_rows 0
 "#;
 
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
-    let result = tester.run_script(script);
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
+    let result = tester.run_script_test(script);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -106,8 +112,11 @@ let id
 select_rows 3
 "#;
 
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
-    let result = tester.run_script(script);
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
+    let result = tester.run_script_test(script);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -127,8 +136,11 @@ let id, name
 select_id 42
 "#;
 
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
-    let result = tester.run_script(script);
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
+    let result = tester.run_script_test(script);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -148,8 +160,11 @@ let id
 statement
 "#;
 
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
-    let result = tester.run_script(script);
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
+    let result = tester.run_script_test(script);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(

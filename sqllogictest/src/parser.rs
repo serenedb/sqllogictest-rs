@@ -13,6 +13,13 @@ use crate::ColumnType;
 
 const RESULTS_DELIMITER: &str = "----";
 
+pub(crate) const IGNORE_MARKER: &str = "<slt:ignore>";
+
+/// Returns true if the given snapshot contains the ignore marker.
+pub(crate) fn contains_ignore_marker(s: &str) -> bool {
+    s.contains(IGNORE_MARKER)
+}
+
 /// The location in source file.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Location {
@@ -24,9 +31,13 @@ pub struct Location {
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.file, self.line)?;
-        if let Some(upper) = &self.upper {
-            write!(f, "\nat {upper}")?;
+
+        let mut upper = self.upper.as_ref();
+        while let Some(location) = upper {
+            write!(f, "\nat {}:{}", location.file, location.line)?;
+            upper = location.upper.as_ref();
         }
+
         Ok(())
     }
 }
@@ -65,15 +76,56 @@ impl Location {
             upper: Some(Arc::new(self.clone())),
         }
     }
+
+    /// Reuse upper field for chain of locations
+    pub fn add_next_location(&mut self, next: Arc<Self>) {
+        self.upper = Some(next);
+    }
+}
+
+/// Retry attempts configuration
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryAttempts {
+    /// Direct numeric value
+    Count(usize),
+    /// Environment variable name to read from (includes '$' prefix)
+    EnvVar(String),
+}
+
+impl std::fmt::Display for RetryAttempts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryAttempts::Count(n) => write!(f, "{}", n),
+            RetryAttempts::EnvVar(var) => write!(f, "{}", var),
+        }
+    }
+}
+
+/// Retry backoff configuration
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryBackoff {
+    /// Direct duration value
+    Duration(Duration),
+    /// Environment variable name to read from (includes '$' prefix)
+    EnvVar(String),
+}
+
+impl std::fmt::Display for RetryBackoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetryBackoff::Duration(d) => write!(f, "{}", humantime::format_duration(*d)),
+            RetryBackoff::EnvVar(var) => write!(f, "{}", var),
+        }
+    }
 }
 
 /// Configuration for retry behavior
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryConfig {
     /// Number of retry attempts
-    pub attempts: usize,
+    pub attempts: RetryAttempts,
     /// Duration to wait between retries
-    pub backoff: Duration,
+    pub backoff: RetryBackoff,
 }
 
 /// Expectation for a statement.
@@ -136,6 +188,9 @@ pub enum Record<T: ColumnType> {
         expected: StatementExpect,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async queries.
+        exec_async: bool,
     },
     /// A query is an SQL command from which we expect to receive results. The result set might be
     /// empty.
@@ -148,6 +203,13 @@ pub enum Record<T: ColumnType> {
         expected: QueryExpect<T>,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async queries.
+        exec_async: bool,
+    },
+    /// A wait record waits for all pending `async` queries to complete before proceeding.
+    Wait {
+        loc: Location,
     },
     /// A system command is an external command that is to be executed by the shell. Currently it
     /// must succeed and the output is ignored.
@@ -160,11 +222,19 @@ pub enum Record<T: ColumnType> {
         stdout: Option<String>,
         /// Optional retry configuration
         retry: Option<RetryConfig>,
+        /// If true, the runner will not wait for the result and will process the next record
+        /// immediately. Use a `wait` record to wait for all pending async system commands.
+        exec_async: bool,
     },
     /// A sleep period.
     Sleep {
         loc: Location,
         duration: Duration,
+    },
+    /// Print a message to stdout.
+    Print {
+        loc: Location,
+        text: String,
     },
     /// Subtest.
     Subtest {
@@ -187,6 +257,18 @@ pub enum Record<T: ColumnType> {
     HashThreshold {
         loc: Location,
         threshold: u64,
+    },
+    /// Show column names or not. True by default.
+    ShowColumnNames {
+        loc: Location,
+        value: bool,
+    },
+    /// Flatten all result values into a single column, instead of preserving the row structure.
+    /// When enabled, the output will be a single column containing all values, regardless of their
+    /// original row grouping.
+    FlatValues {
+        loc: Location,
+        value: bool,
     },
     /// Condition statements, including `onlyif` and `skipif`.
     Condition(Condition),
@@ -235,20 +317,19 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 sql,
                 expected,
                 retry,
+                exec_async,
             } => {
                 write!(f, "statement ")?;
+                if *exec_async {
+                    write!(f, "async ")?;
+                }
                 match expected {
                     StatementExpect::Ok => write!(f, "ok")?,
                     StatementExpect::Count(cnt) => write!(f, "count {cnt}")?,
                     StatementExpect::Error(err) => err.fmt_inline(f)?,
                 }
                 if let Some(retry) = retry {
-                    write!(
-                        f,
-                        " retry {} backoff {}",
-                        retry.attempts,
-                        humantime::format_duration(retry.backoff)
-                    )?;
+                    write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
                 writeln!(f)?;
                 // statement always end with a blank line
@@ -266,8 +347,12 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 sql,
                 expected,
                 retry,
+                exec_async,
             } => {
-                write!(f, "query ")?;
+                write!(f, "query")?;
+                if *exec_async {
+                    write!(f, " async")?;
+                }
                 match expected {
                     QueryExpect::Results {
                         types,
@@ -275,7 +360,10 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                         label,
                         ..
                     } => {
-                        write!(f, "{}", types.iter().map(|c| c.to_char()).join(""))?;
+                        let types_str = types.iter().map(|c| c.to_char()).join("");
+                        if !types_str.is_empty() {
+                            write!(f, " {}", types_str)?;
+                        }
                         if let Some(sort_mode) = sort_mode {
                             write!(f, " {}", sort_mode.as_str())?;
                         }
@@ -283,15 +371,13 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                             write!(f, " {label}")?;
                         }
                     }
-                    QueryExpect::Error(err) => err.fmt_inline(f)?,
+                    QueryExpect::Error(err) => {
+                        write!(f, " ")?;
+                        err.fmt_inline(f)?
+                    }
                 }
                 if let Some(retry) = retry {
-                    write!(
-                        f,
-                        " retry {} backoff {}",
-                        retry.attempts,
-                        humantime::format_duration(retry.backoff)
-                    )?;
+                    write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
                 }
                 writeln!(f)?;
                 writeln!(f, "{sql}")?;
@@ -316,16 +402,17 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 command,
                 stdout,
                 retry,
+                exec_async,
             } => {
-                writeln!(f, "system ok\n{command}")?;
-                if let Some(retry) = retry {
-                    write!(
-                        f,
-                        " retry {} backoff {}",
-                        retry.attempts,
-                        humantime::format_duration(retry.backoff)
-                    )?;
+                write!(f, "system ")?;
+                if *exec_async {
+                    write!(f, "async ")?;
                 }
+                write!(f, "ok")?;
+                if let Some(retry) = retry {
+                    write!(f, " retry {} backoff {}", retry.attempts, retry.backoff)?;
+                }
+                writeln!(f, "\n{command}")?;
                 if let Some(stdout) = stdout {
                     writeln!(f, "----\n{}\n", stdout.trim())?;
                 }
@@ -334,29 +421,81 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             Record::Sleep { loc: _, duration } => {
                 write!(f, "sleep {}", humantime::format_duration(*duration))
             }
+            Record::Print { loc: _, text } => {
+                write!(f, "print {text}")
+            }
             Record::Subtest { loc: _, name } => {
                 write!(f, "subtest {name}")
             }
             Record::Halt { loc: _ } => {
                 write!(f, "halt")
             }
+            Record::Wait { loc: _ } => {
+                write!(f, "wait")
+            }
             Record::Control(c) => match c {
                 Control::SortMode(m) => write!(f, "control sortmode {}", m.as_str()),
                 Control::ResultMode(m) => write!(f, "control resultmode {}", m.as_str()),
                 Control::Substitution(s) => write!(f, "control substitution {}", s.as_str()),
+                Control::AlwaysAsync(s) => write!(f, "control always-async {}", s.as_str()),
+                Control::MaxAsyncConnections(n) => write!(f, "control max-async-connections {}", n),
             },
             Record::Condition(cond) => match cond {
-                Condition::OnlyIf { label } => write!(f, "onlyif {label}"),
-                Condition::SkipIf { label } => write!(f, "skipif {label}"),
+                Condition::OnlyIf { label, comments } => {
+                    write!(f, "onlyif {label}")?;
+                    if !comments.is_empty() {
+                        write!(f, " {}", comments.join(" "))?;
+                    }
+                    Ok(())
+                }
+                Condition::SkipIf { label, comments } => {
+                    write!(f, "skipif {label}")?;
+                    if !comments.is_empty() {
+                        write!(f, " {}", comments.join(" "))?;
+                    }
+                    Ok(())
+                }
             },
             Record::Connection(conn) => {
-                if let Connection::Named(conn) = conn {
-                    write!(f, "connection {}", conn)?;
+                if let Connection::Named {
+                    name,
+                    ssl_mode,
+                    port,
+                    user,
+                    password,
+                    database,
+                } = conn
+                {
+                    write!(f, "connection {name}")?;
+                    // Only emit sslmode when non-default so existing .slt files
+                    // round-trip without change.
+                    if !matches!(ssl_mode, SslMode::Disable) {
+                        write!(f, " sslmode={}", ssl_mode.as_str())?;
+                    }
+                    // Only emit port when explicitly set.
+                    if !matches!(port, DBPort::Plain) {
+                        write!(f, " port={}", port.as_str())?;
+                    }
+                    if let Some(user) = user {
+                        write!(f, " user={user}")?;
+                    }
+                    if let Some(password) = password {
+                        write!(f, " password={password}")?;
+                    }
+                    if let Some(database) = database {
+                        write!(f, " database={database}")?;
+                    }
                 }
                 Ok(())
             }
             Record::HashThreshold { loc: _, threshold } => {
                 write!(f, "hash-threshold {threshold}")
+            }
+            Record::ShowColumnNames { loc: _, value } => {
+                write!(f, "show-column-names {value}")
+            }
+            Record::FlatValues { loc: _, value } => {
+                write!(f, "flat-values {value}")
             }
             Record::Comment(comment) => {
                 let mut iter = comment.iter();
@@ -379,6 +518,146 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
             }
         }
     }
+}
+
+/// Returns true if `actual` matches `expected`, treating `<slt:ignore>` as a wildcard that
+/// matches any substring. Each non-empty fragment between markers must appear in `actual` in
+/// order. If `expected` contains no marker the comparison falls back to exact equality.
+pub(crate) fn match_with_ignore_marker(expected: &str, actual: &str) -> bool {
+    let fragments: Vec<&str> = expected.split(IGNORE_MARKER).collect();
+    if fragments.len() == 1 {
+        return expected == actual;
+    }
+    let allow_leading_data = fragments[0].is_empty();
+    let allow_trailing_data = fragments[fragments.len() - 1].is_empty();
+
+    let mut pos = 0;
+    let mut at_start = true;
+    for frag in fragments.iter().filter(|f| !f.is_empty()) {
+        let Some(idx) = actual[pos..].find(frag) else {
+            tracing::error!(
+                "mismatch at: {}\nexpected: {}\nactual: {}",
+                pos,
+                frag,
+                &actual[pos..]
+            );
+            return false;
+        };
+        if at_start && !allow_leading_data && idx > 0 {
+            tracing::error!(
+                "data found before first expected fragment:\nleading: {}\nexpected: {}",
+                &actual[..idx],
+                frag
+            );
+            return false;
+        }
+        at_start = false;
+        pos += idx + frag.len();
+    }
+    if pos < actual.len() && !allow_trailing_data {
+        tracing::error!(
+            "extra data found after last expected fragment:\nremaining: {}",
+            &actual[pos..]
+        );
+        return false;
+    }
+    true
+}
+
+/// Aligns `actual` against `expected` line-by-line
+pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
+    // Takes expected marker-free and actual substring and tries to build new substring in output.
+    // Depending on marker position, tries to eagerly adsorb suffix or prefix.
+    fn transform<'a>(
+        exp: &str,
+        act: &'a str,
+        has_left_marker: bool,
+        has_right_marker: bool,
+    ) -> &'a str {
+        let act = if has_left_marker {
+            std::iter::once(exp.len())
+                .chain(exp.char_indices().rev().map(|(i, _)| i))
+                .find_map(|end| act.find(&exp[..end]).map(|pos| &act[pos..]))
+                .unwrap_or(act)
+        } else {
+            act
+        };
+
+        if has_right_marker {
+            exp.char_indices()
+                .find_map(|(i, _)| {
+                    let suffix = &exp[i..];
+                    act.rfind(suffix).map(|pos| &act[..pos + suffix.len()])
+                })
+                .unwrap_or(act)
+        } else {
+            act
+        }
+    }
+
+    fn widen<'a>(source: &'a str, prev: &str, next: &str) -> &'a str {
+        let start = prev.as_ptr() as usize - source.as_ptr() as usize;
+        let total = prev.len() + IGNORE_MARKER.len() + next.len();
+        &source[start..start + total]
+    }
+
+    let starts_with_ignore = expected.starts_with(IGNORE_MARKER);
+    let ends_with_ignore = expected.ends_with(IGNORE_MARKER);
+
+    let expected_chunks: Vec<_> = expected.split(IGNORE_MARKER).collect();
+    let chunks_count = expected_chunks.len();
+
+    let mut resp: Vec<&str> = Vec::with_capacity(chunks_count + 1);
+    let mut pending: Option<&str> = None;
+    let mut actual_rem = actual;
+
+    for (i, chunk) in expected_chunks.into_iter().enumerate() {
+        let Some(pos) = actual_rem.find(chunk) else {
+            pending = Some(match pending {
+                Some(prev) => widen(expected, prev, chunk),
+                None => chunk,
+            });
+            continue;
+        };
+
+        if let Some(prev) = pending.take() {
+            resp.push(transform(prev, &actual_rem[..pos], i != 1, true));
+            resp.push(chunk);
+        } else if i == 0 && pos > 0 && !starts_with_ignore {
+            resp.push(&actual_rem[..pos + chunk.len()]);
+        } else {
+            resp.push(chunk);
+        }
+        actual_rem = &actual_rem[pos + chunk.len()..];
+    }
+
+    let trailing_unmatched = pending.is_none() && !actual_rem.is_empty() && !ends_with_ignore;
+
+    if let Some(prev) = pending {
+        resp.push(transform(prev, actual_rem, chunks_count != 0, false));
+    }
+
+    let mut result = resp.into_iter().join(IGNORE_MARKER);
+    if trailing_unmatched {
+        result.push_str(actual_rem);
+    }
+    result
+}
+
+/// [`align_with_ignore_marker`] with a defensive post-check: the aligned string is itself
+/// a wildcard pattern (it still carries `<slt:ignore>` markers), and a correct alignment
+/// must match `actual` when read through those markers. If it doesn't, alignment produced
+/// something inconsistent with actual — warn and fall back to the raw `actual`.
+pub(crate) fn align_with_ignore_marker_checked(expected: &str, actual: &str) -> String {
+    let aligned = align_with_ignore_marker(expected, actual);
+    if !match_with_ignore_marker(&aligned, actual) {
+        tracing::error!(
+            target: "sqllogictest::align",
+            "Aligned pattern does not match actual; falling back to raw actual.\nactual: {actual}\naligned: {aligned}",
+        );
+        return actual.to_string();
+    }
+    aligned
 }
 
 /// Expected error message after `error` or under `----`.
@@ -466,7 +745,7 @@ impl ExpectedError {
         match self {
             Self::Empty => true,
             Self::Inline(regex) => regex.is_match(err),
-            Self::Multiline(results) => results.trim() == err.trim(),
+            Self::Multiline(results) => match_with_ignore_marker(results.trim(), err.trim()),
             Self::SqlState(expected_state) => sqlstate.is_some_and(|state| state == expected_state),
         }
     }
@@ -485,9 +764,17 @@ impl ExpectedError {
         };
 
         if multiline {
+            // If the reference is a Multiline using `<slt:ignore>`, preserve the markers and
+            // only substitute the fragments that diverge — same behavior as query results.
+            let body = match reference {
+                Some(Self::Multiline(ref_body)) if contains_ignore_marker(ref_body) => {
+                    align_with_ignore_marker_checked(ref_body.trim(), trimmed_err)
+                }
+                _ => trimmed_err.to_string(),
+            };
             // Even if the actual error is empty, we still use `Multiline` to indicate that
             // an exact empty error is expected, instead of any error by `Empty`.
-            Self::Multiline(trimmed_err.to_string())
+            Self::Multiline(body)
         } else {
             Self::new_inline(regex::escape(actual_err)).expect("escaped regex should be valid")
         }
@@ -526,6 +813,12 @@ pub enum Control {
     ResultMode(ResultMode),
     /// Control whether or not to substitute variables in the SQL.
     Substitution(bool),
+    /// When on, all subsequent statement/query/system records are treated as async
+    /// without needing to write `async` on each one.
+    AlwaysAsync(bool),
+    /// Limit the number of concurrently executing async tasks.
+    /// `0` clears the limit (unlimited).
+    MaxAsyncConnections(usize),
 }
 
 trait ControlItem: Sized {
@@ -568,17 +861,78 @@ pub enum Injected {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Condition {
     /// The statement or query is evaluated only if the label is seen.
-    OnlyIf { label: String },
+    OnlyIf {
+        label: String,
+        comments: Vec<String>,
+    },
     /// The statement or query is not evaluated if the label is seen.
-    SkipIf { label: String },
+    SkipIf {
+        label: String,
+        comments: Vec<String>,
+    },
 }
 
 impl Condition {
     /// Evaluate condition on given `label`, returns whether to skip this record.
     pub(crate) fn should_skip<'a>(&'a self, labels: impl IntoIterator<Item = &'a str>) -> bool {
         match self {
-            Condition::OnlyIf { label } => !labels.into_iter().contains(&label.as_str()),
-            Condition::SkipIf { label } => labels.into_iter().contains(&label.as_str()),
+            Condition::OnlyIf { label, .. } => !labels.into_iter().contains(&label.as_str()),
+            Condition::SkipIf { label, .. } => labels.into_iter().contains(&label.as_str()),
+        }
+    }
+}
+
+/// SSL mode for a named connection.
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
+pub enum SslMode {
+    /// No TLS. This is the default.
+    #[default]
+    Disable,
+    /// Attempt TLS, fall back to plain if unavailable.
+    Prefer,
+    /// Require TLS; fail if unavailable.
+    Require,
+}
+
+impl SslMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "disable" => Some(Self::Disable),
+            "prefer" => Some(Self::Prefer),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
+pub enum DBPort {
+    #[default]
+    Plain,
+    Ssl,
+}
+
+impl DBPort {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "plain" => Some(Self::Plain),
+            "ssl" => Some(Self::Ssl),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Ssl => "ssl",
         }
     }
 }
@@ -589,15 +943,48 @@ pub enum Connection {
     /// The default connection if not specified or if the name is "default".
     #[default]
     Default,
-    /// A named connection.
-    Named(String),
+    /// A named connection with an optional SSL mode, port, and user override.
+    Named {
+        name: String,
+        /// SSL mode for this connection. Defaults to [`SslMode::Disable`].
+        ssl_mode: SslMode,
+        /// Port to use
+        port: DBPort,
+        /// Login user override (e.g. `user=alice`). `None` uses the runner's
+        /// configured default user. Lets a test run statements as a second
+        /// role, which is required to exercise authorization/RBAC.
+        user: Option<String>,
+        /// Login password override (e.g. `password=secret`). `None` uses the
+        /// runner's configured default password. Lets a test authenticate (or
+        /// deliberately fail to authenticate) with a specific password.
+        password: Option<String>,
+        /// Target database override (e.g. `database=other`). `None` uses the
+        /// runner's configured default database. Lets a test open a specific
+        /// database, which is required to exercise per-database privileges
+        /// (e.g. CONNECT).
+        database: Option<String>,
+    },
 }
 
 impl Connection {
-    fn new(name: impl AsRef<str>) -> Self {
+    fn new(
+        name: impl AsRef<str>,
+        ssl_mode: SslMode,
+        port: DBPort,
+        user: Option<String>,
+        password: Option<String>,
+        database: Option<String>,
+    ) -> Self {
         match name.as_ref() {
             "default" => Self::Default,
-            name => Self::Named(name.to_owned()),
+            name => Self::Named {
+                name: name.to_owned(),
+                ssl_mode,
+                port,
+                user,
+                password,
+                database,
+            },
         }
     }
 }
@@ -702,6 +1089,8 @@ pub enum ParseErrorKind {
     InvalidType(char),
     #[error("invalid number: {0:?}")]
     InvalidNumber(String),
+    #[error("invalid bool: {0:?}")]
+    InvalidBool(String),
     #[error("invalid error message: {0:?}")]
     InvalidErrorMessage(String),
     #[error("duplicated error messages after error` and under `----`")]
@@ -777,20 +1166,20 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.as_slice() {
             [] => continue,
-            ["include", included] => records.push(Record::Include {
+            ["include", included, _rest @ ..] => records.push(Record::Include {
                 loc,
                 filename: included.to_string(),
             }),
-            ["halt"] => {
+            ["halt", _rest @ ..] => {
                 records.push(Record::Halt { loc });
             }
-            ["subtest", name] => {
+            ["subtest", name, _rest @ ..] => {
                 records.push(Record::Subtest {
                     loc,
                     name: name.to_string(),
                 });
             }
-            ["sleep", dur] => {
+            ["sleep", dur, _rest @ ..] => {
                 records.push(Record::Sleep {
                     duration: humantime::parse_duration(dur).map_err(|_| {
                         ParseErrorKind::InvalidDuration(dur.to_string()).at(loc.clone())
@@ -798,32 +1187,85 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     loc,
                 });
             }
-            ["skipif", label] => {
+            ["print", rest @ ..] => {
+                records.push(Record::Print {
+                    text: rest.join(" "),
+                    loc,
+                });
+            }
+            ["skipif", label, rest @ ..] => {
                 let cond = Condition::SkipIf {
                     label: label.to_string(),
+                    comments: rest.iter().map(|s| s.to_string()).collect(),
                 };
                 conditions.push(cond.clone());
                 records.push(Record::Condition(cond));
             }
-            ["onlyif", label] => {
+            ["onlyif", label, rest @ ..] => {
                 let cond = Condition::OnlyIf {
                     label: label.to_string(),
+                    comments: rest.iter().map(|s| s.to_string()).collect(),
                 };
                 conditions.push(cond.clone());
                 records.push(Record::Condition(cond));
             }
-            ["connection", name] => {
-                let conn = Connection::new(name);
+            ["connection", name, rest @ ..] => {
+                let ssl_mode = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("sslmode="))
+                    .map(|val| {
+                        SslMode::parse(val).ok_or_else(|| {
+                            ParseErrorKind::InvalidControl(format!(
+                                "unknown sslmode value: {val:?}, expected disable | prefer | require"
+                            ))
+                            .at(loc.clone())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let port = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("port="))
+                    .map(|val| {
+                        DBPort::parse(val).ok_or_else(|| {
+                            ParseErrorKind::InvalidControl(format!(
+                                "unknown port value: {val:?}, expected plain | ssl"
+                            ))
+                            .at(loc.clone())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let user = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("user="))
+                    .map(|val| val.to_owned());
+                let password = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("password="))
+                    .map(|val| val.to_owned());
+                let database = rest
+                    .iter()
+                    .find_map(|token| token.strip_prefix("database="))
+                    .map(|val| val.to_owned());
+                let conn = Connection::new(name, ssl_mode, port, user, password, database);
                 connection = conn.clone();
                 records.push(Record::Connection(conn));
             }
             ["statement", res @ ..] => {
+                let (exec_async, res) = if res.first() == Some(&"async") {
+                    (true, &res[1..])
+                } else {
+                    (false, res)
+                };
                 let (mut expected, res) = match res {
                     ["ok", retry @ ..] => (StatementExpect::Ok, retry),
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
                             // `statement error retry <num> backoff <duration>`
-                            // To keep syntax simple, let's assume the error message must be multiline.
+                            // To keep syntax simple, let's assume the error message must be
+                            // multiline.
                             (StatementExpect::Error(ExpectedError::Empty), res)
                         } else {
                             let error = ExpectedError::parse_inline_tokens(res)
@@ -864,14 +1306,21 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                     expected,
                     retry,
+                    exec_async,
                 });
             }
             ["query", res @ ..] => {
+                let (exec_async, res) = if res.first() == Some(&"async") {
+                    (true, &res[1..])
+                } else {
+                    (false, res)
+                };
                 let (mut expected, res) = match res {
                     ["error", res @ ..] => {
                         if res.len() == 4 && res[0] == "retry" && res[2] == "backoff" {
                             // `query error retry <num> backoff <duration>`
-                            // To keep syntax simple, let's assume the error message must be multiline.
+                            // To keep syntax simple, let's assume
+                            // the error message must be multiline.
                             (QueryExpect::Error(ExpectedError::Empty), res)
                         } else {
                             let error = ExpectedError::parse_inline_tokens(res)
@@ -879,15 +1328,21 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                             (QueryExpect::Error(error), &[][..])
                         }
                     }
-                    [type_str, res @ ..] => {
-                        // query <type-string> [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
-                        let types = type_str
-                            .chars()
-                            .map(|ch| {
-                                T::from_char(ch)
-                                    .ok_or_else(|| ParseErrorKind::InvalidType(ch).at(loc.clone()))
-                            })
-                            .try_collect()?;
+                    [type_str, rest @ ..] => {
+                        // query [async] [<type-string>] [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
+                        let (types, res) = if SortMode::try_from_str(type_str).is_ok() {
+                            (Vec::new(), res)
+                        } else {
+                            let types = type_str
+                                .chars()
+                                .map(|ch| {
+                                    T::from_char(ch).ok_or_else(|| {
+                                        ParseErrorKind::InvalidType(ch).at(loc.clone())
+                                    })
+                                })
+                                .try_collect()?;
+                            (types, rest)
+                        };
                         let sort_mode = res.first().and_then(|&s| SortMode::try_from_str(s).ok()); // Could be `retry` or label
 
                         // To support `retry`, we assume the label must *not* be "retry"
@@ -951,9 +1406,22 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     sql,
                     expected,
                     retry,
+                    exec_async,
                 });
             }
-            ["system", "ok", res @ ..] => {
+            ["wait"] => {
+                records.push(Record::Wait { loc });
+            }
+            ["system", rest @ ..] => {
+                let (exec_async, rest) = if rest.first() == Some(&"async") {
+                    (true, &rest[1..])
+                } else {
+                    (false, rest)
+                };
+                let res = match rest {
+                    ["ok", res @ ..] => res,
+                    _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
+                };
                 let retry = parse_retry_config(res).map_err(|e| e.at(loc.clone()))?;
 
                 // TODO: we don't support asserting error message for system command
@@ -971,6 +1439,7 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     command,
                     stdout,
                     retry,
+                    exec_async,
                 });
             }
             ["control", res @ ..] => match res {
@@ -988,9 +1457,17 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     Ok(on_off) => records.push(Record::Control(Control::Substitution(on_off))),
                     Err(k) => return Err(k.at(loc)),
                 },
+                ["always-async", on_off] => match bool::try_from_str(on_off) {
+                    Ok(on_off) => records.push(Record::Control(Control::AlwaysAsync(on_off))),
+                    Err(k) => return Err(k.at(loc)),
+                },
+                ["max-async-connections", n] => match n.parse::<usize>() {
+                    Ok(n) => records.push(Record::Control(Control::MaxAsyncConnections(n))),
+                    Err(_) => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
+                },
                 _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
             },
-            ["hash-threshold", threshold] => {
+            ["hash-threshold", threshold, _rest @ ..] => {
                 records.push(Record::HashThreshold {
                     loc: loc.clone(),
                     threshold: threshold.parse::<u64>().map_err(|_| {
@@ -998,6 +1475,18 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     })?,
                 });
             }
+            ["show-column-names", value, _rest @ ..] => records.push(Record::ShowColumnNames {
+                loc: loc.clone(),
+                value: value
+                    .parse::<bool>()
+                    .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
+            }),
+            ["flat-values", value, _rest @ ..] => records.push(Record::FlatValues {
+                loc: loc.clone(),
+                value: value
+                    .parse::<bool>()
+                    .map_err(|_| ParseErrorKind::InvalidBool((*value).into()).at(loc.clone()))?,
+            }),
             ["let", rest @ ..] => {
                 // Parse: let var1, var2, ... followed by SQL
                 // Join the rest of the tokens and parse the variable list
@@ -1074,7 +1563,7 @@ fn parse_file_inner<T: ColumnType>(loc: Location) -> Result<Vec<Record<T>>, Pars
                 return Err(ParseErrorKind::EmptyIncludeFile(filename).at(loc.clone()));
             }
             for included_file in iter {
-                let included_file = included_file.map_err(|e| {
+                let included_file = included_file.map_err(|e: glob::GlobError| {
                     ParseErrorKind::InvalidIncludeFile(e.to_string()).at(loc.clone())
                 })?;
                 let included_file = included_file.as_os_str().to_string_lossy().to_string();
@@ -1181,23 +1670,31 @@ fn parse_retry_config(tokens: &[&str]) -> Result<Option<RetryConfig>, ParseError
         None => return Ok(None),
     }
 
-    // Parse number of attempts
+    // Parse number of attempts (can be numeric or environment variable)
     let attempts = match iter.next() {
-        Some(attempts_str) => attempts_str
-            .parse::<usize>()
-            .map_err(|_| ParseErrorKind::InvalidNumber(attempts_str.to_string()))?,
+        Some(attempts_str) => {
+            if attempts_str.starts_with('$') {
+                // Environment variable reference (store with '$' prefix)
+                RetryAttempts::EnvVar(attempts_str.to_string())
+            } else {
+                // Try to parse as numeric value
+                let count = attempts_str
+                    .parse::<usize>()
+                    .map_err(|_| ParseErrorKind::InvalidNumber(attempts_str.to_string()))?;
+                if count == 0 {
+                    return Err(ParseErrorKind::InvalidRetryConfig(
+                        "attempt must be greater than 0".to_string(),
+                    ));
+                }
+                RetryAttempts::Count(count)
+            }
+        }
         None => {
             return Err(ParseErrorKind::InvalidRetryConfig(
-                "expected a positive number of attempts".to_string(),
+                "expected a positive number of attempts or environment variable".to_string(),
             ))
         }
     };
-
-    if attempts == 0 {
-        return Err(ParseErrorKind::InvalidRetryConfig(
-            "attempt must be greater than 0".to_string(),
-        ));
-    }
 
     // Expect "backoff" keyword
     match iter.next() {
@@ -1210,18 +1707,25 @@ fn parse_retry_config(tokens: &[&str]) -> Result<Option<RetryConfig>, ParseError
         }
     }
 
-    // Parse backoff duration
-    let duration_str = match iter.next() {
+    // Parse backoff duration (can be duration or environment variable)
+    let backoff_str = match iter.next() {
         Some(s) => s,
         None => {
             return Err(ParseErrorKind::InvalidRetryConfig(
-                "expected backoff duration".to_string(),
+                "expected backoff duration or environment variable".to_string(),
             ))
         }
     };
 
-    let backoff = humantime::parse_duration(duration_str)
-        .map_err(|_| ParseErrorKind::InvalidDuration(duration_str.to_string()))?;
+    let backoff = if backoff_str.starts_with('$') {
+        // Environment variable reference (store with '$' prefix)
+        RetryBackoff::EnvVar(backoff_str.to_string())
+    } else {
+        // Parse as duration
+        let duration = humantime::parse_duration(backoff_str)
+            .map_err(|_| ParseErrorKind::InvalidDuration(backoff_str.to_string()))?;
+        RetryBackoff::Duration(duration)
+    };
 
     // No more tokens should be present
     if iter.next().is_some() {
@@ -1258,7 +1762,7 @@ mod tests {
     fn test_include_glob() {
         let records =
             parse_file::<DefaultColumnType>("../tests/slt/include/include_1.slt").unwrap();
-        assert_eq!(15, records.len());
+        assert_eq!(17, records.len());
     }
 
     #[test]
@@ -1284,6 +1788,23 @@ mod tests {
     #[test]
     fn test_valuesort() {
         parse_roundtrip::<DefaultColumnType>("../tests/slt/valuesort.slt")
+    }
+
+    #[test]
+    fn test_sort_mode_without_types() {
+        let records = parse::<DefaultColumnType>("query rowsort\nSELECT 1\n----\n1\n").unwrap();
+        let Record::Query {
+            expected: QueryExpect::Results {
+                types, sort_mode, ..
+            },
+            ..
+        } = &records[0]
+        else {
+            panic!("not a query: {:?}", records[0]);
+        };
+        assert!(types.is_empty());
+        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+        assert_eq!(records[0].to_string(), "query rowsort\nSELECT 1\n----\n1\n");
     }
 
     #[test]
@@ -1342,6 +1863,7 @@ select * from foo;
                 sql: "select * from foo;".to_string(),
                 expected: QueryExpect::empty_results(),
                 retry: None,
+                exec_async: false,
             }]
         );
     }
@@ -1412,7 +1934,11 @@ select * from foo;
                     Record::Subtest { loc, .. } => normalize_loc(loc),
                     Record::Halt { loc, .. } => normalize_loc(loc),
                     Record::HashThreshold { loc, .. } => normalize_loc(loc),
+                    Record::ShowColumnNames { loc, .. } => normalize_loc(loc),
+                    Record::FlatValues { loc, .. } => normalize_loc(loc),
                     Record::Let { loc, .. } => normalize_loc(loc),
+                    Record::Print { loc, .. } => normalize_loc(loc),
+                    Record::Wait { loc, .. } => normalize_loc(loc),
                     // even though these variants don't include a
                     // location include them in this match statement
                     // so if new variants are added, this match
@@ -1465,6 +1991,150 @@ select * from foo;
     #[test]
     fn test_query_retry() {
         parse_roundtrip::<DefaultColumnType>("../tests/no_run/query_retry.slt")
+    }
+
+    #[test]
+    fn test_async_roundtrip() {
+        parse_roundtrip::<DefaultColumnType>("../tests/no_run/async.slt")
+    }
+
+    #[test]
+    fn test_parse_statement_async() {
+        let script = "statement async ok\ninsert into t values (1)\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Statement {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async, "expected async=true");
+                assert_eq!(*expected, StatementExpect::Ok);
+            }
+            _ => panic!("expected Statement record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_statement_no_async_by_default() {
+        let script = "statement ok\ninsert into t values (1)\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Statement { exec_async, .. } => {
+                assert!(!*exec_async, "expected async=false by default");
+            }
+            _ => panic!("expected Statement record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_async() {
+        let script = "query async I\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async, "expected async=true");
+                match expected {
+                    QueryExpect::Results { types, .. } => {
+                        assert_eq!(types.len(), 1);
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_async_with_sort_mode() {
+        let script = "query async I rowsort\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async);
+                match expected {
+                    QueryExpect::Results { sort_mode, .. } => {
+                        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_async_with_label() {
+        let script = "query async I rowsort my_label\nselect id from t\n----\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            Record::Query {
+                exec_async,
+                expected,
+                ..
+            } => {
+                assert!(*exec_async);
+                match expected {
+                    QueryExpect::Results {
+                        label, sort_mode, ..
+                    } => {
+                        assert_eq!(label.as_deref(), Some("my_label"));
+                        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+                    }
+                    _ => panic!("expected Results"),
+                }
+            }
+            _ => panic!("expected Query record"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wait() {
+        let script = "wait\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0], Record::Wait { .. }));
+    }
+
+    #[test]
+    fn test_async_display_roundtrip() {
+        let cases = [
+            "statement async ok\ninsert into t\n\n",
+            "statement async count 3\ninsert into t\n\n",
+            "query async I\nselect id from t\n----\n1\n\n",
+            "query async I rowsort\nselect id from t\n----\n1\n\n",
+            "query async I rowsort my_label\nselect id from t\n----\n1\n\n",
+            "wait",
+        ];
+        for case in cases {
+            let records = parse::<DefaultColumnType>(case)
+                .unwrap_or_else(|e| panic!("failed to parse {case:?}: {e}"));
+            let displayed = records
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let reparsed = parse::<DefaultColumnType>(&displayed)
+                .unwrap_or_else(|e| panic!("failed to reparse {displayed:?}: {e}"));
+            assert_eq!(
+                records.len(),
+                reparsed.len(),
+                "length mismatch for {case:?}"
+            );
+        }
     }
 
     #[test]
@@ -1564,5 +2234,118 @@ SELECT 1
         assert!(!is_valid_variable_name("123"));
         assert!(!is_valid_variable_name("foo-bar"));
         assert!(!is_valid_variable_name("foo bar"));
+    }
+
+    #[test]
+    fn test_align_no_marker_returns_actual() {
+        assert_eq!(align_with_ignore_marker("foo\nbar", "baz\nqux"), "baz\nqux");
+    }
+
+    #[test]
+    fn test_align_all_fragments_match() {
+        let expected = "foo<slt:ignore>bar";
+        let actual = "foobazbar";
+        assert_eq!(align_with_ignore_marker(expected, actual), expected);
+    }
+
+    #[test]
+    fn test_align_trailing_fragment_replaced_by_last_line() {
+        // From improve_override.md: user's motivating example.
+        let expected = "<slt:ignore>\n2\n<slt:ignore>\n8";
+        let actual = "1\n2\n3\n4";
+        assert_eq!(
+            align_with_ignore_marker(expected, actual),
+            "<slt:ignore>\n2\n<slt:ignore>\n4"
+        );
+    }
+
+    #[test]
+    fn test_align_trailing_marker_consumes_remainder() {
+        let expected = "foo<slt:ignore>";
+        let actual = "foobarbaz";
+        assert_eq!(align_with_ignore_marker(expected, actual), expected);
+    }
+
+    #[test]
+    fn test_align_leading_fragment_mismatch_uses_lookahead() {
+        let expected = "header\n<slt:ignore>\nfoo";
+        let actual = "differentheader\nline1\nfoo";
+        assert_eq!(
+            align_with_ignore_marker(expected, actual),
+            "differentheader\n<slt:ignore>\nfoo"
+        );
+    }
+
+    #[test]
+    fn test_align_middle_literal_mismatch_line_based() {
+        let expected = "line1\n<slt:ignore>\nlineX\n<slt:ignore>\nline3";
+        let actual = "line1\nfoo\nlineDifferent\nbar\nline3";
+        // Line-based: markers each absorb one line; the mismatched literal is substituted.
+        assert_eq!(
+            align_with_ignore_marker(expected, actual),
+            "line1\n<slt:ignore>\nlineDifferent\n<slt:ignore>\nline3"
+        );
+    }
+
+    #[test]
+    fn test_align_line_based_appends_extra_actual_rows() {
+        // User-reported case: expected is shorter than actual; extras should be appended
+        // so the override captures rows the original expected didn't account for.
+        let expected = "col1\n1\n<slt:ignore>\n3\n<slt:ignore>\n9";
+        let actual = "col1\n1\n2\n4\n8\n9\n10";
+        assert_eq!(
+            align_with_ignore_marker(expected, actual),
+            "col1\n1\n<slt:ignore>\n4\n<slt:ignore>\n9\n10"
+        );
+    }
+
+    #[test]
+    fn test_align_single_line_inline_marker() {
+        // Single-line expected with an inline marker: the line is preserved verbatim and
+        // the marker absorbs the whole actual.
+        let expected = "foo<slt:ignore>bar";
+        let actual = "foobazbar";
+        assert_eq!(align_with_ignore_marker(expected, actual), expected);
+    }
+
+    #[test]
+    fn test_align_inline_marker_inside_multiline_preserves_line() {
+        // Box-drawing case from the user bug report: the line containing the inline marker
+        // must survive the alignment with its surrounding `│` characters intact, while the
+        // non-marker lines around it still get substituted from actual.
+        let expected = "│ header │\n\
+                        │       <slt:ignore>     │\n\
+                        │ 0.01s  │";
+        let actual = "│ header │\n\
+                      │       0.726s            │\n\
+                      │ 0.00s  │";
+        assert_eq!(
+            align_with_ignore_marker(expected, actual),
+            "│ header │\n\
+             │       <slt:ignore>     │\n\
+             │ 0.00s  │"
+        );
+    }
+
+    #[test]
+    fn test_align_inline_marker_substituted_when_surroundings_differ() {
+        // If the non-marker parts of the inline marker line no longer match the actual
+        // line, we substitute with the actual line so the diff surfaces the structural
+        // change.
+        let expected = "prefix\n│   <slt:ignore>   │\nsuffix";
+        let actual = "prefix\nwildly different\nsuffix";
+        assert_eq!(
+            align_with_ignore_marker(expected, actual),
+            "prefix\nwildly different\nsuffix"
+        );
+    }
+
+    #[test]
+    fn test_align_roundtrip_when_match_succeeds() {
+        // If the ignore marker already matches, aligning should produce the original expected.
+        let expected = "alpha\n<slt:ignore>\nbeta";
+        let actual = "alpha\nwhatever\nin\nbetween\nbeta";
+        assert!(match_with_ignore_marker(expected, actual));
+        assert_eq!(align_with_ignore_marker(expected, actual), expected);
     }
 }

@@ -27,9 +27,12 @@ impl sqllogictest::DB for FakeDB {
 
 #[test]
 fn test() {
-    let mut tester = sqllogictest::Runner::new(|| async { Ok(FakeDB) });
+    let mut tester =
+        sqllogictest::Runner::new(|_ssl_mode, _port, _user, _password, _database| async {
+            Ok(FakeDB)
+        });
     // Validator will always return true.
     tester.with_validator(|_, _, _| true);
 
-    tester.run_file("./validator/validator.slt").unwrap();
+    tester.run_file_test("./validator/validator.slt").unwrap();
 }
