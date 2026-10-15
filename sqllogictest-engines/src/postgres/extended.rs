@@ -493,20 +493,20 @@ impl fmt::Display for InetValue {
 }
 
 #[derive(Debug)]
-struct Refcursor(String);
+struct TextValue(String);
 
-impl<'a> FromSql<'a> for Refcursor {
+impl<'a> FromSql<'a> for TextValue {
     fn from_sql(
         _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(Refcursor(std::str::from_utf8(raw)?.to_string()))
+        Ok(TextValue(std::str::from_utf8(raw)?.to_string()))
     }
 
-    accepts!(REFCURSOR);
+    accepts!(REFCURSOR, XML);
 }
 
-impl fmt::Display for Refcursor {
+impl fmt::Display for TextValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -745,7 +745,12 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
             Type::FLOAT8 if bytes.len() == 8 => {
                 return Some(float8_to_str(&f64::from_be_bytes(bytes.try_into().ok()?)));
             }
-            Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR | Type::REFCURSOR => {
+            Type::TEXT
+            | Type::VARCHAR
+            | Type::NAME
+            | Type::BPCHAR
+            | Type::REFCURSOR
+            | Type::XML => {
                 return Some(std::str::from_utf8(bytes).ok()?.to_string());
             }
             Type::BYTEA => {
@@ -1517,11 +1522,11 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::INET | Type::CIDR => {
                         single_process!(row, row_vec, idx, InetValue);
                     }
-                    Type::REFCURSOR => {
-                        single_process!(row, row_vec, idx, Refcursor);
+                    Type::REFCURSOR | Type::XML => {
+                        single_process!(row, row_vec, idx, TextValue);
                     }
-                    Type::REFCURSOR_ARRAY => {
-                        array_process!(row, row_vec, idx, Refcursor);
+                    Type::REFCURSOR_ARRAY | Type::XML_ARRAY => {
+                        array_process!(row, row_vec, idx, TextValue);
                     }
                     Type::MACADDR | Type::MACADDR8 => {
                         single_process!(row, row_vec, idx, MacaddrValue);
