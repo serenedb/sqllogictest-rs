@@ -670,32 +670,85 @@ impl<'a> FromSql<'a> for RangeValue {
         let Kind::Range(element) = ty.kind() else {
             return Err(format!("{} is not a range type", ty.name()).into());
         };
-        let (&flags, mut rest) = raw.split_first().ok_or("range value: missing flags")?;
-        if flags & RANGE_EMPTY != 0 {
-            return Ok(RangeValue("empty".into()));
-        }
-        let mut bound = |infinite: u8| -> Option<String> {
-            if flags & infinite != 0 {
-                return Some(String::new());
-            }
-            let mut pos = 0;
-            let len = usize::try_from(read_be_i32(rest, &mut pos)?).ok()?;
-            let bytes = rest.get(pos..pos + len)?;
-            rest = &rest[pos + len..];
-            Some(escape_range_bound(&render_record_field(
-                element.oid() as i32,
-                bytes,
-            )?))
-        };
-        let lower = bound(RANGE_LB_INF).ok_or("range value: bad lower bound")?;
-        let upper = bound(RANGE_UB_INF).ok_or("range value: bad upper bound")?;
-        let open = if flags & RANGE_LB_INC != 0 { '[' } else { '(' };
-        let close = if flags & RANGE_UB_INC != 0 { ']' } else { ')' };
-        Ok(RangeValue(format!("{open}{lower},{upper}{close}")))
+        Ok(RangeValue(
+            render_range(element, raw).ok_or("range value: malformed")?,
+        ))
     }
 
     fn accepts(ty: &Type) -> bool {
         matches!(ty.kind(), Kind::Range(_))
+    }
+}
+
+fn render_range(element: &Type, raw: &[u8]) -> Option<String> {
+    let (&flags, mut rest) = raw.split_first()?;
+    if flags & RANGE_EMPTY != 0 {
+        return (rest.is_empty()).then(|| "empty".into());
+    }
+    let mut bound = |infinite: u8| -> Option<String> {
+        if flags & infinite != 0 {
+            return Some(String::new());
+        }
+        let mut pos = 0;
+        let len = usize::try_from(read_be_i32(rest, &mut pos)?).ok()?;
+        let bytes = rest.get(pos..pos + len)?;
+        rest = &rest[pos + len..];
+        Some(escape_range_bound(&render_record_field(
+            element.oid() as i32,
+            bytes,
+        )?))
+    };
+    let lower = bound(RANGE_LB_INF)?;
+    let upper = bound(RANGE_UB_INF)?;
+    let open = if flags & RANGE_LB_INC != 0 { '[' } else { '(' };
+    let close = if flags & RANGE_UB_INC != 0 { ']' } else { ')' };
+    rest.is_empty()
+        .then(|| format!("{open}{lower},{upper}{close}"))
+}
+
+// Multirange values (see PG `multirange_send`): an int32 range count, then
+// each range as an int32 length followed by its `range_send` bytes. Rendered
+// like PG's `multirange_out`.
+#[derive(Debug)]
+struct MultirangeValue(String);
+
+impl<'a> FromSql<'a> for MultirangeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let Kind::Multirange(element) = ty.kind() else {
+            return Err(format!("{} is not a multirange type", ty.name()).into());
+        };
+        Ok(MultirangeValue(
+            render_multirange(element, raw).ok_or("multirange value: malformed")?,
+        ))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Multirange(_))
+    }
+}
+
+fn render_multirange(element: &Type, raw: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    let count = read_be_i32(raw, &mut pos)?;
+    let mut out = String::from('{');
+    for i in 0..count {
+        if i > 0 {
+            out.push(',');
+        }
+        let len = usize::try_from(read_be_i32(raw, &mut pos)?).ok()?;
+        out.push_str(&render_range(element, raw.get(pos..pos + len)?)?);
+        pos += len;
+    }
+    out.push('}');
+    (pos == raw.len()).then_some(out)
+}
+
+impl fmt::Display for MultirangeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -815,8 +868,11 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(rendered);
             }
         }
-        if matches!(t.kind(), Kind::Range(_)) {
-            return RangeValue::from_sql(t, bytes).ok().map(|v| v.0);
+        if let Kind::Range(element) = t.kind() {
+            return render_range(element, bytes);
+        }
+        if let Kind::Multirange(element) = t.kind() {
+            return render_multirange(element, bytes);
         }
     }
     if let Some(t) = ty {
@@ -1611,6 +1667,16 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     ) =>
                     {
                         array_process!(row, row_vec, idx, RangeValue);
+                    }
+                    _ if matches!(column.type_().kind(), Kind::Multirange(_)) => {
+                        single_process!(row, row_vec, idx, MultirangeValue);
+                    }
+                    _ if matches!(
+                        column.type_().kind(),
+                        Kind::Array(elem) if matches!(elem.kind(), Kind::Multirange(_))
+                    ) =>
+                    {
+                        array_process!(row, row_vec, idx, MultirangeValue);
                     }
                     _ if column.type_().name() == "geometry" => {
                         single_process!(row, row_vec, idx, GeometryValue);
