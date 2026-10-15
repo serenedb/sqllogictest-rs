@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::NaiveTime;
 use futures::{pin_mut, StreamExt};
 use pg_interval::Interval;
 use postgres_types::{accepts, FromSql, Kind, PgLsn, ToSql, Type};
@@ -224,31 +224,79 @@ impl fmt::Display for BitValue {
     }
 }
 
-// TIMESTAMP can be ±infinity (i64::MAX / i64::MIN microseconds since 2000-01-01),
-// which chrono's NaiveDateTime can't represent. Decode the sentinels explicitly
-// and fall back to NaiveDateTime for finite values.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+fn read_micros(raw: &[u8]) -> std::result::Result<i64, Box<dyn std::error::Error + Sync + Send>> {
+    Ok(i64::from_be_bytes(
+        raw.try_into().map_err(|_| "expected an 8-byte value")?,
+    ))
+}
+
+// The proleptic Gregorian (year, month, day) `days` after 2000-01-01, PG's
+// epoch, for any day count the server sends: chrono stops at year 262143, and
+// SereneDB's dates reach millions of years.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 10_957 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+// A date as PG prints it: years before 1 AD as "YYYY-MM-DD BC".
+fn format_date_part(days: i64) -> (String, bool) {
+    let (year, month, day) = civil_from_days(days);
+    let bc = year <= 0;
+    let year = if bc { 1 - year } else { year };
+    (format!("{year:04}-{month:02}-{day:02}"), bc)
+}
+
+fn format_date(days: i64) -> String {
+    match format_date_part(days) {
+        (date, true) => date + " BC",
+        (date, false) => date,
+    }
+}
+
+// A time of day as PG prints it, with fractional seconds only when nonzero,
+// trailing zeros trimmed; 24:00:00 stays 24:00:00.
+fn format_time(micros: i64) -> String {
+    let secs = micros / 1_000_000;
+    let base = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+    match micros % 1_000_000 {
+        0 => base,
+        frac => format!("{base}.{}", format!("{frac:06}").trim_end_matches('0')),
+    }
+}
+
+// A timestamp of `micros` after 2000-01-01 as PG prints it, followed by
+// `zone` and, before 1 AD, " BC"; i64::MAX / i64::MIN are ±infinity.
+fn format_timestamp(micros: i64, zone: &str) -> String {
+    match micros {
+        i64::MAX => "infinity".into(),
+        i64::MIN => "-infinity".into(),
+        _ => {
+            let (date, bc) = format_date_part(micros.div_euclid(MICROS_PER_DAY));
+            let time = format_time(micros.rem_euclid(MICROS_PER_DAY));
+            format!("{date} {time}{zone}{}", if bc { " BC" } else { "" })
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TimestampValue(String);
 
 impl<'a> FromSql<'a> for TimestampValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 8 {
-            let micros = i64::from_be_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            if micros == i64::MAX {
-                return Ok(TimestampValue("infinity".into()));
-            }
-            if micros == i64::MIN {
-                return Ok(TimestampValue("-infinity".into()));
-            }
-        }
-        Ok(TimestampValue(
-            NaiveDateTime::from_sql(ty, raw)?.to_string(),
-        ))
+        Ok(TimestampValue(format_timestamp(read_micros(raw)?, "")))
     }
 
     accepts!(TIMESTAMP);
@@ -260,33 +308,16 @@ impl fmt::Display for TimestampValue {
     }
 }
 
-// TIMESTAMPTZ carries the same ±infinity sentinels as TIMESTAMP, which
-// chrono's DateTime<Utc> can't represent. Decode the sentinels explicitly and
-// render finite values in UTC with the fixed "+00" suffix (same shape as the
-// binary record path above).
+// TIMESTAMPTZ renders in UTC with the fixed "+00" suffix.
 #[derive(Debug)]
 struct TimestampTzValue(String);
 
 impl<'a> FromSql<'a> for TimestampTzValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 8 {
-            let micros = i64::from_be_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            if micros == i64::MAX {
-                return Ok(TimestampTzValue("infinity".into()));
-            }
-            if micros == i64::MIN {
-                return Ok(TimestampTzValue("-infinity".into()));
-            }
-        }
-        let dt = DateTime::<chrono::Utc>::from_sql(ty, raw)?;
-        Ok(TimestampTzValue(
-            format_naive_timestamp(dt.naive_utc()) + "+00",
-        ))
+        Ok(TimestampTzValue(format_timestamp(read_micros(raw)?, "+00")))
     }
 
     accepts!(TIMESTAMPTZ);
@@ -298,26 +329,15 @@ impl fmt::Display for TimestampTzValue {
     }
 }
 
-// TIME can be the 24:00:00 day boundary (86400000000 micros), which chrono's
-// NaiveTime wraps to 00:00:00. Decode it explicitly.
 #[derive(Debug)]
 struct TimeValue(String);
 
 impl<'a> FromSql<'a> for TimeValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 8 {
-            let micros = i64::from_be_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            if micros == 86_400_000_000 {
-                return Ok(TimeValue("24:00:00".into()));
-            }
-        }
-        let t = NaiveTime::from_sql(ty, raw)?;
-        Ok(TimeValue(format_naive_time(t)))
+        Ok(TimeValue(format_time(read_micros(raw)?)))
     }
 
     accepts!(TIME);
@@ -329,27 +349,22 @@ impl fmt::Display for TimeValue {
     }
 }
 
-// DATE carries ±infinity as i32::MAX / i32::MIN days since 2000-01-01, which
-// chrono's NaiveDate can't represent. Decode the sentinels explicitly.
+// DATE travels as i32 days since 2000-01-01, i32::MAX / i32::MIN being
+// ±infinity.
 #[derive(Debug)]
 struct DateValue(String);
 
 impl<'a> FromSql<'a> for DateValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 4 {
-            let days = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            if days == i32::MAX {
-                return Ok(DateValue("infinity".into()));
-            }
-            if days == i32::MIN {
-                return Ok(DateValue("-infinity".into()));
-            }
-        }
-        let d = NaiveDate::from_sql(ty, raw)?;
-        Ok(DateValue(d.format("%Y-%m-%d").to_string()))
+        let days = i32::from_be_bytes(raw.try_into().map_err(|_| "expected a 4-byte date")?);
+        Ok(DateValue(match days {
+            i32::MAX => "infinity".into(),
+            i32::MIN => "-infinity".into(),
+            _ => format_date(days.into()),
+        }))
     }
 
     accepts!(DATE);
@@ -768,20 +783,16 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(d.to_string());
             }
             Type::TIMESTAMP => {
-                let dt = NaiveDateTime::from_sql(&Type::TIMESTAMP, bytes).ok()?;
-                return Some(format_naive_timestamp(dt));
+                return TimestampValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::TIMESTAMPTZ => {
-                let dt = DateTime::<chrono::Utc>::from_sql(&Type::TIMESTAMPTZ, bytes).ok()?;
-                return Some(format_naive_timestamp(dt.naive_utc()) + "+00");
+                return TimestampTzValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::DATE => {
-                let d = NaiveDate::from_sql(&Type::DATE, bytes).ok()?;
-                return Some(d.format("%Y-%m-%d").to_string());
+                return DateValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::TIME => {
-                let t = NaiveTime::from_sql(&Type::TIME, bytes).ok()?;
-                return Some(format_naive_time(t));
+                return TimeValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::INTERVAL => {
                 let iv = Interval::from_sql(&Type::INTERVAL, bytes).ok()?;
@@ -833,32 +844,6 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
         return Some(rendered);
     }
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
-}
-
-// Format a NaiveDateTime as PG would (e.g. "2025-03-15 14:30:00", with
-// fractional seconds appended only when nonzero, trailing zeros trimmed).
-fn format_naive_timestamp(dt: NaiveDateTime) -> String {
-    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-    let nanos = dt.nanosecond();
-    if nanos == 0 {
-        base
-    } else {
-        let frac = format!("{:09}", nanos);
-        let frac = frac.trim_end_matches('0');
-        format!("{base}.{frac}")
-    }
-}
-
-fn format_naive_time(t: NaiveTime) -> String {
-    let base = t.format("%H:%M:%S").to_string();
-    let nanos = t.nanosecond();
-    if nanos == 0 {
-        base
-    } else {
-        let frac = format!("{:09}", nanos);
-        let frac = frac.trim_end_matches('0');
-        format!("{base}.{frac}")
-    }
 }
 
 // Append a record field to `out`, applying PG's composite quoting rules
@@ -1345,7 +1330,7 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         single_process!(row, row_vec, idx, TimeValue);
                     }
                     Type::TIME_ARRAY => {
-                        array_process!(row, row_vec, idx, NaiveTime);
+                        array_process!(row, row_vec, idx, TimeValue);
                     }
                     Type::TIMETZ => {
                         single_process!(row, row_vec, idx, TimeTzValue);
