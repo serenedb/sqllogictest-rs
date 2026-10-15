@@ -650,6 +650,83 @@ impl fmt::Display for MoneyValue {
     }
 }
 
+// Range values (see PG `range_send`): a flags byte, then the lower and upper
+// bounds that are present, each an int32 length followed by the element's
+// binary value. Rendered like PG's `range_out`.
+#[derive(Debug)]
+struct RangeValue(String);
+
+const RANGE_EMPTY: u8 = 0x01;
+const RANGE_LB_INC: u8 = 0x02;
+const RANGE_UB_INC: u8 = 0x04;
+const RANGE_LB_INF: u8 = 0x08;
+const RANGE_UB_INF: u8 = 0x10;
+
+impl<'a> FromSql<'a> for RangeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let Kind::Range(element) = ty.kind() else {
+            return Err(format!("{} is not a range type", ty.name()).into());
+        };
+        let (&flags, mut rest) = raw.split_first().ok_or("range value: missing flags")?;
+        if flags & RANGE_EMPTY != 0 {
+            return Ok(RangeValue("empty".into()));
+        }
+        let mut bound = |infinite: u8| -> Option<String> {
+            if flags & infinite != 0 {
+                return Some(String::new());
+            }
+            let mut pos = 0;
+            let len = usize::try_from(read_be_i32(rest, &mut pos)?).ok()?;
+            let bytes = rest.get(pos..pos + len)?;
+            rest = &rest[pos + len..];
+            Some(escape_range_bound(&render_record_field(
+                element.oid() as i32,
+                bytes,
+            )?))
+        };
+        let lower = bound(RANGE_LB_INF).ok_or("range value: bad lower bound")?;
+        let upper = bound(RANGE_UB_INF).ok_or("range value: bad upper bound")?;
+        let open = if flags & RANGE_LB_INC != 0 { '[' } else { '(' };
+        let close = if flags & RANGE_UB_INC != 0 { ']' } else { ')' };
+        Ok(RangeValue(format!("{open}{lower},{upper}{close}")))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Range(_))
+    }
+}
+
+// Quote a range bound like PG's `range_bound_escape`: when empty or holding
+// `"`, `\`, `(`, `)`, `[`, `]`, `,` or whitespace, with `"` and `\` doubled.
+fn escape_range_bound(value: &str) -> String {
+    let needs_quote = value.is_empty()
+        || value.chars().any(|c| {
+            matches!(c, '"' | '\\' | '(' | ')' | '[' | ']' | ',') || c.is_ascii_whitespace()
+        });
+    if !needs_quote {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+impl fmt::Display for RangeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // Composite/record values. The server may send composite either as text
 // (`(f1,f2,...)`) when negotiated, or as PG's binary record format when the
 // client (tokio-postgres by default) requests binary. We handle both: try
@@ -734,6 +811,9 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
             if let Some(rendered) = parse_array_binary(bytes) {
                 return Some(rendered);
             }
+        }
+        if matches!(t.kind(), Kind::Range(_)) {
+            return RangeValue::from_sql(t, bytes).ok().map(|v| v.0);
         }
     }
     if let Some(t) = ty {
@@ -1515,6 +1595,16 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
+                    }
+                    _ if matches!(column.type_().kind(), Kind::Range(_)) => {
+                        single_process!(row, row_vec, idx, RangeValue);
+                    }
+                    _ if matches!(
+                        column.type_().kind(),
+                        Kind::Array(elem) if matches!(elem.kind(), Kind::Range(_))
+                    ) =>
+                    {
+                        array_process!(row, row_vec, idx, RangeValue);
                     }
                     _ if column.type_().name() == "geometry" => {
                         single_process!(row, row_vec, idx, GeometryValue);
