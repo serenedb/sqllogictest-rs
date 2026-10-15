@@ -30,23 +30,23 @@ fn print_array<T: std::fmt::Display>(
 // * equals to NULL (case insensitive)
 // Or contains
 // * curly braces
-// * delimiter characters(comma)
+// * the type's delimiter character (a comma, a semicolon for box)
 // * double quotes
 // * backslashes
 // * space
 // It'is used (although it's simple protocol specific) to not duplicate tests for simple and
 // extended protocols.
-pub fn array_item_need_escape_and_quote(data: &str) -> bool {
+pub fn array_item_need_escape_and_quote(data: &str, delim: char) -> bool {
     if data.is_empty() || data.eq_ignore_ascii_case("null") {
         return true;
     }
 
     data.chars()
-        .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_ascii_whitespace())
+        .any(|c| matches!(c, '{' | '}' | '"' | '\\') || c == delim || c.is_ascii_whitespace())
 }
 
-pub fn escape_and_quote(input: &str) -> String {
-    debug_assert!(array_item_need_escape_and_quote(input));
+pub fn escape_and_quote(input: &str, delim: char) -> String {
+    debug_assert!(array_item_need_escape_and_quote(input, delim));
     let mut response = String::with_capacity(input.len());
     response.push('"');
 
@@ -76,8 +76,8 @@ fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Opti
             Some(value) => {
                 let mut item = String::new();
                 write!(item, "{}", value)?;
-                if array_item_need_escape_and_quote(&item) {
-                    item = escape_and_quote(&item);
+                if array_item_need_escape_and_quote(&item, delim) {
+                    item = escape_and_quote(&item, delim);
                 }
                 assert!(!item.is_empty());
                 fmt.write_str(&item)
@@ -752,6 +752,90 @@ impl fmt::Display for MultirangeValue {
     }
 }
 
+// Geometric values (see PG `point_send` and its siblings): float8 coordinates,
+// a closed-flag byte and an int32 point count in front of a path's points, an
+// int32 point count in front of a polygon's. Rendered like PG's `point_out`,
+// `line_out`, `lseg_out`, `box_out`, `path_out`, `poly_out` and `circle_out`.
+#[derive(Debug)]
+struct GeometricValue(String);
+
+impl<'a> FromSql<'a> for GeometricValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(GeometricValue(
+            render_geometric(ty, raw).ok_or("geometric value: malformed")?,
+        ))
+    }
+
+    accepts!(POINT, LINE, LSEG, BOX, PATH, POLYGON, CIRCLE);
+}
+
+fn render_geometric(ty: &Type, raw: &[u8]) -> Option<String> {
+    let coordinates = |bytes: &[u8], count: usize| -> Option<Vec<f64>> {
+        (bytes.len() == count * 8).then(|| {
+            bytes
+                .chunks_exact(8)
+                .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
+                .collect()
+        })
+    };
+    let points = |values: &[f64]| -> String {
+        values
+            .chunks_exact(2)
+            .map(|point| {
+                format!(
+                    "({},{})",
+                    float8_to_str(&point[0]),
+                    float8_to_str(&point[1])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let counted = |bytes: &[u8]| -> Option<Vec<f64>> {
+        let mut pos = 0;
+        let count = usize::try_from(read_be_i32(bytes, &mut pos)?).ok()?;
+        coordinates(&bytes[pos..], 2 * count)
+    };
+    match *ty {
+        Type::POINT => Some(points(&coordinates(raw, 2)?)),
+        Type::LINE => {
+            let values = coordinates(raw, 3)?;
+            Some(format!(
+                "{{{},{},{}}}",
+                float8_to_str(&values[0]),
+                float8_to_str(&values[1]),
+                float8_to_str(&values[2])
+            ))
+        }
+        Type::LSEG => Some(format!("[{}]", points(&coordinates(raw, 4)?))),
+        Type::BOX => Some(points(&coordinates(raw, 4)?)),
+        Type::CIRCLE => {
+            let values = coordinates(raw, 3)?;
+            Some(format!(
+                "<{},{}>",
+                points(&values[..2]),
+                float8_to_str(&values[2])
+            ))
+        }
+        Type::PATH => {
+            let (&closed, rest) = raw.split_first()?;
+            let (open, close) = if closed != 0 { ('(', ')') } else { ('[', ']') };
+            Some(format!("{open}{}{close}", points(&counted(rest)?)))
+        }
+        Type::POLYGON => Some(format!("({})", points(&counted(raw)?))),
+        _ => None,
+    }
+}
+
+impl fmt::Display for GeometricValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // Quote a range bound like PG's `range_bound_escape`: when empty or holding
 // `"`, `\`, `(`, `)`, `[`, `]`, `,` or whitespace, with `"` and `\` doubled.
 fn escape_range_bound(value: &str) -> String {
@@ -962,6 +1046,15 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                     .ok()
                     .map(|v| v.to_string());
             }
+            Type::POINT
+            | Type::LINE
+            | Type::LSEG
+            | Type::BOX
+            | Type::PATH
+            | Type::POLYGON
+            | Type::CIRCLE => {
+                return render_geometric(&t, bytes);
+            }
             Type::RECORD => {
                 return parse_record_binary(bytes);
             }
@@ -1010,14 +1103,14 @@ fn append_composite_field(out: &mut String, field: &str) {
 
 // Append an array element to `out`, applying PG's array quoting rules
 // (matches `array_out`). Quote if empty, equals "NULL" case-insensitively,
-// or contains `,`, `{`, `}`, `"`, `\`, or whitespace. Inside quotes,
+// or contains the delimiter, `{`, `}`, `"`, `\`, or whitespace. Inside quotes,
 // `"` becomes `\"` and `\` becomes `\\`.
-fn append_array_element(out: &mut String, elem: &str) {
+fn append_array_element(out: &mut String, elem: &str, delim: char) {
     let needs_quote = elem.is_empty()
         || elem.eq_ignore_ascii_case("NULL")
         || elem
             .chars()
-            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+            .any(|c| matches!(c, '{' | '}' | '"' | '\\') || c == delim || c.is_whitespace());
     if needs_quote {
         out.push('"');
         for c in elem.chars() {
@@ -1115,21 +1208,32 @@ fn parse_array_binary(raw: &[u8]) -> Option<String> {
     if pos != raw.len() {
         return None;
     }
+    let delim = if elem_oid as u32 == Type::BOX.oid() {
+        ';'
+    } else {
+        ','
+    };
     let mut out = String::new();
     let mut idx = 0;
-    render_array_dim(&mut out, &elems, &dims, &mut idx);
+    render_array_dim(&mut out, &elems, &dims, &mut idx, delim);
     Some(out)
 }
 
-fn render_array_dim(out: &mut String, elems: &[Option<String>], dims: &[usize], idx: &mut usize) {
+fn render_array_dim(
+    out: &mut String,
+    elems: &[Option<String>],
+    dims: &[usize],
+    idx: &mut usize,
+    delim: char,
+) {
     out.push('{');
     if dims.len() == 1 {
         for i in 0..dims[0] {
             if i > 0 {
-                out.push(',');
+                out.push(delim);
             }
             match &elems[*idx] {
-                Some(s) => append_array_element(out, s),
+                Some(s) => append_array_element(out, s, delim),
                 None => out.push_str("NULL"),
             }
             *idx += 1;
@@ -1137,9 +1241,9 @@ fn render_array_dim(out: &mut String, elems: &[Option<String>], dims: &[usize], 
     } else {
         for i in 0..dims[0] {
             if i > 0 {
-                out.push(',');
+                out.push(delim);
             }
-            render_array_dim(out, elems, &dims[1..], idx);
+            render_array_dim(out, elems, &dims[1..], idx, delim);
         }
     }
     out.push('}');
@@ -1679,6 +1783,26 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
                     }
+                    Type::POINT
+                    | Type::LINE
+                    | Type::LSEG
+                    | Type::BOX
+                    | Type::PATH
+                    | Type::POLYGON
+                    | Type::CIRCLE => {
+                        single_process!(row, row_vec, idx, GeometricValue);
+                    }
+                    Type::BOX_ARRAY => {
+                        array_process!(row, row_vec, idx, GeometricValue, delim = ';');
+                    }
+                    Type::POINT_ARRAY
+                    | Type::LINE_ARRAY
+                    | Type::LSEG_ARRAY
+                    | Type::PATH_ARRAY
+                    | Type::POLYGON_ARRAY
+                    | Type::CIRCLE_ARRAY => {
+                        array_process!(row, row_vec, idx, GeometricValue);
+                    }
                     _ if matches!(column.type_().kind(), Kind::Range(_)) => {
                         single_process!(row, row_vec, idx, RangeValue);
                     }
@@ -1845,5 +1969,68 @@ mod float_tests {
             "1.7976931348623157e+308"
         );
         assert_eq!(float8_to_str(&f64::INFINITY), "Infinity");
+    }
+}
+
+#[cfg(test)]
+mod geometric_tests {
+    use super::*;
+
+    fn bytes(values: &[f64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    fn counted(prefix: &[u8], values: &[f64]) -> Vec<u8> {
+        let mut raw = prefix.to_vec();
+        raw.extend_from_slice(&((values.len() / 2) as i32).to_be_bytes());
+        raw.extend(bytes(values));
+        raw
+    }
+
+    fn decode(ty: &Type, raw: &[u8]) -> String {
+        GeometricValue::from_sql(ty, raw).unwrap().0
+    }
+
+    #[test]
+    fn fixed_shapes() {
+        assert_eq!(decode(&Type::POINT, &bytes(&[1.5, -2.0])), "(1.5,-2)");
+        assert_eq!(decode(&Type::LINE, &bytes(&[1.0, -1.0, 0.0])), "{1,-1,0}");
+        assert_eq!(
+            decode(&Type::LSEG, &bytes(&[0.0, 0.0, 1.0, 2.0])),
+            "[(0,0),(1,2)]"
+        );
+        assert_eq!(
+            decode(&Type::BOX, &bytes(&[2.0, 2.0, 0.0, 0.0])),
+            "(2,2),(0,0)"
+        );
+        assert_eq!(
+            decode(&Type::CIRCLE, &bytes(&[1.0, 1.0, f64::INFINITY])),
+            "<(1,1),Infinity>"
+        );
+    }
+
+    #[test]
+    fn paths_and_polygons() {
+        let points = [0.0, 0.0, 1.0, 1e20];
+        assert_eq!(
+            decode(&Type::PATH, &counted(&[1], &points)),
+            "((0,0),(1,1e+20))"
+        );
+        assert_eq!(
+            decode(&Type::PATH, &counted(&[0], &points)),
+            "[(0,0),(1,1e+20)]"
+        );
+        assert_eq!(
+            decode(&Type::POLYGON, &counted(&[], &points)),
+            "((0,0),(1,1e+20))"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        assert!(GeometricValue::from_sql(&Type::POINT, &bytes(&[1.0])).is_err());
+        assert!(
+            GeometricValue::from_sql(&Type::POLYGON, &counted(&[], &[1.0, 2.0])[..10]).is_err()
+        );
     }
 }
