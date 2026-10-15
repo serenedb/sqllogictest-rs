@@ -1328,15 +1328,21 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                             (QueryExpect::Error(error), &[][..])
                         }
                     }
-                    [type_str, res @ ..] => {
-                        // query [async] <type-string> [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
-                        let types = type_str
-                            .chars()
-                            .map(|ch| {
-                                T::from_char(ch)
-                                    .ok_or_else(|| ParseErrorKind::InvalidType(ch).at(loc.clone()))
-                            })
-                            .try_collect()?;
+                    [type_str, rest @ ..] => {
+                        // query [async] [<type-string>] [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
+                        let (types, res) = if SortMode::try_from_str(type_str).is_ok() {
+                            (Vec::new(), res)
+                        } else {
+                            let types = type_str
+                                .chars()
+                                .map(|ch| {
+                                    T::from_char(ch).ok_or_else(|| {
+                                        ParseErrorKind::InvalidType(ch).at(loc.clone())
+                                    })
+                                })
+                                .try_collect()?;
+                            (types, rest)
+                        };
                         let sort_mode = res.first().and_then(|&s| SortMode::try_from_str(s).ok()); // Could be `retry` or label
 
                         // To support `retry`, we assume the label must *not* be "retry"
@@ -1782,6 +1788,23 @@ mod tests {
     #[test]
     fn test_valuesort() {
         parse_roundtrip::<DefaultColumnType>("../tests/slt/valuesort.slt")
+    }
+
+    #[test]
+    fn test_sort_mode_without_types() {
+        let records = parse::<DefaultColumnType>("query rowsort\nSELECT 1\n----\n1\n").unwrap();
+        let Record::Query {
+            expected: QueryExpect::Results {
+                types, sort_mode, ..
+            },
+            ..
+        } = &records[0]
+        else {
+            panic!("not a query: {:?}", records[0]);
+        };
+        assert!(types.is_empty());
+        assert_eq!(*sort_mode, Some(SortMode::RowSort));
+        assert_eq!(records[0].to_string(), "query rowsort\nSELECT 1\n----\n1\n");
     }
 
     #[test]
