@@ -1345,10 +1345,8 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         let value: Option<RegOid> = row.get(idx);
                         match value {
                             Some(RegOid(oid)) => {
-                                let sql = format!(
-                                    "select ($1::oid)::{}::varchar",
-                                    column.type_().name()
-                                );
+                                let sql =
+                                    format!("select ($1::oid)::{}::varchar", column.type_().name());
                                 let tmp_rows = self.client()?.query(&sql, &[&oid]).await?;
                                 let text: &str = tmp_rows[0].get(0);
                                 row_vec.push(placeholder_if_empty(text.to_string()));
