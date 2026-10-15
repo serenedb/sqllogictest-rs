@@ -877,6 +877,9 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
     }
     let ty = Type::from_oid(oid as u32);
     if let Some(t) = &ty {
+        if *t == Type::INT2_VECTOR || *t == Type::OID_VECTOR {
+            return VectorValue::from_sql(t, bytes).ok().map(|v| v.to_string());
+        }
         if matches!(t.kind(), Kind::Array(_)) {
             if let Some(rendered) = parse_array_binary(bytes) {
                 return Some(rendered);
@@ -1673,6 +1676,9 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     }
                     Type::INT2_VECTOR | Type::OID_VECTOR => {
                         single_process!(row, row_vec, idx, VectorValue);
+                    }
+                    Type::INT2_VECTOR_ARRAY | Type::OID_VECTOR_ARRAY => {
+                        array_process!(row, row_vec, idx, VectorValue);
                     }
                     Type::MACADDR_ARRAY | Type::MACADDR8_ARRAY => {
                         array_process!(row, row_vec, idx, MacaddrValue);
