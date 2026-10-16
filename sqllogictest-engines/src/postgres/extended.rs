@@ -4,10 +4,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::NaiveTime;
 use futures::{pin_mut, StreamExt};
 use pg_interval::Interval;
-use postgres_types::{accepts, FromSql, Kind, ToSql, Type};
+use postgres_types::{accepts, FromSql, Kind, PgLsn, ToSql, Type};
 use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
@@ -30,23 +30,23 @@ fn print_array<T: std::fmt::Display>(
 // * equals to NULL (case insensitive)
 // Or contains
 // * curly braces
-// * delimiter characters(comma)
+// * the type's delimiter character (a comma, a semicolon for box)
 // * double quotes
 // * backslashes
 // * space
 // It'is used (although it's simple protocol specific) to not duplicate tests for simple and
 // extended protocols.
-pub fn array_item_need_escape_and_quote(data: &str) -> bool {
+pub fn array_item_need_escape_and_quote(data: &str, delim: char) -> bool {
     if data.is_empty() || data.eq_ignore_ascii_case("null") {
         return true;
     }
 
     data.chars()
-        .any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_ascii_whitespace())
+        .any(|c| matches!(c, '{' | '}' | '"' | '\\') || c == delim || c.is_ascii_whitespace())
 }
 
-pub fn escape_and_quote(input: &str) -> String {
-    debug_assert!(array_item_need_escape_and_quote(input));
+pub fn escape_and_quote(input: &str, delim: char) -> String {
+    debug_assert!(array_item_need_escape_and_quote(input, delim));
     let mut response = String::with_capacity(input.len());
     response.push('"');
 
@@ -76,8 +76,8 @@ fn print_array_helper<'a, T: std::fmt::Display + 'a, I: Iterator<Item = &'a Opti
             Some(value) => {
                 let mut item = String::new();
                 write!(item, "{}", value)?;
-                if array_item_need_escape_and_quote(&item) {
-                    item = escape_and_quote(&item);
+                if array_item_need_escape_and_quote(&item, delim) {
+                    item = escape_and_quote(&item, delim);
                 }
                 assert!(!item.is_empty());
                 fmt.write_str(&item)
@@ -224,31 +224,79 @@ impl fmt::Display for BitValue {
     }
 }
 
-// TIMESTAMP can be ±infinity (i64::MAX / i64::MIN microseconds since 2000-01-01),
-// which chrono's NaiveDateTime can't represent. Decode the sentinels explicitly
-// and fall back to NaiveDateTime for finite values.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+fn read_micros(raw: &[u8]) -> std::result::Result<i64, Box<dyn std::error::Error + Sync + Send>> {
+    Ok(i64::from_be_bytes(
+        raw.try_into().map_err(|_| "expected an 8-byte value")?,
+    ))
+}
+
+// The proleptic Gregorian (year, month, day) `days` after 2000-01-01, PG's
+// epoch, for any day count the server sends: chrono stops at year 262143, and
+// SereneDB's dates reach millions of years.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 10_957 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+// A date as PG prints it: years before 1 AD as "YYYY-MM-DD BC".
+fn format_date_part(days: i64) -> (String, bool) {
+    let (year, month, day) = civil_from_days(days);
+    let bc = year <= 0;
+    let year = if bc { 1 - year } else { year };
+    (format!("{year:04}-{month:02}-{day:02}"), bc)
+}
+
+fn format_date(days: i64) -> String {
+    match format_date_part(days) {
+        (date, true) => date + " BC",
+        (date, false) => date,
+    }
+}
+
+// A time of day as PG prints it, with fractional seconds only when nonzero,
+// trailing zeros trimmed; 24:00:00 stays 24:00:00.
+fn format_time(micros: i64) -> String {
+    let secs = micros / 1_000_000;
+    let base = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+    match micros % 1_000_000 {
+        0 => base,
+        frac => format!("{base}.{}", format!("{frac:06}").trim_end_matches('0')),
+    }
+}
+
+// A timestamp of `micros` after 2000-01-01 as PG prints it, followed by
+// `zone` and, before 1 AD, " BC"; i64::MAX / i64::MIN are ±infinity.
+fn format_timestamp(micros: i64, zone: &str) -> String {
+    match micros {
+        i64::MAX => "infinity".into(),
+        i64::MIN => "-infinity".into(),
+        _ => {
+            let (date, bc) = format_date_part(micros.div_euclid(MICROS_PER_DAY));
+            let time = format_time(micros.rem_euclid(MICROS_PER_DAY));
+            format!("{date} {time}{zone}{}", if bc { " BC" } else { "" })
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TimestampValue(String);
 
 impl<'a> FromSql<'a> for TimestampValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 8 {
-            let micros = i64::from_be_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            if micros == i64::MAX {
-                return Ok(TimestampValue("infinity".into()));
-            }
-            if micros == i64::MIN {
-                return Ok(TimestampValue("-infinity".into()));
-            }
-        }
-        Ok(TimestampValue(
-            NaiveDateTime::from_sql(ty, raw)?.to_string(),
-        ))
+        Ok(TimestampValue(format_timestamp(read_micros(raw)?, "")))
     }
 
     accepts!(TIMESTAMP);
@@ -260,33 +308,16 @@ impl fmt::Display for TimestampValue {
     }
 }
 
-// TIMESTAMPTZ carries the same ±infinity sentinels as TIMESTAMP, which
-// chrono's DateTime<Utc> can't represent. Decode the sentinels explicitly and
-// render finite values in UTC with the fixed "+00" suffix (same shape as the
-// binary record path above).
+// TIMESTAMPTZ renders in UTC with the fixed "+00" suffix.
 #[derive(Debug)]
 struct TimestampTzValue(String);
 
 impl<'a> FromSql<'a> for TimestampTzValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 8 {
-            let micros = i64::from_be_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            if micros == i64::MAX {
-                return Ok(TimestampTzValue("infinity".into()));
-            }
-            if micros == i64::MIN {
-                return Ok(TimestampTzValue("-infinity".into()));
-            }
-        }
-        let dt = DateTime::<chrono::Utc>::from_sql(ty, raw)?;
-        Ok(TimestampTzValue(
-            format_naive_timestamp(dt.naive_utc()) + "+00",
-        ))
+        Ok(TimestampTzValue(format_timestamp(read_micros(raw)?, "+00")))
     }
 
     accepts!(TIMESTAMPTZ);
@@ -298,26 +329,15 @@ impl fmt::Display for TimestampTzValue {
     }
 }
 
-// TIME can be the 24:00:00 day boundary (86400000000 micros), which chrono's
-// NaiveTime wraps to 00:00:00. Decode it explicitly.
 #[derive(Debug)]
 struct TimeValue(String);
 
 impl<'a> FromSql<'a> for TimeValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 8 {
-            let micros = i64::from_be_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            if micros == 86_400_000_000 {
-                return Ok(TimeValue("24:00:00".into()));
-            }
-        }
-        let t = NaiveTime::from_sql(ty, raw)?;
-        Ok(TimeValue(format_naive_time(t)))
+        Ok(TimeValue(format_time(read_micros(raw)?)))
     }
 
     accepts!(TIME);
@@ -329,27 +349,22 @@ impl fmt::Display for TimeValue {
     }
 }
 
-// DATE carries ±infinity as i32::MAX / i32::MIN days since 2000-01-01, which
-// chrono's NaiveDate can't represent. Decode the sentinels explicitly.
+// DATE travels as i32 days since 2000-01-01, i32::MAX / i32::MIN being
+// ±infinity.
 #[derive(Debug)]
 struct DateValue(String);
 
 impl<'a> FromSql<'a> for DateValue {
     fn from_sql(
-        ty: &Type,
+        _ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        if raw.len() == 4 {
-            let days = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            if days == i32::MAX {
-                return Ok(DateValue("infinity".into()));
-            }
-            if days == i32::MIN {
-                return Ok(DateValue("-infinity".into()));
-            }
-        }
-        let d = NaiveDate::from_sql(ty, raw)?;
-        Ok(DateValue(d.format("%Y-%m-%d").to_string()))
+        let days = i32::from_be_bytes(raw.try_into().map_err(|_| "expected a 4-byte date")?);
+        Ok(DateValue(match days {
+            i32::MAX => "infinity".into(),
+            i32::MIN => "-infinity".into(),
+            _ => format_date(days.into()),
+        }))
     }
 
     accepts!(DATE);
@@ -492,6 +507,363 @@ impl fmt::Display for InetValue {
     }
 }
 
+#[derive(Debug)]
+struct TextValue(String);
+
+impl<'a> FromSql<'a> for TextValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(TextValue(std::str::from_utf8(raw)?.to_string()))
+    }
+
+    accepts!(REFCURSOR, XML);
+}
+
+impl fmt::Display for TextValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug)]
+struct TidValue(u32, u16);
+
+impl<'a> FromSql<'a> for TidValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() != 6 {
+            return Err(format!("invalid tid length {}", raw.len()).into());
+        }
+        Ok(TidValue(
+            u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            u16::from_be_bytes([raw[4], raw[5]]),
+        ))
+    }
+
+    accepts!(TID);
+}
+
+impl fmt::Display for TidValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({},{})", self.0, self.1)
+    }
+}
+
+// int2vector and oidvector travel in the binary array format but print as
+// space-separated numbers.
+#[derive(Debug)]
+struct VectorValue(Vec<String>);
+
+impl<'a> FromSql<'a> for VectorValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let read_i32 = |at: usize| -> std::result::Result<i32, String> {
+            raw.get(at..at + 4)
+                .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                .ok_or_else(|| "truncated vector".to_string())
+        };
+        let ndim = read_i32(0)?;
+        let mut pos = 12usize;
+        let count = if ndim > 0 { read_i32(pos)? as usize } else { 0 };
+        pos += 8 * ndim.max(0) as usize;
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = read_i32(pos)? as usize;
+            pos += 4;
+            let data = raw.get(pos..pos + len).ok_or("truncated vector item")?;
+            pos += len;
+            items.push(if *ty == Type::INT2_VECTOR {
+                i16::from_be_bytes([data[0], data[1]]).to_string()
+            } else {
+                u32::from_be_bytes([data[0], data[1], data[2], data[3]]).to_string()
+            });
+        }
+        Ok(VectorValue(items))
+    }
+
+    accepts!(INT2_VECTOR, OID_VECTOR);
+}
+
+impl fmt::Display for VectorValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.join(" "))
+    }
+}
+
+#[derive(Debug)]
+struct MacaddrValue(Vec<u8>);
+
+impl<'a> FromSql<'a> for MacaddrValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(MacaddrValue(raw.to_vec()))
+    }
+
+    accepts!(MACADDR, MACADDR8);
+}
+
+impl fmt::Display for MacaddrValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let octets: Vec<String> = self.0.iter().map(|b| format!("{b:02x}")).collect();
+        write!(f, "{}", octets.join(":"))
+    }
+}
+
+#[derive(Debug)]
+struct MoneyValue(i64);
+
+impl<'a> FromSql<'a> for MoneyValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let cents: [u8; 8] = raw
+            .try_into()
+            .map_err(|_| format!("invalid money length {}", raw.len()))?;
+        Ok(MoneyValue(i64::from_be_bytes(cents)))
+    }
+
+    accepts!(MONEY);
+}
+
+impl fmt::Display for MoneyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cents = self.0.unsigned_abs();
+        let units = (cents / 100).to_string();
+        let mut grouped = String::with_capacity(units.len() + units.len() / 3);
+        for (i, digit) in units.chars().enumerate() {
+            if i > 0 && (units.len() - i) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(digit);
+        }
+        let sign = if self.0 < 0 { "-" } else { "" };
+        write!(f, "{sign}${grouped}.{:02}", cents % 100)
+    }
+}
+
+// Range values (see PG `range_send`): a flags byte, then the lower and upper
+// bounds that are present, each an int32 length followed by the element's
+// binary value. Rendered like PG's `range_out`.
+#[derive(Debug)]
+struct RangeValue(String);
+
+const RANGE_EMPTY: u8 = 0x01;
+const RANGE_LB_INC: u8 = 0x02;
+const RANGE_UB_INC: u8 = 0x04;
+const RANGE_LB_INF: u8 = 0x08;
+const RANGE_UB_INF: u8 = 0x10;
+
+impl<'a> FromSql<'a> for RangeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let Kind::Range(element) = ty.kind() else {
+            return Err(format!("{} is not a range type", ty.name()).into());
+        };
+        Ok(RangeValue(
+            render_range(element, raw).ok_or("range value: malformed")?,
+        ))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Range(_))
+    }
+}
+
+fn render_range(element: &Type, raw: &[u8]) -> Option<String> {
+    let (&flags, mut rest) = raw.split_first()?;
+    if flags & RANGE_EMPTY != 0 {
+        return (rest.is_empty()).then(|| "empty".into());
+    }
+    let mut bound = |infinite: u8| -> Option<String> {
+        if flags & infinite != 0 {
+            return Some(String::new());
+        }
+        let mut pos = 0;
+        let len = usize::try_from(read_be_i32(rest, &mut pos)?).ok()?;
+        let bytes = rest.get(pos..pos + len)?;
+        rest = &rest[pos + len..];
+        Some(escape_range_bound(&render_record_field(
+            element.oid() as i32,
+            bytes,
+        )?))
+    };
+    let lower = bound(RANGE_LB_INF)?;
+    let upper = bound(RANGE_UB_INF)?;
+    let open = if flags & RANGE_LB_INC != 0 { '[' } else { '(' };
+    let close = if flags & RANGE_UB_INC != 0 { ']' } else { ')' };
+    rest.is_empty()
+        .then(|| format!("{open}{lower},{upper}{close}"))
+}
+
+// Multirange values (see PG `multirange_send`): an int32 range count, then
+// each range as an int32 length followed by its `range_send` bytes. Rendered
+// like PG's `multirange_out`.
+#[derive(Debug)]
+struct MultirangeValue(String);
+
+impl<'a> FromSql<'a> for MultirangeValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let Kind::Multirange(element) = ty.kind() else {
+            return Err(format!("{} is not a multirange type", ty.name()).into());
+        };
+        Ok(MultirangeValue(
+            render_multirange(element, raw).ok_or("multirange value: malformed")?,
+        ))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(ty.kind(), Kind::Multirange(_))
+    }
+}
+
+fn render_multirange(element: &Type, raw: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    let count = read_be_i32(raw, &mut pos)?;
+    let mut out = String::from('{');
+    for i in 0..count {
+        if i > 0 {
+            out.push(',');
+        }
+        let len = usize::try_from(read_be_i32(raw, &mut pos)?).ok()?;
+        out.push_str(&render_range(element, raw.get(pos..pos + len)?)?);
+        pos += len;
+    }
+    out.push('}');
+    (pos == raw.len()).then_some(out)
+}
+
+impl fmt::Display for MultirangeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// Geometric values (see PG `point_send` and its siblings): float8 coordinates,
+// a closed-flag byte and an int32 point count in front of a path's points, an
+// int32 point count in front of a polygon's. Rendered like PG's `point_out`,
+// `line_out`, `lseg_out`, `box_out`, `path_out`, `poly_out` and `circle_out`.
+#[derive(Debug)]
+struct GeometricValue(String);
+
+impl<'a> FromSql<'a> for GeometricValue {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(GeometricValue(
+            render_geometric(ty, raw).ok_or("geometric value: malformed")?,
+        ))
+    }
+
+    accepts!(POINT, LINE, LSEG, BOX, PATH, POLYGON, CIRCLE);
+}
+
+fn render_geometric(ty: &Type, raw: &[u8]) -> Option<String> {
+    let coordinates = |bytes: &[u8], count: usize| -> Option<Vec<f64>> {
+        (bytes.len() == count * 8).then(|| {
+            bytes
+                .chunks_exact(8)
+                .map(|chunk| f64::from_be_bytes(chunk.try_into().unwrap()))
+                .collect()
+        })
+    };
+    let points = |values: &[f64]| -> String {
+        values
+            .chunks_exact(2)
+            .map(|point| {
+                format!(
+                    "({},{})",
+                    float8out_to_str(&point[0]),
+                    float8out_to_str(&point[1])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let counted = |bytes: &[u8]| -> Option<Vec<f64>> {
+        let mut pos = 0;
+        let count = usize::try_from(read_be_i32(bytes, &mut pos)?).ok()?;
+        coordinates(&bytes[pos..], 2 * count)
+    };
+    match *ty {
+        Type::POINT => Some(points(&coordinates(raw, 2)?)),
+        Type::LINE => {
+            let values = coordinates(raw, 3)?;
+            Some(format!(
+                "{{{},{},{}}}",
+                float8out_to_str(&values[0]),
+                float8out_to_str(&values[1]),
+                float8out_to_str(&values[2])
+            ))
+        }
+        Type::LSEG => Some(format!("[{}]", points(&coordinates(raw, 4)?))),
+        Type::BOX => Some(points(&coordinates(raw, 4)?)),
+        Type::CIRCLE => {
+            let values = coordinates(raw, 3)?;
+            Some(format!(
+                "<{},{}>",
+                points(&values[..2]),
+                float8out_to_str(&values[2])
+            ))
+        }
+        Type::PATH => {
+            let (&closed, rest) = raw.split_first()?;
+            let (open, close) = if closed != 0 { ('(', ')') } else { ('[', ']') };
+            Some(format!("{open}{}{close}", points(&counted(rest)?)))
+        }
+        Type::POLYGON => Some(format!("({})", points(&counted(raw)?))),
+        _ => None,
+    }
+}
+
+impl fmt::Display for GeometricValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// Quote a range bound like PG's `range_bound_escape`: when empty or holding
+// `"`, `\`, `(`, `)`, `[`, `]`, `,` or whitespace, with `"` and `\` doubled.
+fn escape_range_bound(value: &str) -> String {
+    let needs_quote = value.is_empty()
+        || value.chars().any(|c| {
+            matches!(c, '"' | '\\' | '(' | ')' | '[' | ']' | ',') || c.is_ascii_whitespace()
+        });
+    if !needs_quote {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        if c == '"' || c == '\\' {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+impl fmt::Display for RangeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 // Composite/record values. The server may send composite either as text
 // (`(f1,f2,...)`) when negotiated, or as PG's binary record format when the
 // client (tokio-postgres by default) requests binary. We handle both: try
@@ -572,10 +944,19 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
     }
     let ty = Type::from_oid(oid as u32);
     if let Some(t) = &ty {
+        if *t == Type::INT2_VECTOR || *t == Type::OID_VECTOR {
+            return VectorValue::from_sql(t, bytes).ok().map(|v| v.to_string());
+        }
         if matches!(t.kind(), Kind::Array(_)) {
             if let Some(rendered) = parse_array_binary(bytes) {
                 return Some(rendered);
             }
+        }
+        if let Kind::Range(element) = t.kind() {
+            return render_range(element, bytes);
+        }
+        if let Kind::Multirange(element) = t.kind() {
+            return render_multirange(element, bytes);
         }
     }
     if let Some(t) = ty {
@@ -597,12 +978,17 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(i64::from_be_bytes(bytes.try_into().ok()?).to_string());
             }
             Type::FLOAT4 if bytes.len() == 4 => {
-                return Some(f32::from_be_bytes(bytes.try_into().ok()?).to_string());
+                return Some(float4_to_str(&f32::from_be_bytes(bytes.try_into().ok()?)));
             }
             Type::FLOAT8 if bytes.len() == 8 => {
-                return Some(f64::from_be_bytes(bytes.try_into().ok()?).to_string());
+                return Some(float8_to_str(&f64::from_be_bytes(bytes.try_into().ok()?)));
             }
-            Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR => {
+            Type::TEXT
+            | Type::VARCHAR
+            | Type::NAME
+            | Type::BPCHAR
+            | Type::REFCURSOR
+            | Type::XML => {
                 return Some(std::str::from_utf8(bytes).ok()?.to_string());
             }
             Type::BYTEA => {
@@ -620,20 +1006,16 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(d.to_string());
             }
             Type::TIMESTAMP => {
-                let dt = NaiveDateTime::from_sql(&Type::TIMESTAMP, bytes).ok()?;
-                return Some(format_naive_timestamp(dt));
+                return TimestampValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::TIMESTAMPTZ => {
-                let dt = DateTime::<chrono::Utc>::from_sql(&Type::TIMESTAMPTZ, bytes).ok()?;
-                return Some(format_naive_timestamp(dt.naive_utc()) + "+00");
+                return TimestampTzValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::DATE => {
-                let d = NaiveDate::from_sql(&Type::DATE, bytes).ok()?;
-                return Some(d.format("%Y-%m-%d").to_string());
+                return DateValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::TIME => {
-                let t = NaiveTime::from_sql(&Type::TIME, bytes).ok()?;
-                return Some(format_naive_time(t));
+                return TimeValue::from_sql(&t, bytes).ok().map(|v| v.0);
             }
             Type::INTERVAL => {
                 let iv = Interval::from_sql(&Type::INTERVAL, bytes).ok()?;
@@ -652,6 +1034,26 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
             }
             Type::INET | Type::CIDR => {
                 return InetValue::from_sql(&t, bytes).ok().map(|v| v.0);
+            }
+            Type::TID => {
+                return TidValue::from_sql(&t, bytes).ok().map(|v| v.to_string());
+            }
+            Type::MONEY => {
+                return MoneyValue::from_sql(&t, bytes).ok().map(|v| v.to_string());
+            }
+            Type::MACADDR | Type::MACADDR8 => {
+                return MacaddrValue::from_sql(&t, bytes)
+                    .ok()
+                    .map(|v| v.to_string());
+            }
+            Type::POINT
+            | Type::LINE
+            | Type::LSEG
+            | Type::BOX
+            | Type::PATH
+            | Type::POLYGON
+            | Type::CIRCLE => {
+                return render_geometric(&t, bytes);
             }
             Type::RECORD => {
                 return parse_record_binary(bytes);
@@ -674,32 +1076,6 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
         return Some(rendered);
     }
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
-}
-
-// Format a NaiveDateTime as PG would (e.g. "2025-03-15 14:30:00", with
-// fractional seconds appended only when nonzero, trailing zeros trimmed).
-fn format_naive_timestamp(dt: NaiveDateTime) -> String {
-    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
-    let nanos = dt.nanosecond();
-    if nanos == 0 {
-        base
-    } else {
-        let frac = format!("{:09}", nanos);
-        let frac = frac.trim_end_matches('0');
-        format!("{base}.{frac}")
-    }
-}
-
-fn format_naive_time(t: NaiveTime) -> String {
-    let base = t.format("%H:%M:%S").to_string();
-    let nanos = t.nanosecond();
-    if nanos == 0 {
-        base
-    } else {
-        let frac = format!("{:09}", nanos);
-        let frac = frac.trim_end_matches('0');
-        format!("{base}.{frac}")
-    }
 }
 
 // Append a record field to `out`, applying PG's composite quoting rules
@@ -727,14 +1103,14 @@ fn append_composite_field(out: &mut String, field: &str) {
 
 // Append an array element to `out`, applying PG's array quoting rules
 // (matches `array_out`). Quote if empty, equals "NULL" case-insensitively,
-// or contains `,`, `{`, `}`, `"`, `\`, or whitespace. Inside quotes,
+// or contains the delimiter, `{`, `}`, `"`, `\`, or whitespace. Inside quotes,
 // `"` becomes `\"` and `\` becomes `\\`.
-fn append_array_element(out: &mut String, elem: &str) {
+fn append_array_element(out: &mut String, elem: &str, delim: char) {
     let needs_quote = elem.is_empty()
         || elem.eq_ignore_ascii_case("NULL")
         || elem
             .chars()
-            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+            .any(|c| matches!(c, '{' | '}' | '"' | '\\') || c == delim || c.is_whitespace());
     if needs_quote {
         out.push('"');
         for c in elem.chars() {
@@ -832,21 +1208,32 @@ fn parse_array_binary(raw: &[u8]) -> Option<String> {
     if pos != raw.len() {
         return None;
     }
+    let delim = if elem_oid as u32 == Type::BOX.oid() {
+        ';'
+    } else {
+        ','
+    };
     let mut out = String::new();
     let mut idx = 0;
-    render_array_dim(&mut out, &elems, &dims, &mut idx);
+    render_array_dim(&mut out, &elems, &dims, &mut idx, delim);
     Some(out)
 }
 
-fn render_array_dim(out: &mut String, elems: &[Option<String>], dims: &[usize], idx: &mut usize) {
+fn render_array_dim(
+    out: &mut String,
+    elems: &[Option<String>],
+    dims: &[usize],
+    idx: &mut usize,
+    delim: char,
+) {
     out.push('{');
     if dims.len() == 1 {
         for i in 0..dims[0] {
             if i > 0 {
-                out.push(',');
+                out.push(delim);
             }
             match &elems[*idx] {
-                Some(s) => append_array_element(out, s),
+                Some(s) => append_array_element(out, s, delim),
                 None => out.push_str("NULL"),
             }
             *idx += 1;
@@ -854,9 +1241,9 @@ fn render_array_dim(out: &mut String, elems: &[Option<String>], dims: &[usize], 
     } else {
         for i in 0..dims[0] {
             if i > 0 {
-                out.push(',');
+                out.push(delim);
             }
-            render_array_dim(out, elems, &dims[1..], idx);
+            render_array_dim(out, elems, &dims[1..], idx, delim);
         }
     }
     out.push('}');
@@ -907,73 +1294,35 @@ impl fmt::Display for Char {
                 write!(f, "{}", self.0 as char)
             }
             0x80..=0xff => {
-                write!(f, "{:o}", self.0)
+                write!(f, "\\{:03o}", self.0)
             }
         }
     }
 }
 
-#[derive(Debug)]
-struct Regtype(String);
+struct RegOid(u32);
 
-impl<'a> FromSql<'a> for Regtype {
+impl<'a> FromSql<'a> for RegOid {
     fn from_sql(
         ty: &Type,
         raw: &'a [u8],
     ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        let oid = <u32 as FromSql>::from_sql(ty, raw)?;
-        let name = match oid {
-            16 => "boolean",
-            17 => "bytea",
-            18 => "character",
-            20 => "bigint",
-            21 => "smallint",
-            23 => "integer",
-            25 => "text",
-            114 => "json",
-            700 => "real",
-            701 => "double precision",
-            705 => "unknown",
-            1043 => "character varying",
-            1082 => "date",
-            1114 => "timestamp without time zone",
-            1184 => "timestamp with time zone",
-            1186 => "interval",
-            1700 => "numeric",
-            2205 => "regclass",
-            2206 => "regtype",
-            2950 => "uuid",
-            3802 => "jsonb",
-            // Array types
-            199 => "json[]",
-            1000 => "boolean[]",
-            1001 => "bytea[]",
-            1002 => "character[]",
-            1005 => "smallint[]",
-            1007 => "integer[]",
-            1009 => "text[]",
-            1015 => "character varying[]",
-            1016 => "bigint[]",
-            1021 => "real[]",
-            1022 => "double precision[]",
-            1115 => "timestamp without time zone[]",
-            1182 => "date[]",
-            1185 => "timestamp with time zone[]",
-            1187 => "interval[]",
-            1231 => "numeric[]",
-            2951 => "uuid[]",
-            other => return Ok(Regtype(other.to_string())),
-        };
-        Ok(Regtype(name.to_string()))
+        Ok(RegOid(<u32 as FromSql>::from_sql(ty, raw)?))
     }
 
-    accepts!(REGTYPE);
-}
-
-impl fmt::Display for Regtype {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+    accepts!(
+        REGTYPE,
+        REGPROC,
+        REGPROCEDURE,
+        REGOPER,
+        REGOPERATOR,
+        REGCLASS,
+        REGNAMESPACE,
+        REGROLE,
+        REGCONFIG,
+        REGDICTIONARY,
+        REGCOLLATION
+    );
 }
 
 // It's required to use postgres_array::Array instead of Vec.
@@ -1121,6 +1470,43 @@ fn bytea_to_str(value: &[u8]) -> String {
     result
 }
 
+fn split_exponential(exponential: &str) -> (&str, i32) {
+    let (mantissa, exponent) = exponential
+        .split_once('e')
+        .expect("exponential float formatting has an exponent");
+    (
+        mantissa,
+        exponent.parse().expect("float exponent is a number"),
+    )
+}
+
+fn scientific_to_str(mantissa: &str, exponent: i32) -> String {
+    let sign = if exponent < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exponent.abs())
+}
+
+fn shortest_float_to_str(exponential: String, fixed: String, fixed_below: i32) -> String {
+    let (mantissa, exponent) = split_exponential(&exponential);
+    if (-4..fixed_below).contains(&exponent) {
+        fixed
+    } else {
+        scientific_to_str(mantissa, exponent)
+    }
+}
+
+fn shortest_or_integral_to_str(fixed: String, exponential: String, integral: bool) -> String {
+    if integral {
+        return fixed;
+    }
+    let (mantissa, exponent) = split_exponential(&exponential);
+    let scientific = scientific_to_str(mantissa, exponent);
+    if scientific.len() < fixed.len() {
+        scientific
+    } else {
+        fixed
+    }
+}
+
 fn float4_to_str(value: &f32) -> String {
     if value.is_nan() {
         "NaN".to_string()
@@ -1129,7 +1515,11 @@ fn float4_to_str(value: &f32) -> String {
     } else if *value == f32::NEG_INFINITY {
         "-Infinity".to_string()
     } else {
-        value.to_string()
+        shortest_or_integral_to_str(
+            value.to_string(),
+            format!("{value:e}"),
+            value.abs() < u64::MAX as f32 && value.fract() == 0.0,
+        )
     }
 }
 
@@ -1141,7 +1531,19 @@ fn float8_to_str(value: &f64) -> String {
     } else if *value == f64::NEG_INFINITY {
         "-Infinity".to_string()
     } else {
-        value.to_string()
+        shortest_or_integral_to_str(
+            value.to_string(),
+            format!("{value:e}"),
+            value.abs() < u64::MAX as f64 && value.fract() == 0.0,
+        )
+    }
+}
+
+fn float8out_to_str(value: &f64) -> String {
+    if value.is_finite() {
+        shortest_float_to_str(format!("{value:e}"), value.to_string(), 15)
+    } else {
+        float8_to_str(value)
     }
 }
 
@@ -1211,7 +1613,7 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         single_process!(row, row_vec, idx, TimeValue);
                     }
                     Type::TIME_ARRAY => {
-                        array_process!(row, row_vec, idx, NaiveTime);
+                        array_process!(row, row_vec, idx, TimeValue);
                     }
                     Type::TIMETZ => {
                         single_process!(row, row_vec, idx, TimeTzValue);
@@ -1246,8 +1648,30 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME => {
                         single_process!(row, row_vec, idx, &str);
                     }
-                    Type::REGTYPE => {
-                        single_process!(row, row_vec, idx, Regtype);
+                    Type::REGTYPE
+                    | Type::REGPROC
+                    | Type::REGPROCEDURE
+                    | Type::REGOPER
+                    | Type::REGOPERATOR
+                    | Type::REGCLASS
+                    | Type::REGNAMESPACE
+                    | Type::REGROLE
+                    | Type::REGCONFIG
+                    | Type::REGDICTIONARY
+                    | Type::REGCOLLATION => {
+                        let value: Option<RegOid> = row.get(idx);
+                        match value {
+                            Some(RegOid(oid)) => {
+                                let sql =
+                                    format!("select ($1::oid)::{}::varchar", column.type_().name());
+                                let tmp_rows = self.client()?.query(&sql, &[&oid]).await?;
+                                let text: &str = tmp_rows[0].get(0);
+                                row_vec.push(placeholder_if_empty(text.to_string()));
+                            }
+                            None => {
+                                row_vec.push("NULL".to_string());
+                            }
+                        }
                     }
                     Type::VARCHAR_ARRAY
                     | Type::TEXT_ARRAY
@@ -1304,6 +1728,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::UUID_ARRAY => {
                         array_process!(row, row_vec, idx, UuidValue);
                     }
+                    Type::PG_LSN => {
+                        single_process!(row, row_vec, idx, PgLsn);
+                    }
+                    Type::PG_LSN_ARRAY => {
+                        array_process!(row, row_vec, idx, PgLsn);
+                    }
                     _ if matches!(column.type_().kind(), Kind::Enum(_)) => {
                         single_process!(row, row_vec, idx, EnumValue);
                     }
@@ -1339,8 +1769,78 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::INET | Type::CIDR => {
                         single_process!(row, row_vec, idx, InetValue);
                     }
+                    Type::REFCURSOR | Type::XML => {
+                        single_process!(row, row_vec, idx, TextValue);
+                    }
+                    Type::REFCURSOR_ARRAY | Type::XML_ARRAY => {
+                        array_process!(row, row_vec, idx, TextValue);
+                    }
+                    Type::MACADDR | Type::MACADDR8 => {
+                        single_process!(row, row_vec, idx, MacaddrValue);
+                    }
+                    Type::TID => {
+                        single_process!(row, row_vec, idx, TidValue);
+                    }
+                    Type::TID_ARRAY => {
+                        array_process!(row, row_vec, idx, TidValue);
+                    }
+                    Type::INT2_VECTOR | Type::OID_VECTOR => {
+                        single_process!(row, row_vec, idx, VectorValue);
+                    }
+                    Type::INT2_VECTOR_ARRAY | Type::OID_VECTOR_ARRAY => {
+                        array_process!(row, row_vec, idx, VectorValue);
+                    }
+                    Type::MACADDR_ARRAY | Type::MACADDR8_ARRAY => {
+                        array_process!(row, row_vec, idx, MacaddrValue);
+                    }
+                    Type::MONEY => {
+                        single_process!(row, row_vec, idx, MoneyValue);
+                    }
+                    Type::MONEY_ARRAY => {
+                        array_process!(row, row_vec, idx, MoneyValue);
+                    }
                     Type::INET_ARRAY | Type::CIDR_ARRAY => {
                         array_process!(row, row_vec, idx, InetValue);
+                    }
+                    Type::POINT
+                    | Type::LINE
+                    | Type::LSEG
+                    | Type::BOX
+                    | Type::PATH
+                    | Type::POLYGON
+                    | Type::CIRCLE => {
+                        single_process!(row, row_vec, idx, GeometricValue);
+                    }
+                    Type::BOX_ARRAY => {
+                        array_process!(row, row_vec, idx, GeometricValue, delim = ';');
+                    }
+                    Type::POINT_ARRAY
+                    | Type::LINE_ARRAY
+                    | Type::LSEG_ARRAY
+                    | Type::PATH_ARRAY
+                    | Type::POLYGON_ARRAY
+                    | Type::CIRCLE_ARRAY => {
+                        array_process!(row, row_vec, idx, GeometricValue);
+                    }
+                    _ if matches!(column.type_().kind(), Kind::Range(_)) => {
+                        single_process!(row, row_vec, idx, RangeValue);
+                    }
+                    _ if matches!(
+                        column.type_().kind(),
+                        Kind::Array(elem) if matches!(elem.kind(), Kind::Range(_))
+                    ) =>
+                    {
+                        array_process!(row, row_vec, idx, RangeValue);
+                    }
+                    _ if matches!(column.type_().kind(), Kind::Multirange(_)) => {
+                        single_process!(row, row_vec, idx, MultirangeValue);
+                    }
+                    _ if matches!(
+                        column.type_().kind(),
+                        Kind::Array(elem) if matches!(elem.kind(), Kind::Multirange(_))
+                    ) =>
+                    {
+                        array_process!(row, row_vec, idx, MultirangeValue);
                     }
                     _ if column.type_().name() == "geometry" => {
                         single_process!(row, row_vec, idx, GeometryValue);
@@ -1451,5 +1951,116 @@ mod inet_tests {
     fn rejects_truncated() {
         assert!(InetValue::from_sql(&Type::INET, &[2, 24, 0]).is_err());
         assert!(InetValue::from_sql(&Type::INET, &[2, 24, 0, 4, 192, 168]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod float_tests {
+    use super::*;
+
+    #[test]
+    fn float4_integral_or_shortest() {
+        assert_eq!(float4_to_str(&999999.0), "999999");
+        assert_eq!(float4_to_str(&1e6), "1000000");
+        assert_eq!(float4_to_str(&-1223768.0), "-1223768");
+        assert_eq!(float4_to_str(&0.0001), "1e-04");
+        assert_eq!(float4_to_str(&0.00001), "1e-05");
+        assert_eq!(float4_to_str(&1.5), "1.5");
+        assert_eq!(float4_to_str(&123456.7), "123456.7");
+        assert_eq!(float4_to_str(&f32::NAN), "NaN");
+        assert_eq!(float4_to_str(&f32::NEG_INFINITY), "-Infinity");
+    }
+
+    #[test]
+    fn float8_integral_or_shortest() {
+        assert_eq!(float8_to_str(&1e15), "1000000000000000");
+        assert_eq!(float8_to_str(&1223768.0), "1223768");
+        assert_eq!(float8_to_str(&0.1), "0.1");
+        assert_eq!(float8_to_str(&1000000000000000.5), "1000000000000000.5");
+        assert_eq!(
+            float8_to_str(&1.0000000005838672e-7),
+            "1.0000000005838672e-07"
+        );
+        assert_eq!(float8_to_str(&1e20), "1e+20");
+        assert_eq!(float8_to_str(&f64::INFINITY), "Infinity");
+    }
+
+    #[test]
+    fn float8out_like_postgres() {
+        assert_eq!(float8out_to_str(&999999999999999.0), "999999999999999");
+        assert_eq!(float8out_to_str(&1e15), "1e+15");
+        assert_eq!(float8out_to_str(&1223768.0), "1223768");
+        assert_eq!(float8out_to_str(&0.1), "0.1");
+        assert_eq!(float8out_to_str(&1.5e-7), "1.5e-07");
+        assert_eq!(float8out_to_str(&-0.0), "-0");
+        assert_eq!(
+            float8out_to_str(&1.7976931348623157e308),
+            "1.7976931348623157e+308"
+        );
+        assert_eq!(float8out_to_str(&f64::INFINITY), "Infinity");
+        assert_eq!(float8out_to_str(&f64::NAN), "NaN");
+    }
+}
+
+#[cfg(test)]
+mod geometric_tests {
+    use super::*;
+
+    fn bytes(values: &[f64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    fn counted(prefix: &[u8], values: &[f64]) -> Vec<u8> {
+        let mut raw = prefix.to_vec();
+        raw.extend_from_slice(&((values.len() / 2) as i32).to_be_bytes());
+        raw.extend(bytes(values));
+        raw
+    }
+
+    fn decode(ty: &Type, raw: &[u8]) -> String {
+        GeometricValue::from_sql(ty, raw).unwrap().0
+    }
+
+    #[test]
+    fn fixed_shapes() {
+        assert_eq!(decode(&Type::POINT, &bytes(&[1.5, -2.0])), "(1.5,-2)");
+        assert_eq!(decode(&Type::LINE, &bytes(&[1.0, -1.0, 0.0])), "{1,-1,0}");
+        assert_eq!(
+            decode(&Type::LSEG, &bytes(&[0.0, 0.0, 1.0, 2.0])),
+            "[(0,0),(1,2)]"
+        );
+        assert_eq!(
+            decode(&Type::BOX, &bytes(&[2.0, 2.0, 0.0, 0.0])),
+            "(2,2),(0,0)"
+        );
+        assert_eq!(
+            decode(&Type::CIRCLE, &bytes(&[1.0, 1.0, f64::INFINITY])),
+            "<(1,1),Infinity>"
+        );
+    }
+
+    #[test]
+    fn paths_and_polygons() {
+        let points = [0.0, 0.0, 1.0, 1e20];
+        assert_eq!(
+            decode(&Type::PATH, &counted(&[1], &points)),
+            "((0,0),(1,1e+20))"
+        );
+        assert_eq!(
+            decode(&Type::PATH, &counted(&[0], &points)),
+            "[(0,0),(1,1e+20)]"
+        );
+        assert_eq!(
+            decode(&Type::POLYGON, &counted(&[], &points)),
+            "((0,0),(1,1e+20))"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        assert!(GeometricValue::from_sql(&Type::POINT, &bytes(&[1.0])).is_err());
+        assert!(
+            GeometricValue::from_sql(&Type::POLYGON, &counted(&[], &[1.0, 2.0])[..10]).is_err()
+        );
     }
 }
