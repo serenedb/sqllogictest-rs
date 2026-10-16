@@ -857,8 +857,8 @@ fn render_geometric(ty: &Type, raw: &[u8]) -> Option<String> {
             .map(|point| {
                 format!(
                     "({},{})",
-                    float8_to_str(&point[0]),
-                    float8_to_str(&point[1])
+                    float8out_to_str(&point[0]),
+                    float8out_to_str(&point[1])
                 )
             })
             .collect::<Vec<_>>()
@@ -875,9 +875,9 @@ fn render_geometric(ty: &Type, raw: &[u8]) -> Option<String> {
             let values = coordinates(raw, 3)?;
             Some(format!(
                 "{{{},{},{}}}",
-                float8_to_str(&values[0]),
-                float8_to_str(&values[1]),
-                float8_to_str(&values[2])
+                float8out_to_str(&values[0]),
+                float8out_to_str(&values[1]),
+                float8out_to_str(&values[2])
             ))
         }
         Type::LSEG => Some(format!("[{}]", points(&coordinates(raw, 4)?))),
@@ -887,7 +887,7 @@ fn render_geometric(ty: &Type, raw: &[u8]) -> Option<String> {
             Some(format!(
                 "<{},{}>",
                 points(&values[..2]),
-                float8_to_str(&values[2])
+                float8out_to_str(&values[2])
             ))
         }
         Type::PATH => {
@@ -1554,16 +1554,40 @@ fn bytea_to_str(value: &[u8]) -> String {
     result
 }
 
-fn shortest_float_to_str(exponential: String, fixed: String, fixed_below: i32) -> String {
+fn split_exponential(exponential: &str) -> (&str, i32) {
     let (mantissa, exponent) = exponential
         .split_once('e')
         .expect("exponential float formatting has an exponent");
-    let exponent: i32 = exponent.parse().expect("float exponent is a number");
+    (
+        mantissa,
+        exponent.parse().expect("float exponent is a number"),
+    )
+}
+
+fn scientific_to_str(mantissa: &str, exponent: i32) -> String {
+    let sign = if exponent < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exponent.abs())
+}
+
+fn shortest_float_to_str(exponential: String, fixed: String, fixed_below: i32) -> String {
+    let (mantissa, exponent) = split_exponential(&exponential);
     if (-4..fixed_below).contains(&exponent) {
         fixed
     } else {
-        let sign = if exponent < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exponent.abs())
+        scientific_to_str(mantissa, exponent)
+    }
+}
+
+fn shortest_or_integral_to_str(fixed: String, exponential: String, integral: bool) -> String {
+    if integral {
+        return fixed;
+    }
+    let (mantissa, exponent) = split_exponential(&exponential);
+    let scientific = scientific_to_str(mantissa, exponent);
+    if scientific.len() < fixed.len() {
+        scientific
+    } else {
+        fixed
     }
 }
 
@@ -1575,7 +1599,11 @@ fn float4_to_str(value: &f32) -> String {
     } else if *value == f32::NEG_INFINITY {
         "-Infinity".to_string()
     } else {
-        shortest_float_to_str(format!("{value:e}"), value.to_string(), 6)
+        shortest_or_integral_to_str(
+            value.to_string(),
+            format!("{value:e}"),
+            value.abs() < u64::MAX as f32 && value.fract() == 0.0,
+        )
     }
 }
 
@@ -1587,7 +1615,19 @@ fn float8_to_str(value: &f64) -> String {
     } else if *value == f64::NEG_INFINITY {
         "-Infinity".to_string()
     } else {
+        shortest_or_integral_to_str(
+            value.to_string(),
+            format!("{value:e}"),
+            value.abs() < u64::MAX as f64 && value.fract() == 0.0,
+        )
+    }
+}
+
+fn float8out_to_str(value: &f64) -> String {
+    if value.is_finite() {
         shortest_float_to_str(format!("{value:e}"), value.to_string(), 15)
+    } else {
+        float8_to_str(value)
     }
 }
 
@@ -2012,32 +2052,46 @@ mod float_tests {
     use super::*;
 
     #[test]
-    fn float4_like_postgres() {
+    fn float4_integral_or_shortest() {
         assert_eq!(float4_to_str(&999999.0), "999999");
-        assert_eq!(float4_to_str(&1e6), "1e+06");
-        assert_eq!(float4_to_str(&-1223768.0), "-1.223768e+06");
-        assert_eq!(float4_to_str(&0.0001), "0.0001");
+        assert_eq!(float4_to_str(&1e6), "1000000");
+        assert_eq!(float4_to_str(&-1223768.0), "-1223768");
+        assert_eq!(float4_to_str(&0.0001), "1e-04");
         assert_eq!(float4_to_str(&0.00001), "1e-05");
         assert_eq!(float4_to_str(&1.5), "1.5");
-        assert_eq!(float4_to_str(&-0.0), "-0");
-        assert_eq!(float4_to_str(&3.4e38), "3.4e+38");
+        assert_eq!(float4_to_str(&123456.7), "123456.7");
         assert_eq!(float4_to_str(&f32::NAN), "NaN");
         assert_eq!(float4_to_str(&f32::NEG_INFINITY), "-Infinity");
     }
 
     #[test]
-    fn float8_like_postgres() {
-        assert_eq!(float8_to_str(&999999999999999.0), "999999999999999");
-        assert_eq!(float8_to_str(&1e15), "1e+15");
+    fn float8_integral_or_shortest() {
+        assert_eq!(float8_to_str(&1e15), "1000000000000000");
         assert_eq!(float8_to_str(&1223768.0), "1223768");
         assert_eq!(float8_to_str(&0.1), "0.1");
-        assert_eq!(float8_to_str(&1.5e-7), "1.5e-07");
-        assert_eq!(float8_to_str(&-0.0), "-0");
+        assert_eq!(float8_to_str(&1000000000000000.5), "1000000000000000.5");
         assert_eq!(
-            float8_to_str(&1.7976931348623157e308),
+            float8_to_str(&1.0000000005838672e-7),
+            "1.0000000005838672e-07"
+        );
+        assert_eq!(float8_to_str(&1e20), "1e+20");
+        assert_eq!(float8_to_str(&f64::INFINITY), "Infinity");
+    }
+
+    #[test]
+    fn float8out_like_postgres() {
+        assert_eq!(float8out_to_str(&999999999999999.0), "999999999999999");
+        assert_eq!(float8out_to_str(&1e15), "1e+15");
+        assert_eq!(float8out_to_str(&1223768.0), "1223768");
+        assert_eq!(float8out_to_str(&0.1), "0.1");
+        assert_eq!(float8out_to_str(&1.5e-7), "1.5e-07");
+        assert_eq!(float8out_to_str(&-0.0), "-0");
+        assert_eq!(
+            float8out_to_str(&1.7976931348623157e308),
             "1.7976931348623157e+308"
         );
-        assert_eq!(float8_to_str(&f64::INFINITY), "Infinity");
+        assert_eq!(float8out_to_str(&f64::INFINITY), "Infinity");
+        assert_eq!(float8out_to_str(&f64::NAN), "NaN");
     }
 }
 
