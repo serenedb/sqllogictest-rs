@@ -82,7 +82,7 @@ query I
 select ARRAY['\\'::varchar], ARRAY[''::varchar], ARRAY['abc'::varchar]
 ----
 array	array	array
-{"\\\\"}	{""}	{abc}
+{"\\\\\\\\"}	{""}	{abc}
 
 # date && date array
 query I
