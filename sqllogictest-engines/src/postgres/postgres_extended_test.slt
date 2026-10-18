@@ -125,3 +125,21 @@ select true::bool, '{true,false}'::bool[]
 ----
 bool	bool
 t	{t,f}
+
+# int2vector && oidvector
+query I
+select '1 2'::int2vector, '23 25'::oidvector, ''::int2vector
+----
+int2vector	oidvector	int2vector
+1 2	23 25	(empty)
+
+# unknown type
+onlyif pg-wire-extended
+query error the extended engine can't decode type tsvector
+select 'a b'::tsvector
+
+query I
+select 1::int2
+----
+int2
+1

@@ -1055,6 +1055,21 @@ macro_rules! array_process {
     };
 }
 
+macro_rules! vector_process {
+    ($row:ident, $row_vec:ident, $idx:ident, $t:ty) => {
+        let value: Option<Vec<$t>> = $row.get($idx);
+        match value {
+            Some(value) => {
+                let items: Vec<String> = value.iter().map(|v| v.to_string()).collect();
+                $row_vec.push(placeholder_if_empty(items.join(" ")));
+            }
+            None => {
+                $row_vec.push("NULL".to_string());
+            }
+        }
+    };
+}
+
 fn placeholder_if_empty(value: String) -> String {
     if value.is_empty() {
         "(empty)".into()
@@ -1298,6 +1313,12 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                     Type::OID_ARRAY => {
                         array_process!(row, row_vec, idx, u32);
                     }
+                    Type::INT2_VECTOR => {
+                        vector_process!(row, row_vec, idx, i16);
+                    }
+                    Type::OID_VECTOR => {
+                        vector_process!(row, row_vec, idx, u32);
+                    }
                     Type::UUID => {
                         single_process!(row, row_vec, idx, UuidValue);
                     }
@@ -1349,7 +1370,10 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(row, row_vec, idx, GeometryValue, delim = ':');
                     }
                     _ => {
-                        todo!("Don't support {} type now.", column.type_().name())
+                        return Err(PgDriverError::Decode(format!(
+                            "the extended engine can't decode type {}",
+                            column.type_().name()
+                        )));
                     }
                 }
             }

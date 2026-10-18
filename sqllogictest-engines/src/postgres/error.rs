@@ -6,6 +6,7 @@ pub enum PgDriverError {
     Postgres(tokio_postgres::Error),
     /// Internal driver error (e.g. connection already shut down).
     Internal(String),
+    Decode(String),
 }
 
 impl PgDriverError {
@@ -17,7 +18,7 @@ impl PgDriverError {
     pub fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
         match self {
             Self::Postgres(e) => e.code(),
-            Self::Internal(_) => None,
+            Self::Internal(_) | Self::Decode(_) => None,
         }
     }
 
@@ -27,6 +28,7 @@ impl PgDriverError {
                 e.is_closed() || e.source().is_some_and(|cause| cause.is::<std::io::Error>())
             }
             Self::Internal(_) => true,
+            Self::Decode(_) => false,
         }
     }
 }
@@ -41,7 +43,7 @@ impl std::fmt::Display for PgDriverError {
                 }
                 Ok(())
             }
-            Self::Internal(msg) => write!(f, "{}", msg),
+            Self::Internal(msg) | Self::Decode(msg) => write!(f, "{}", msg),
         }
     }
 }
