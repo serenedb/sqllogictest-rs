@@ -59,7 +59,8 @@ fn render(ty: &Type, raw: &[u8]) -> Option<String> {
         | Type::NAME
         | Type::JSON
         | Type::XML
-        | Type::REFCURSOR => std::str::from_utf8(raw).ok()?.into(),
+        | Type::REFCURSOR
+        | Type::UNKNOWN => std::str::from_utf8(raw).ok()?.into(),
         Type::JSONB => serde_json::Value::from_sql(ty, raw).ok()?.to_string(),
         // It assumes that 'BYTEA_OUTPUT' variable is set to 'hex' (default value)
         Type::BYTEA => raw.iter().fold("\\x".to_string(), |mut out, byte| {
