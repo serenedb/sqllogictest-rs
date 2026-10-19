@@ -140,6 +140,12 @@ select row(1::oid, 'a'::"char", '1/2'::pg_lsn, B'101'::bit(3), '10:00:00+02'::ti
 row
 (1,a,1/2,101,10:00:00+02,"{""a b"",NULL}")
 
+query I
+select row(1, 'a b', true)
+----
+row
+(1,"a b",t)
+
 # unknown type
 onlyif pg-wire-extended
 query error the extended engine can't decode type tsvector
