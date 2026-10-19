@@ -133,6 +133,13 @@ select '1 2'::int2vector, '23 25'::oidvector, ''::int2vector
 int2vector	oidvector	int2vector
 1 2	23 25	(empty)
 
+# record fields print as their types do outside a record
+query I
+select row(1::oid, 'a'::"char", '1/2'::pg_lsn, B'101'::bit(3), '10:00:00+02'::timetz, '{"a b",NULL}'::text[])
+----
+row
+(1,a,1/2,101,10:00:00+02,"{""a b"",NULL}")
+
 # unknown type
 onlyif pg-wire-extended
 query error the extended engine can't decode type tsvector

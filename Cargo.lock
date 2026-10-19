@@ -1458,18 +1458,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "postgres_array"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2667c8b8c3a857620d87fc5172972c3385254a7563a5ab303bc9a41a16a7bf4e"
-dependencies = [
- "bytes",
- "fallible-iterator",
- "postgres-protocol",
- "postgres-types",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1963,7 +1951,6 @@ dependencies = [
  "mysql_async",
  "pg_interval",
  "postgres-types",
- "postgres_array",
  "rustls",
  "serde",
  "serde_json",
