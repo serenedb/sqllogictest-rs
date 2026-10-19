@@ -4,11 +4,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
+use crate::postgres::error::PgDriverError;
+
 use super::{Postgres, Result, Simple};
 
 #[async_trait]
 impl sqllogictest::AsyncDB for Postgres<Simple> {
-    type Error = tokio_postgres::error::Error;
+    type Error = PgDriverError;
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>> {
@@ -20,7 +22,7 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
         // and we have to follow the format given by the specific database (pg).
         // For example, postgres will output `t` as true and `f` as false,
         // thus we have to write `t`/`f` in the expected results.
-        let rows = self.client().simple_query(sql).await?;
+        let rows = self.client()?.simple_query(sql).await?;
         let mut cnt = 0;
         for row in rows {
             let mut row_vec = vec![];
@@ -41,11 +43,17 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
                 }
                 tokio_postgres::SimpleQueryMessage::CommandComplete(cnt_) => {
                     cnt = cnt_;
-                    break;
-                }
-                tokio_postgres::SimpleQueryMessage::RowDescription(_) => {
-                    // information about the row (i.e., column names), we can skip them for now
                     continue;
+                }
+                tokio_postgres::SimpleQueryMessage::RowDescription(column_names) => {
+                    if column_names.is_empty() {
+                        // No columns in the table => no rows, so just skip
+                        continue;
+                    }
+                    // Just print column names in the first line
+                    for column_name in column_names.iter() {
+                        row_vec.push(column_name.name().to_string());
+                    }
                 }
                 cmd => unreachable!("unsupported cmd: {cmd:?}, please create an issue in risinglightdb/sqllogictest-rs"),
             }
@@ -67,7 +75,7 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
     }
 
     fn engine_name(&self) -> &str {
-        "postgres"
+        "pg-wire-simple"
     }
 
     async fn sleep(dur: Duration) {
@@ -80,5 +88,9 @@ impl sqllogictest::AsyncDB for Postgres<Simple> {
 
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         err.code().map(|s| s.code().to_owned())
+    }
+
+    fn is_connection_error(err: &Self::Error) -> bool {
+        err.is_connection_error()
     }
 }

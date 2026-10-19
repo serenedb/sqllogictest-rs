@@ -1,0 +1,57 @@
+use std::error::Error;
+
+#[derive(Debug)]
+pub enum PgDriverError {
+    /// Error from the underlying tokio_postgres driver.
+    Postgres(tokio_postgres::Error),
+    /// Internal driver error (e.g. connection already shut down).
+    Internal(String),
+    Decode(String),
+}
+
+impl PgDriverError {
+    pub(crate) fn connection_closed() -> Self {
+        Self::Internal("connection is closed".into())
+    }
+
+    /// Returns the SQL state code if this is a Postgres error.
+    pub fn code(&self) -> Option<&tokio_postgres::error::SqlState> {
+        match self {
+            Self::Postgres(e) => e.code(),
+            Self::Internal(_) | Self::Decode(_) => None,
+        }
+    }
+
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            Self::Postgres(e) => {
+                e.is_closed() || e.source().is_some_and(|cause| cause.is::<std::io::Error>())
+            }
+            Self::Internal(_) => true,
+            Self::Decode(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for PgDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Postgres(e) => {
+                write!(f, "{}", e)?;
+                if let Some(cause) = e.source() {
+                    write!(f, ": {}", cause)?;
+                }
+                Ok(())
+            }
+            Self::Internal(msg) | Self::Decode(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PgDriverError {}
+
+impl From<tokio_postgres::Error> for PgDriverError {
+    fn from(value: tokio_postgres::Error) -> Self {
+        Self::Postgres(value)
+    }
+}
