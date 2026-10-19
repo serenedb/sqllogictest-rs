@@ -20,7 +20,6 @@ mysql_async = { workspace = true, default-features = false, features = [
     "minimal",
 ] }
 pg_interval = { workspace = true }
-postgres_array = { workspace = true }
 postgres-types = { workspace = true, features = [
     "derive",
     "with-chrono-0_4",
