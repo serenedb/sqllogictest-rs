@@ -40,7 +40,6 @@ log = "=0.4.28"
 md-5 = "=0.10.6"
 mysql_async = { version = "=0.34.2", default-features = false } # TODO update to 0.36
 pg_interval = "=0.4.2"
-postgres_array = "=0.11.1"
 postgres-types = "=0.2.11"                                       # TODO update to 0.2.11
 owo-colors = "=4.2.3"
 quick-junit = "=0.5.1"
