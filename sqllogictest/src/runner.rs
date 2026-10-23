@@ -1826,6 +1826,14 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         self.check_options.hash_threshold = hash_threshold;
     }
 
+    pub fn with_show_column_names(&mut self, show_column_names: bool) {
+        self.check_options.show_column_names = show_column_names;
+    }
+
+    pub fn with_flat_values(&mut self, flat_values: bool) {
+        self.check_options.flat_values = flat_values;
+    }
+
     /// Run a single record, acquiring and returning a connection as needed.
     ///
     /// Returns the raw [`RecordOutput`] without comparing it against any expected value.

@@ -140,6 +140,18 @@ struct Opt {
     #[clap(long = "label")]
     labels: Vec<String>,
 
+    /// The value the `show-column-names` directive has at the start of every file.
+    #[clap(long, action = ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    show_column_names: bool,
+
+    /// The value the `flat-values` directive has at the start of every file.
+    #[clap(long, action = ArgAction::Set, default_value_t = false, value_name = "BOOL")]
+    flat_values: bool,
+
+    /// The value the `hash-threshold` directive has at the start of every file.
+    #[clap(long, default_value_t = 0, value_name = "N")]
+    hash_threshold: usize,
+
     /// Partition ID for sharding the test files. When used with `partition_count`,
     /// divides the test files into shards based on the hash of the file path.
     ///
@@ -285,6 +297,9 @@ pub async fn main() -> Result<()> {
         format,
         skip_failed,
         labels,
+        show_column_names,
+        flat_values,
+        hash_threshold,
         partition_count,
         partition_id,
         shutdown_timeout_secs,
@@ -303,6 +318,11 @@ pub async fn main() -> Result<()> {
         );
     }
     let addrs = host.into_iter().zip_eq(port).collect();
+    let directives = Directives {
+        show_column_names,
+        flat_values,
+        hash_threshold,
+    };
 
     let engine = match engine {
         EngineType::Mysql => EngineConfig::MySql,
@@ -415,6 +435,7 @@ pub async fn main() -> Result<()> {
             jobs,
             keep_db_on_failure,
             labels,
+            directives,
             show_discovered_tests,
         )
         .await;
@@ -442,6 +463,7 @@ pub async fn main() -> Result<()> {
 
     let run_config = RunConfig {
         labels,
+        directives,
         junit: junit.clone(),
         fail_fast,
         show_all_errors,
@@ -475,8 +497,24 @@ pub async fn main() -> Result<()> {
     result
 }
 
+#[derive(Clone, Copy)]
+struct Directives {
+    show_column_names: bool,
+    flat_values: bool,
+    hash_threshold: usize,
+}
+
+impl Directives {
+    fn apply<M: MakeConnection>(self, runner: &mut Runner<M::Conn, M>) {
+        runner.with_show_column_names(self.show_column_names);
+        runner.with_flat_values(self.flat_values);
+        runner.with_hash_threshold(self.hash_threshold);
+    }
+}
+
 struct RunConfig {
     labels: Vec<String>,
+    directives: Directives,
     junit: Option<String>,
     fail_fast: bool,
     show_all_errors: bool,
@@ -598,6 +636,7 @@ async fn run_parallel(
     config: DBConfig,
     RunConfig {
         labels,
+        directives,
         junit,
         fail_fast,
         show_all_errors,
@@ -647,6 +686,7 @@ async fn run_parallel(
             engine,
             config,
             labels,
+            directives,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
@@ -887,6 +927,7 @@ async fn execution_task(
     engine: EngineConfig,
     config: DBConfig,
     labels: Arc<Vec<String>>,
+    directives: Directives,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
@@ -918,6 +959,7 @@ async fn execution_task(
                 &engine,
                 job_config,
                 labels.as_ref(),
+                directives,
                 show_all_errors,
                 cancel,
                 shutdown_timeout,
@@ -1094,6 +1136,7 @@ async fn run_serial(
     config: DBConfig,
     RunConfig {
         labels,
+        directives,
         junit,
         fail_fast,
         show_all_errors,
@@ -1116,6 +1159,7 @@ async fn run_serial(
             engine,
             config.clone(),
             &labels,
+            directives,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
@@ -1200,6 +1244,7 @@ async fn update_test_files(
     jobs: Option<usize>,
     keep_db_on_failure: bool,
     labels: Vec<String>,
+    directives: Directives,
     show_discovered_tests: bool,
 ) -> Result<()> {
     let temp_dir = TempDirGuard::new().context("failed to create temp directory for overrides")?;
@@ -1257,6 +1302,7 @@ async fn update_test_files(
                 for label in labels {
                     runner.add_label(label);
                 }
+                directives.apply(&mut runner);
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
@@ -1399,6 +1445,7 @@ async fn connect_and_run_test_file(
     engine: &EngineConfig,
     config: DBConfig,
     labels: &[String],
+    directives: Directives,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
@@ -1437,6 +1484,7 @@ async fn connect_and_run_test_file(
     for label in labels {
         runner.add_label(label);
     }
+    directives.apply(&mut runner);
     runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
 
     let begin = Instant::now();
