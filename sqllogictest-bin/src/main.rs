@@ -377,20 +377,6 @@ pub async fn main() -> Result<()> {
 
     all_files = all_files.into_iter().unique().collect();
 
-    // Slowest-first off the persisted timing cache ($SDB_TIMING_CACHE): unknown
-    // tests stay in front (may be new/heavy), then known descending by duration.
-    if let Ok(cache) = std::env::var("SDB_TIMING_CACHE") {
-        if !cache.is_empty() {
-            let times = load_timing_cache(&cache);
-            if !times.is_empty() {
-                all_files.sort_by_key(|p| match times.get(p.to_string_lossy().as_ref()) {
-                    Some(ms) => (1i8, -*ms),
-                    None => (0i8, 0i64),
-                });
-            }
-        }
-    }
-
     let config = DBConfig {
         addrs,
         ssl_port,
@@ -601,33 +587,6 @@ struct TestResultMessage {
 enum DropMessage {
     Drop(String),
     ConnectionRefused,
-}
-
-/// Best-effort: append `path\t<ms>` to $SDB_TIMING_OUT for the slowest-first cache.
-fn record_timing(path: &str, duration: Duration) {
-    let out = match std::env::var("SDB_TIMING_OUT") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&out) {
-        // One write_all so concurrent workers' O_APPEND lines don't interleave.
-        let line = format!("{}\t{}\n", path, duration.as_millis());
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
-fn load_timing_cache(path: &str) -> std::collections::HashMap<String, i64> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            if let Some((p, ms)) = line.split_once('\t') {
-                if let Ok(ms) = ms.trim().parse::<i64>() {
-                    map.insert(p.to_string(), ms);
-                }
-            }
-        }
-    }
-    map
 }
 
 async fn run_parallel(
@@ -967,9 +926,6 @@ async fn execution_task(
             .await;
 
             let file = filename.to_string_lossy().to_string();
-            if let RunResult::Ok(duration) = &result {
-                record_timing(&file, *duration);
-            }
             let message = TestResultMessage {
                 db_name,
                 file,
@@ -1168,9 +1124,6 @@ async fn run_serial(
         .await;
         stdout().flush()?;
 
-        if let RunResult::Ok(duration) = &res {
-            record_timing(&path, *duration);
-        }
         let case = res.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
         test_suite.add_test_case(case);
 
