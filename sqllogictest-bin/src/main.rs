@@ -22,8 +22,8 @@ use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_validator, trim_normalizer, update_record_with_output,
-    AsyncDB, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode, TestError,
-    UpdateMode,
+    AsyncDB, ColumnType, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode,
+    TestError, UpdateMode,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -151,6 +151,18 @@ struct Opt {
     /// The value the `hash-threshold` directive has at the start of every file.
     #[clap(long, default_value_t = 0, value_name = "N")]
     hash_threshold: usize,
+
+    /// Run only part K of N of every file (`K/N`, K from 1). Every record runs except the
+    /// queries outside the K-th of N equal, contiguous shares of the file's queries: each
+    /// query sees the state a run of the whole file gives it, and the N parts together run
+    /// every query once.
+    #[clap(
+        long,
+        value_name = "K/N",
+        value_parser = parse_part,
+        conflicts_with_all = ["override", "force_override", "format", "skip_failed"]
+    )]
+    part: Option<Part>,
 
     /// Partition ID for sharding the test files. When used with `partition_count`,
     /// divides the test files into shards based on the hash of the file path.
@@ -300,6 +312,7 @@ pub async fn main() -> Result<()> {
         show_column_names,
         flat_values,
         hash_threshold,
+        part,
         partition_count,
         partition_id,
         shutdown_timeout_secs,
@@ -464,6 +477,7 @@ pub async fn main() -> Result<()> {
     let run_config = RunConfig {
         labels,
         directives,
+        part,
         junit: junit.clone(),
         fail_fast,
         show_all_errors,
@@ -512,9 +526,45 @@ impl Directives {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Part {
+    index: usize,
+    count: usize,
+}
+
+fn parse_part(arg: &str) -> Result<Part, String> {
+    let (index, count) = arg.split_once('/').ok_or("expected K/N")?;
+    let index: usize = index.parse().map_err(|e| format!("{index}: {e}"))?;
+    let count: usize = count.parse().map_err(|e| format!("{count}: {e}"))?;
+    if index == 0 || index > count {
+        return Err(format!("{arg}: K must be between 1 and N"));
+    }
+    Ok(Part { index, count })
+}
+
+impl Part {
+    fn select<T: ColumnType>(self, records: Vec<Record<T>>) -> Vec<Record<T>> {
+        let is_query = |record: &Record<T>| matches!(record, Record::Query { .. });
+        let queries = records.iter().filter(|record| is_query(record)).count();
+        let share = queries * (self.index - 1) / self.count..queries * self.index / self.count;
+        let mut seen = 0;
+        records
+            .into_iter()
+            .filter(|record| {
+                if !is_query(record) {
+                    return true;
+                }
+                seen += 1;
+                share.contains(&(seen - 1))
+            })
+            .collect()
+    }
+}
+
 struct RunConfig {
     labels: Vec<String>,
     directives: Directives,
+    part: Option<Part>,
     junit: Option<String>,
     fail_fast: bool,
     show_all_errors: bool,
@@ -637,6 +687,7 @@ async fn run_parallel(
     RunConfig {
         labels,
         directives,
+        part,
         junit,
         fail_fast,
         show_all_errors,
@@ -687,6 +738,7 @@ async fn run_parallel(
             config,
             labels,
             directives,
+            part,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
@@ -928,6 +980,7 @@ async fn execution_task(
     config: DBConfig,
     labels: Arc<Vec<String>>,
     directives: Directives,
+    part: Option<Part>,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
@@ -960,6 +1013,7 @@ async fn execution_task(
                 job_config,
                 labels.as_ref(),
                 directives,
+                part,
                 show_all_errors,
                 cancel,
                 shutdown_timeout,
@@ -1137,6 +1191,7 @@ async fn run_serial(
     RunConfig {
         labels,
         directives,
+        part,
         junit,
         fail_fast,
         show_all_errors,
@@ -1160,6 +1215,7 @@ async fn run_serial(
             config.clone(),
             &labels,
             directives,
+            part,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
@@ -1446,6 +1502,7 @@ async fn connect_and_run_test_file(
     config: DBConfig,
     labels: &[String],
     directives: Directives,
+    part: Option<Part>,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
@@ -1528,7 +1585,7 @@ async fn connect_and_run_test_file(
                 filename.display()
             ))
         }
-        result = run_test_file(&mut out.0, &mut runner, filename.clone(), show_all_errors) => {
+        result = run_test_file(&mut out.0, &mut runner, filename.clone(), part, show_all_errors) => {
             if let Err(err) = &result {
                 writeln!(
                     out.0,
@@ -1568,6 +1625,7 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
+    part: Option<Part>,
     show_all_errors: bool,
 ) -> Result<Duration>
 where
@@ -1575,11 +1633,18 @@ where
 {
     let filename = filename.as_ref();
 
-    write!(out, "{: <60} .. ", filename.to_string_lossy())?;
+    let name = match part {
+        Some(Part { index, count }) => format!("{} [{index}/{count}]", filename.to_string_lossy()),
+        None => filename.to_string_lossy().into_owned(),
+    };
+    write!(out, "{name: <60} .. ")?;
     flush(out).await?;
 
-    let records = tokio::task::block_in_place(|| sqllogictest::parse_file(filename))
+    let mut records = tokio::task::block_in_place(|| sqllogictest::parse_file(filename))
         .context("failed to parse sqllogictest file")?;
+    if let Some(part) = part {
+        records = part.select(records);
+    }
 
     let mut begin_times = vec![];
     let mut did_pop = false;
