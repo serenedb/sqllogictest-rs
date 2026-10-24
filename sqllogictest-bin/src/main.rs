@@ -22,8 +22,8 @@ use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_validator, trim_normalizer, update_record_with_output,
-    AsyncDB, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode, TestError,
-    UpdateMode,
+    AsyncDB, ColumnType, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode,
+    TestError, UpdateMode,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -139,6 +139,30 @@ struct Opt {
     /// The engine name is a label by default.
     #[clap(long = "label")]
     labels: Vec<String>,
+
+    /// The value the `show-column-names` directive has at the start of every file.
+    #[clap(long, action = ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    show_column_names: bool,
+
+    /// The value the `flat-values` directive has at the start of every file.
+    #[clap(long, action = ArgAction::Set, default_value_t = false, value_name = "BOOL")]
+    flat_values: bool,
+
+    /// The value the `hash-threshold` directive has at the start of every file.
+    #[clap(long, default_value_t = 0, value_name = "N")]
+    hash_threshold: usize,
+
+    /// Run only part K of N of every file (`K/N`, K from 1). Every record runs except the
+    /// queries outside the K-th of N equal, contiguous shares of the file's queries: each
+    /// query sees the state a run of the whole file gives it, and the N parts together run
+    /// every query once.
+    #[clap(
+        long,
+        value_name = "K/N",
+        value_parser = parse_part,
+        conflicts_with_all = ["override", "force_override", "format", "skip_failed"]
+    )]
+    part: Option<Part>,
 
     /// Partition ID for sharding the test files. When used with `partition_count`,
     /// divides the test files into shards based on the hash of the file path.
@@ -285,6 +309,10 @@ pub async fn main() -> Result<()> {
         format,
         skip_failed,
         labels,
+        show_column_names,
+        flat_values,
+        hash_threshold,
+        part,
         partition_count,
         partition_id,
         shutdown_timeout_secs,
@@ -303,6 +331,11 @@ pub async fn main() -> Result<()> {
         );
     }
     let addrs = host.into_iter().zip_eq(port).collect();
+    let directives = Directives {
+        show_column_names,
+        flat_values,
+        hash_threshold,
+    };
 
     let engine = match engine {
         EngineType::Mysql => EngineConfig::MySql,
@@ -377,20 +410,6 @@ pub async fn main() -> Result<()> {
 
     all_files = all_files.into_iter().unique().collect();
 
-    // Slowest-first off the persisted timing cache ($SDB_TIMING_CACHE): unknown
-    // tests stay in front (may be new/heavy), then known descending by duration.
-    if let Ok(cache) = std::env::var("SDB_TIMING_CACHE") {
-        if !cache.is_empty() {
-            let times = load_timing_cache(&cache);
-            if !times.is_empty() {
-                all_files.sort_by_key(|p| match times.get(p.to_string_lossy().as_ref()) {
-                    Some(ms) => (1i8, -*ms),
-                    None => (0i8, 0i64),
-                });
-            }
-        }
-    }
-
     let config = DBConfig {
         addrs,
         ssl_port,
@@ -429,6 +448,7 @@ pub async fn main() -> Result<()> {
             jobs,
             keep_db_on_failure,
             labels,
+            directives,
             show_discovered_tests,
         )
         .await;
@@ -456,6 +476,8 @@ pub async fn main() -> Result<()> {
 
     let run_config = RunConfig {
         labels,
+        directives,
+        part,
         junit: junit.clone(),
         fail_fast,
         show_all_errors,
@@ -489,8 +511,60 @@ pub async fn main() -> Result<()> {
     result
 }
 
+#[derive(Clone, Copy)]
+struct Directives {
+    show_column_names: bool,
+    flat_values: bool,
+    hash_threshold: usize,
+}
+
+impl Directives {
+    fn apply<M: MakeConnection>(self, runner: &mut Runner<M::Conn, M>) {
+        runner.with_show_column_names(self.show_column_names);
+        runner.with_flat_values(self.flat_values);
+        runner.with_hash_threshold(self.hash_threshold);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Part {
+    index: usize,
+    count: usize,
+}
+
+fn parse_part(arg: &str) -> Result<Part, String> {
+    let (index, count) = arg.split_once('/').ok_or("expected K/N")?;
+    let index: usize = index.parse().map_err(|e| format!("{index}: {e}"))?;
+    let count: usize = count.parse().map_err(|e| format!("{count}: {e}"))?;
+    if index == 0 || index > count {
+        return Err(format!("{arg}: K must be between 1 and N"));
+    }
+    Ok(Part { index, count })
+}
+
+impl Part {
+    fn select<T: ColumnType>(self, records: Vec<Record<T>>) -> Vec<Record<T>> {
+        let is_query = |record: &Record<T>| matches!(record, Record::Query { .. });
+        let queries = records.iter().filter(|record| is_query(record)).count();
+        let share = queries * (self.index - 1) / self.count..queries * self.index / self.count;
+        let mut seen = 0;
+        records
+            .into_iter()
+            .filter(|record| {
+                if !is_query(record) {
+                    return true;
+                }
+                seen += 1;
+                share.contains(&(seen - 1))
+            })
+            .collect()
+    }
+}
+
 struct RunConfig {
     labels: Vec<String>,
+    directives: Directives,
+    part: Option<Part>,
     junit: Option<String>,
     fail_fast: bool,
     show_all_errors: bool,
@@ -603,33 +677,6 @@ enum DropMessage {
     ConnectionRefused,
 }
 
-/// Best-effort: append `path\t<ms>` to $SDB_TIMING_OUT for the slowest-first cache.
-fn record_timing(path: &str, duration: Duration) {
-    let out = match std::env::var("SDB_TIMING_OUT") {
-        Ok(v) if !v.is_empty() => v,
-        _ => return,
-    };
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&out) {
-        // One write_all so concurrent workers' O_APPEND lines don't interleave.
-        let line = format!("{}\t{}\n", path, duration.as_millis());
-        let _ = f.write_all(line.as_bytes());
-    }
-}
-
-fn load_timing_cache(path: &str) -> std::collections::HashMap<String, i64> {
-    let mut map = std::collections::HashMap::new();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            if let Some((p, ms)) = line.split_once('\t') {
-                if let Ok(ms) = ms.trim().parse::<i64>() {
-                    map.insert(p.to_string(), ms);
-                }
-            }
-        }
-    }
-    map
-}
-
 async fn run_parallel(
     jobs: usize,
     keep_db_on_failure: bool,
@@ -639,6 +686,8 @@ async fn run_parallel(
     config: DBConfig,
     RunConfig {
         labels,
+        directives,
+        part,
         junit,
         fail_fast,
         show_all_errors,
@@ -688,6 +737,8 @@ async fn run_parallel(
             engine,
             config,
             labels,
+            directives,
+            part,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
@@ -928,6 +979,8 @@ async fn execution_task(
     engine: EngineConfig,
     config: DBConfig,
     labels: Arc<Vec<String>>,
+    directives: Directives,
+    part: Option<Part>,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
@@ -959,6 +1012,8 @@ async fn execution_task(
                 &engine,
                 job_config,
                 labels.as_ref(),
+                directives,
+                part,
                 show_all_errors,
                 cancel,
                 shutdown_timeout,
@@ -967,9 +1022,6 @@ async fn execution_task(
             .await;
 
             let file = filename.to_string_lossy().to_string();
-            if let RunResult::Ok(duration) = &result {
-                record_timing(&file, *duration);
-            }
             let message = TestResultMessage {
                 db_name,
                 file,
@@ -1138,6 +1190,8 @@ async fn run_serial(
     config: DBConfig,
     RunConfig {
         labels,
+        directives,
+        part,
         junit,
         fail_fast,
         show_all_errors,
@@ -1160,6 +1214,8 @@ async fn run_serial(
             engine,
             config.clone(),
             &labels,
+            directives,
+            part,
             show_all_errors,
             cancel.clone(),
             shutdown_timeout,
@@ -1168,9 +1224,6 @@ async fn run_serial(
         .await;
         stdout().flush()?;
 
-        if let RunResult::Ok(duration) = &res {
-            record_timing(&path, *duration);
-        }
         let case = res.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
         test_suite.add_test_case(case);
 
@@ -1247,6 +1300,7 @@ async fn update_test_files(
     jobs: Option<usize>,
     keep_db_on_failure: bool,
     labels: Vec<String>,
+    directives: Directives,
     show_discovered_tests: bool,
 ) -> Result<()> {
     let temp_dir = TempDirGuard::new().context("failed to create temp directory for overrides")?;
@@ -1304,6 +1358,7 @@ async fn update_test_files(
                 for label in labels {
                     runner.add_label(label);
                 }
+                directives.apply(&mut runner);
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
@@ -1446,6 +1501,8 @@ async fn connect_and_run_test_file(
     engine: &EngineConfig,
     config: DBConfig,
     labels: &[String],
+    directives: Directives,
+    part: Option<Part>,
     show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
@@ -1484,6 +1541,7 @@ async fn connect_and_run_test_file(
     for label in labels {
         runner.add_label(label);
     }
+    directives.apply(&mut runner);
     runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
 
     let begin = Instant::now();
@@ -1527,7 +1585,7 @@ async fn connect_and_run_test_file(
                 filename.display()
             ))
         }
-        result = run_test_file(&mut out.0, &mut runner, filename.clone(), show_all_errors) => {
+        result = run_test_file(&mut out.0, &mut runner, filename.clone(), part, show_all_errors) => {
             if let Err(err) = &result {
                 writeln!(
                     out.0,
@@ -1567,6 +1625,7 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
+    part: Option<Part>,
     show_all_errors: bool,
 ) -> Result<Duration>
 where
@@ -1574,11 +1633,18 @@ where
 {
     let filename = filename.as_ref();
 
-    write!(out, "{: <60} .. ", filename.to_string_lossy())?;
+    let name = match part {
+        Some(Part { index, count }) => format!("{} [{index}/{count}]", filename.to_string_lossy()),
+        None => filename.to_string_lossy().into_owned(),
+    };
+    write!(out, "{name: <60} .. ")?;
     flush(out).await?;
 
-    let records = tokio::task::block_in_place(|| sqllogictest::parse_file(filename))
+    let mut records = tokio::task::block_in_place(|| sqllogictest::parse_file(filename))
         .context("failed to parse sqllogictest file")?;
+    if let Some(part) = part {
+        records = part.select(records);
+    }
 
     let mut begin_times = vec![];
     let mut did_pop = false;
@@ -1687,6 +1753,33 @@ fn finish_test_file<T: io::Write>(
     Ok::<_, anyhow::Error>(())
 }
 
+/// Leaves at most one of the newlines a rewritten file ends with: the last record is a
+/// statement or a query, or the original file ended with several.
+fn trim_trailing_newlines(outfile: &mut File) -> io::Result<()> {
+    const N: usize = 8;
+    let mut buf = [0u8; N];
+    loop {
+        let tail = outfile.metadata()?.len().min(N as u64) as usize;
+        if tail == 0 {
+            return Ok(());
+        }
+        outfile.seek(SeekFrom::End(-(tail as i64)))?;
+        outfile.read_exact(&mut buf[..tail])?;
+        let num_newlines = buf[..tail]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\n')
+            .count();
+        assert!(num_newlines > 0);
+        if num_newlines > 1 {
+            outfile.set_len(outfile.metadata()?.len() - num_newlines as u64 + 1)?;
+        }
+        if num_newlines <= 1 || num_newlines < tail {
+            return Ok(());
+        }
+    }
+}
+
 /// Different from [`sqllogictest::update_test_file`], we re-implement it here to print some
 /// progress information.
 async fn update_test_file<T: io::Write, M: MakeConnection>(
@@ -1749,29 +1842,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
         outfilename: &PathBuf,
         outfile: &mut File,
     ) -> io::Result<()> {
-        // check whether outfile ends with multiple newlines, which happens if
-        // - the last record is statement/query
-        // - the original file ends with multiple newlines
-
-        const N: usize = 8;
-        let mut buf = [0u8; N];
-        loop {
-            outfile.seek(SeekFrom::End(-(N as i64))).unwrap();
-            outfile.read_exact(&mut buf).unwrap();
-            let num_newlines = buf.iter().rev().take_while(|&&b| b == b'\n').count();
-            assert!(num_newlines > 0);
-
-            if num_newlines > 1 {
-                // if so, remove the last ones
-                outfile
-                    .set_len(outfile.metadata().unwrap().len() - num_newlines as u64 + 1)
-                    .unwrap();
-            }
-
-            if num_newlines == 1 || num_newlines < N {
-                break;
-            }
-        }
+        trim_trailing_newlines(outfile)?;
 
         let replace_via_copy = || -> io::Result<()> {
             fs_err::copy(outfilename, filename)?;
@@ -1941,5 +2012,33 @@ impl<T: AsRef<str>> T {
     /// Normalize the path to the test case name.
     pub fn to_test_case_name(&self) -> String {
         self.as_ref().replace([' ', '.', '-', '/'], "_")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trimmed(content: &[u8]) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.slt");
+        std::fs::write(&path, content).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        trim_trailing_newlines(&mut file).unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn trim_trailing_newlines_keeps_one() {
+        assert_eq!(trimmed(b""), b"");
+        assert_eq!(trimmed(b"\n"), b"\n");
+        assert_eq!(trimmed(b"\n\n\n"), b"\n");
+        assert_eq!(trimmed(b"a\n"), b"a\n");
+        assert_eq!(trimmed(b"query\n----\n1\n\n\n"), b"query\n----\n1\n");
+        assert_eq!(trimmed(&[b"x".as_slice(), &[b'\n'; 20]].concat()), b"x\n");
     }
 }

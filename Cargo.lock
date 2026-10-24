@@ -2141,6 +2141,7 @@ dependencies = [
  "rand 0.8.5",
  "sqllogictest",
  "sqllogictest-engines",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
