@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::ValueEnum;
+use sqllogictest::parser::{DBPort, SslMode};
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 use sqllogictest_engines::external::ExternalDriver;
 use sqllogictest_engines::mysql::{MySql, MySqlConfig};
+use sqllogictest_engines::postgres::to_pg_ssl_mode;
 use sqllogictest_engines::postgres::{PostgresConfig, PostgresExtended, PostgresSimple};
 use tokio::process::Command;
 
@@ -14,7 +16,9 @@ use super::{DBConfig, Result};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum EngineType {
     Mysql,
+    #[value(alias = "pg-wire-simple")]
     Postgres,
+    #[value(alias = "pg-wire-extended")]
     PostgresExtended,
     External,
 }
@@ -25,6 +29,17 @@ pub enum EngineConfig {
     Postgres,
     PostgresExtended,
     External(String),
+}
+
+impl Display for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineConfig::MySql => write!(f, "mysql"),
+            EngineConfig::Postgres => write!(f, "pg-wire-simple"),
+            EngineConfig::PostgresExtended => write!(f, "pg-wire-extended"),
+            EngineConfig::External(cmd) => write!(f, "external({cmd})"),
+        }
+    }
 }
 
 pub(crate) enum Engines {
@@ -41,34 +56,66 @@ impl From<&DBConfig> for MySqlConfig {
             "mysql://{}:{}@{}:{}/{}",
             config.user, config.pass, host, port, config.db
         );
-
         MySqlConfig::from_url(&database_url).unwrap()
     }
 }
 
+fn make_connect_opts(
+    config: &DBConfig,
+    ssl_mode: SslMode,
+    port_override: DBPort,
+    user_override: Option<&str>,
+    password_override: Option<&str>,
+    database_override: Option<&str>,
+) -> PostgresConfig {
+    let (host, port) = config.random_addr();
+    let port = if port_override == DBPort::Ssl && config.ssl_port != 0 {
+        config.ssl_port
+    } else {
+        port
+    };
+
+    let mut pg_config = PostgresConfig::new();
+    pg_config
+        .host(host)
+        .port(port)
+        // A per-connection `database=` override (from a `connection ...
+        // database=db` record) lets a test open a specific database; otherwise
+        // the runner's configured default database is used.
+        .dbname(database_override.unwrap_or(&config.db))
+        // A per-connection `user=` override (from a `connection ... user=role`
+        // record) lets a test authenticate as a second role; otherwise the
+        // runner's configured default user is used.
+        .user(user_override.unwrap_or(&config.user))
+        // A per-connection `password=` override lets a test authenticate (or
+        // deliberately fail) with a specific password; otherwise the runner's
+        // configured default password is used.
+        .password(password_override.unwrap_or(&config.pass));
+    if let Some(options) = &config.options {
+        pg_config.options(options);
+    }
+    pg_config.ssl_mode(to_pg_ssl_mode(ssl_mode));
+    pg_config
+}
+
 impl From<&DBConfig> for PostgresConfig {
     fn from(config: &DBConfig) -> Self {
-        let (host, port) = config.random_addr();
-
-        let mut pg_config = PostgresConfig::new();
-        pg_config
-            .host(host)
-            .port(port)
-            .dbname(&config.db)
-            .user(&config.user)
-            .password(&config.pass);
-        if let Some(options) = &config.options {
-            pg_config.options(options);
-        }
-
-        pg_config
+        make_connect_opts(config, SslMode::Disable, DBPort::Plain, None, None, None)
     }
 }
 
 pub(crate) async fn connect(
     engine: &EngineConfig,
     config: &DBConfig,
+    ssl_mode: SslMode,
+    port: DBPort,
+    user: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
 ) -> Result<Engines, EnginesError> {
+    let user = user.as_deref();
+    let password = password.as_deref();
+    let database = database.as_deref();
     Ok(match engine {
         EngineConfig::MySql => Engines::MySql(
             MySql::connect(config.into())
@@ -76,23 +123,27 @@ pub(crate) async fn connect(
                 .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::Postgres => Engines::Postgres(
-            PostgresSimple::connect(config.into())
-                .await
-                .map_err(EnginesError::without_state)?,
+            PostgresSimple::connect(make_connect_opts(
+                config, ssl_mode, port, user, password, database,
+            ))
+            .await
+            .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::PostgresExtended => Engines::PostgresExtended(
-            PostgresExtended::connect(config.into())
-                .await
-                .map_err(EnginesError::without_state)?,
+            PostgresExtended::connect(make_connect_opts(
+                config, ssl_mode, port, user, password, database,
+            ))
+            .await
+            .map_err(EnginesError::without_state)?,
         ),
         EngineConfig::External(cmd_tmpl) => {
             let (host, port) = config.random_addr();
             let cmd_str = cmd_tmpl
-                .replace("{db}", &config.db)
+                .replace("{db}", database.unwrap_or(&config.db))
                 .replace("{host}", host)
                 .replace("{port}", &port.to_string())
-                .replace("{user}", &config.user)
-                .replace("{pass}", &config.pass);
+                .replace("{user}", user.unwrap_or(&config.user))
+                .replace("{pass}", password.unwrap_or(&config.pass));
             let mut cmd = Command::new("bash");
             cmd.args(["-c", &cmd_str]);
             Engines::External(
@@ -108,6 +159,7 @@ pub(crate) async fn connect(
 pub(crate) struct EnginesError {
     error: anyhow::Error,
     sqlstate: Option<String>,
+    connection_error: bool,
 }
 
 impl EnginesError {
@@ -115,6 +167,7 @@ impl EnginesError {
         Self {
             error: error.into(),
             sqlstate: None,
+            connection_error: false,
         }
     }
 }
@@ -146,6 +199,10 @@ fn error_sql_state<E: AsyncDB>(_engine: &E, error: &E::Error) -> Option<String> 
     E::error_sql_state(error)
 }
 
+fn is_connection_error<E: AsyncDB>(_engine: &E, error: &E::Error) -> bool {
+    E::is_connection_error(error)
+}
+
 #[async_trait]
 impl AsyncDB for Engines {
     type Error = EnginesError;
@@ -155,6 +212,7 @@ impl AsyncDB for Engines {
         dispatch_engines!(self, e, {
             e.run(sql).await.map_err(|error| EnginesError {
                 sqlstate: error_sql_state(e, &error),
+                connection_error: is_connection_error(e, &error),
                 error: anyhow::Error::from(error),
             })
         })
@@ -178,5 +236,9 @@ impl AsyncDB for Engines {
 
     fn error_sql_state(err: &Self::Error) -> Option<String> {
         err.sqlstate.clone()
+    }
+
+    fn is_connection_error(err: &Self::Error) -> bool {
+        err.connection_error
     }
 }

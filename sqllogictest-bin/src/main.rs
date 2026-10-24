@@ -1,9 +1,10 @@
 mod engines;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, stdout, Read, Seek, SeekFrom, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,11 +21,13 @@ use rand::distributions::DistString;
 use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
-    default_column_validator, default_normalizer, default_validator, update_record_with_output,
-    AsyncDB, Injected, MakeConnection, Partitioner, Record, Runner,
+    default_column_validator, default_validator, trim_normalizer, update_record_with_output,
+    AsyncDB, ColumnType, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode,
+    TestError, UpdateMode,
 };
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Default, Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 #[must_use]
@@ -76,6 +79,9 @@ struct Opt {
     /// When using `-j`, whether to keep the temporary database when a test case fails.
     #[clap(long, default_value = "false", env = "SLT_KEEP_DB_ON_FAILURE")]
     keep_db_on_failure: bool,
+    /// Show all errors
+    #[clap(long, default_value = "false", env = "SLT_SHOW_ALL_ERRORS")]
+    show_all_errors: bool,
 
     /// Whether to exit immediately when a test case fails.
     #[clap(long, default_value = "false", env = "SLT_FAIL_FAST")]
@@ -93,6 +99,9 @@ struct Opt {
     /// If multiple addresses are specified, one will be chosen randomly per session.
     #[clap(short, long, default_value = "5432", env = "SLT_PORT")]
     port: Vec<u16>,
+    /// The database server port for encrypted connections.
+    #[clap(long, default_value = "0", env = "SLT_PORT_SSL")]
+    ssl_port: u16,
     /// The database name to connect.
     #[clap(short, long, default_value = "postgres", env = "SLT_DB")]
     db: String,
@@ -107,11 +116,20 @@ struct Opt {
     options: Option<String>,
 
     /// Overrides the test files with the actual output of the database.
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = ["force_override", "format", "skip_failed"])]
     r#override: bool,
+    /// Overrides the test files with the actual output of the database,
+    /// and normalizes formatting (e.g., converts spaces to tabs and despite <slt:ignore>) even
+    /// when the logical content matches.
+    #[clap(long, conflicts_with_all = ["override", "format", "skip_failed"])]
+    force_override: bool,
     /// Reformats the test files.
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = ["override", "force_override", "skip_failed"])]
     format: bool,
+    /// When a test fails, prepend a skipif directive instead of updating the expected output.
+    /// Format: LABEL,REASON (e.g., "postgres,not implemented yet")
+    #[clap(long, conflicts_with_all = ["override", "force_override", "format"])]
+    skip_failed: Option<String>,
 
     /// Add a label for conditions.
     ///
@@ -121,6 +139,30 @@ struct Opt {
     /// The engine name is a label by default.
     #[clap(long = "label")]
     labels: Vec<String>,
+
+    /// The value the `show-column-names` directive has at the start of every file.
+    #[clap(long, action = ArgAction::Set, default_value_t = true, value_name = "BOOL")]
+    show_column_names: bool,
+
+    /// The value the `flat-values` directive has at the start of every file.
+    #[clap(long, action = ArgAction::Set, default_value_t = false, value_name = "BOOL")]
+    flat_values: bool,
+
+    /// The value the `hash-threshold` directive has at the start of every file.
+    #[clap(long, default_value_t = 0, value_name = "N")]
+    hash_threshold: usize,
+
+    /// Run only part K of N of every file (`K/N`, K from 1). Every record runs except the
+    /// queries outside the K-th of N equal, contiguous shares of the file's queries: each
+    /// query sees the state a run of the whole file gives it, and the N parts together run
+    /// every query once.
+    #[clap(
+        long,
+        value_name = "K/N",
+        value_parser = parse_part,
+        conflicts_with_all = ["override", "force_override", "format", "skip_failed"]
+    )]
+    part: Option<Part>,
 
     /// Partition ID for sharding the test files. When used with `partition_count`,
     /// divides the test files into shards based on the hash of the file path.
@@ -139,9 +181,21 @@ struct Opt {
     #[clap(long = "shutdown-timeout", env = "SLT_SHUTDOWN_TIMEOUT")]
     shutdown_timeout_secs: Option<u64>,
 
+    /// Timeout in seconds for a single test file. By default this is unspecified,
+    /// meaning a wedged test blocks the whole run forever: the result channel
+    /// never sees its message and the receive loop cannot make progress.
+    #[clap(long = "test-timeout", env = "SLT_TEST_TIMEOUT")]
+    test_timeout_secs: Option<u64>,
+
     /// Skip tests that matches the given regex.
     #[clap(long)]
     skip: Option<String>,
+
+    /// Print a `+ Discovered Test: <name>` line for each test file before
+    /// running. Off by default; enable for debugging which files were picked
+    /// up by the glob.
+    #[clap(long, default_value = "false", env = "SLT_SHOW_DISCOVERED_TESTS")]
+    show_discovered_tests: bool,
 }
 
 /// Connection configuration.
@@ -149,6 +203,8 @@ struct Opt {
 struct DBConfig {
     /// The database server host and port. Will randomly choose one if multiple are given.
     addrs: Vec<(String, u16)>,
+    // For now single port for encrypted connections.
+    ssl_port: u16,
     /// The database name to connect.
     db: String,
     /// The database username.
@@ -238,21 +294,31 @@ pub async fn main() -> Result<()> {
         color,
         jobs,
         keep_db_on_failure,
+        show_all_errors,
         fail_fast,
         junit,
         host,
         port,
+        ssl_port,
         db,
         user,
         pass,
         options,
         r#override,
+        force_override,
         format,
+        skip_failed,
         labels,
+        show_column_names,
+        flat_values,
+        hash_threshold,
+        part,
         partition_count,
         partition_id,
         shutdown_timeout_secs,
+        test_timeout_secs,
         skip,
+        show_discovered_tests,
     } = Opt::from_arg_matches(&matches)
         .map_err(|err| err.exit())
         .unwrap();
@@ -265,6 +331,11 @@ pub async fn main() -> Result<()> {
         );
     }
     let addrs = host.into_iter().zip_eq(port).collect();
+    let directives = Directives {
+        show_column_names,
+        flat_values,
+        hash_threshold,
+    };
 
     let engine = match engine {
         EngineType::Mysql => EngineConfig::MySql,
@@ -302,7 +373,7 @@ pub async fn main() -> Result<()> {
     let mut all_files = Vec::new();
 
     let re = skip
-        .map(|s| Regex::new(&s))
+        .map(|s| Regex::new(&s).map_err(Box::new))
         .transpose()
         .context("invalid regex")?;
 
@@ -311,6 +382,8 @@ pub async fn main() -> Result<()> {
             .context("failed to read glob pattern")?
             .try_collect()?;
 
+        // Skip directories
+        files.retain(|path| !path.is_dir());
         if let Some(re) = &re {
             files.retain(|path| {
                 !re.is_match(&path.to_string_lossy())
@@ -319,7 +392,8 @@ pub async fn main() -> Result<()> {
             });
         }
 
-        // Test against partitioner only if there are multiple files matched, e.g., expanded from an `*`.
+        // Test against partitioner only if there are multiple files matched,
+        // e.g., expanded from an `*`.
         if files.len() > 1 {
             if let Some(partitioner) = &partitioner {
                 let len = files.len();
@@ -334,16 +408,50 @@ pub async fn main() -> Result<()> {
         all_files.extend(files);
     }
 
+    all_files = all_files.into_iter().unique().collect();
+
     let config = DBConfig {
         addrs,
+        ssl_port,
         db,
         user,
         pass,
         options,
     };
 
-    if r#override || format {
-        return update_test_files(all_files, &engine, config, format).await;
+    let update_mode = if format {
+        Some(UpdateMode::Format)
+    } else if force_override {
+        Some(UpdateMode::OverrideWithFormat)
+    } else if r#override {
+        Some(UpdateMode::Override)
+    } else if let Some(skip_failed_arg) = skip_failed {
+        let parts: Vec<&str> = skip_failed_arg.splitn(2, ',').collect();
+        if parts.len() != 2 {
+            bail!("--skip-failed must be in format LABEL,REASON (e.g., 'postgres,not implemented yet')");
+        }
+
+        Some(UpdateMode::SkipFailed {
+            label: parts[0].trim().to_string(),
+            reason: parts[1].trim().to_string(),
+        })
+    } else {
+        None
+    };
+
+    if let Some(update_mode) = update_mode {
+        return update_test_files(
+            all_files,
+            &engine,
+            config,
+            &update_mode,
+            jobs,
+            keep_db_on_failure,
+            labels,
+            directives,
+            show_discovered_tests,
+        )
+        .await;
     }
 
     let mut report = Report::new(junit.clone().unwrap_or_else(|| "sqllogictest".to_string()));
@@ -368,10 +476,15 @@ pub async fn main() -> Result<()> {
 
     let run_config = RunConfig {
         labels,
+        directives,
+        part,
         junit: junit.clone(),
         fail_fast,
+        show_all_errors,
+        show_discovered_tests,
         cancel,
         shutdown_timeout: shutdown_timeout_secs.map(Duration::from_secs),
+        test_timeout: test_timeout_secs.map(Duration::from_secs),
     };
 
     let result = if let Some(jobs) = jobs {
@@ -398,12 +511,170 @@ pub async fn main() -> Result<()> {
     result
 }
 
+#[derive(Clone, Copy)]
+struct Directives {
+    show_column_names: bool,
+    flat_values: bool,
+    hash_threshold: usize,
+}
+
+impl Directives {
+    fn apply<M: MakeConnection>(self, runner: &mut Runner<M::Conn, M>) {
+        runner.with_show_column_names(self.show_column_names);
+        runner.with_flat_values(self.flat_values);
+        runner.with_hash_threshold(self.hash_threshold);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Part {
+    index: usize,
+    count: usize,
+}
+
+fn parse_part(arg: &str) -> Result<Part, String> {
+    let (index, count) = arg.split_once('/').ok_or("expected K/N")?;
+    let index: usize = index.parse().map_err(|e| format!("{index}: {e}"))?;
+    let count: usize = count.parse().map_err(|e| format!("{count}: {e}"))?;
+    if index == 0 || index > count {
+        return Err(format!("{arg}: K must be between 1 and N"));
+    }
+    Ok(Part { index, count })
+}
+
+impl Part {
+    fn select<T: ColumnType>(self, records: Vec<Record<T>>) -> Vec<Record<T>> {
+        let is_query = |record: &Record<T>| matches!(record, Record::Query { .. });
+        let queries = records.iter().filter(|record| is_query(record)).count();
+        let share = queries * (self.index - 1) / self.count..queries * self.index / self.count;
+        let mut seen = 0;
+        records
+            .into_iter()
+            .filter(|record| {
+                if !is_query(record) {
+                    return true;
+                }
+                seen += 1;
+                share.contains(&(seen - 1))
+            })
+            .collect()
+    }
+}
+
 struct RunConfig {
     labels: Vec<String>,
+    directives: Directives,
+    part: Option<Part>,
     junit: Option<String>,
     fail_fast: bool,
+    show_all_errors: bool,
+    show_discovered_tests: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
+    test_timeout: Option<Duration>,
+}
+
+fn to_relative_path_display(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_relative() {
+        return path.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => p
+            .strip_prefix(&cwd)
+            .map(|r| r.display().to_string())
+            .unwrap_or_else(|_| path.to_string()),
+        Err(_) => path.to_string(),
+    }
+}
+
+fn test_db_name(test_case_name: String) -> String {
+    // Because PostgreSQL database names are < 64
+    const MAX_DATABASE_NAME_LEN: usize = 63;
+    const RANDOM_LEN: usize = 8;
+
+    let mut test_case_prefix = test_case_name;
+
+    if test_case_prefix.len() > MAX_DATABASE_NAME_LEN - RANDOM_LEN - 1 {
+        test_case_prefix = test_case_prefix[..MAX_DATABASE_NAME_LEN - RANDOM_LEN - 1].to_string();
+    }
+
+    let random_id: String = rand::distributions::Alphanumeric
+        .sample_string(&mut rand::thread_rng(), RANDOM_LEN)
+        .to_lowercase();
+    format!("{test_case_prefix}_{random_id}")
+}
+
+/// Length of the directory prefix shared by every name, trimmed back to the
+/// last `/` so a path component is never split (`a/b/c1/d` and `a/b/c2/d` share
+/// `a/b/`, not `a/b/c`). Stripping it keeps the part of the path that actually
+/// distinguishes a test, which matters because `test_db_name` truncates the
+/// suffix to fit the 63-char limit -- a long shared prefix would otherwise
+/// crowd the distinctive part out.
+fn common_dir_prefix_len(names: &[&str]) -> usize {
+    let Some(first) = names.first() else {
+        return 0;
+    };
+    let first = first.as_bytes();
+    let mut lcp = first.len();
+    for n in &names[1..] {
+        let b = n.as_bytes();
+        let mut i = 0;
+        while i < lcp && i < b.len() && b[i] == first[i] {
+            i += 1;
+        }
+        lcp = i;
+    }
+    // `/` is ASCII, so this is always a valid UTF-8 boundary.
+    first[..lcp]
+        .iter()
+        .rposition(|&c| c == b'/')
+        .map_or(0, |p| p + 1)
+}
+
+fn test_db_names(
+    files: Vec<PathBuf>,
+    show_discovered_tests: bool,
+) -> Result<Vec<(String, PathBuf)>> {
+    let filenames = files
+        .iter()
+        .map(|f| f.to_str().ok_or_else(|| anyhow!("not a UTF-8 filename")))
+        .collect::<Result<Vec<_>>>()?;
+    let prefix_len = common_dir_prefix_len(&filenames);
+
+    let mut test_databases = Vec::with_capacity(files.len());
+    let mut test_cases = HashSet::new();
+    for (file, filename) in files.iter().zip(filenames) {
+        let stripped: &str = &filename[prefix_len..];
+        let test_case_name = stripped.to_test_case_name();
+
+        if show_discovered_tests {
+            eprintln!("+ Discovered Test: {test_case_name}");
+        }
+        if !test_cases.insert(test_case_name.clone()) {
+            return Err(anyhow!("duplicated test case found: {}", test_case_name));
+        }
+
+        let db_name = test_db_name(test_case_name);
+        test_databases.push((db_name, file.clone()));
+    }
+    Ok(test_databases)
+}
+
+struct TestJob {
+    db_name: String,
+    filename: PathBuf,
+}
+
+struct TestResultMessage {
+    db_name: String,
+    file: String,
+    result: RunResult,
+}
+
+enum DropMessage {
+    Drop(String),
+    ConnectionRefused,
 }
 
 async fn run_parallel(
@@ -415,80 +686,544 @@ async fn run_parallel(
     config: DBConfig,
     RunConfig {
         labels,
+        directives,
+        part,
         junit,
         fail_fast,
+        show_all_errors,
+        show_discovered_tests,
         cancel,
         shutdown_timeout,
+        test_timeout,
     }: RunConfig,
 ) -> Result<()> {
-    let mut create_databases = BTreeMap::new();
-    let mut test_cases = BTreeSet::new();
-    for file in files {
-        let filename = file
-            .to_str()
-            .ok_or_else(|| anyhow!("not a UTF-8 filename"))?;
-        let test_case_name = filename.to_test_case_name();
-        eprintln!("+ Discovered Test: {test_case_name}");
-        if !test_cases.insert(test_case_name.clone()) {
-            return Err(anyhow!("duplicated test case found: {}", test_case_name));
-        }
-        let random_id: String = rand::distributions::Alphanumeric
-            .sample_string(&mut rand::thread_rng(), 8)
-            .to_lowercase();
-        let db_name = format!("{test_case_name}_{random_id}");
+    let test_databases = test_db_names(files, show_discovered_tests)?;
+    let total_tests = test_databases.len();
+    // Which tests have not reported yet. Without this, a wedged test leaves the
+    // loop below blocked on `recv()` with no indication of which file it is.
+    let mut outstanding: HashMap<String, PathBuf> = test_databases
+        .iter()
+        .map(|(db, file)| (db.clone(), file.clone()))
+        .collect();
 
-        create_databases.insert(db_name, file);
-    }
+    // db_name -> when the test actually began running. Written by each test task,
+    // read only when the watchdog fires. A plain std Mutex: the critical sections
+    // are two map operations with no await inside, so it never blocks the runtime.
+    let in_flight: Arc<std::sync::Mutex<HashMap<String, Instant>>> = Arc::default();
 
-    let mut db = engines::connect(engine, &config).await?;
+    let (job_tx, job_rx) = mpsc::channel::<TestJob>(jobs);
+    let (result_tx, mut result_rx) = mpsc::channel::<TestResultMessage>(jobs);
+    // Unbounded on purpose. The dropper is a single task issuing DROP DATABASE
+    // serially, so it is far slower than 128 tests finishing in parallel. On a
+    // bounded channel the loop below blocks in `drop_tx.send().await`, stops
+    // draining `result_rx`, and the whole pipeline stalls behind cleanup:
+    // finished tests block sending results while still holding their semaphore
+    // permits, which starves `execution_task` of new jobs.
+    let (drop_tx, drop_rx) = mpsc::unbounded_channel::<DropMessage>();
 
-    let db_names: Vec<String> = create_databases.keys().cloned().collect();
-    for db_name in &db_names {
-        let query = format!("CREATE DATABASE {db_name};");
-        eprintln!("+ {query}");
-        if let Err(err) = db.run(&query).await {
-            eprintln!("  ignore error: {err}");
-        }
-    }
+    let labels = Arc::new(labels);
 
-    let mut stream = futures::stream::iter(create_databases)
-        .map(|(db_name, filename)| {
-            let mut config = config.clone();
-            config.db.clone_from(&db_name);
-            let file = filename.to_string_lossy().to_string();
-            let engine = engine.clone();
-            let labels = labels.clone();
-            let cancel = cancel.clone();
-            async move {
-                let res = AbortOnDropHandle::new(tokio::spawn(async move {
-                    connect_and_run_test_file(
-                        Vec::new(),
-                        filename,
-                        &engine,
-                        config,
-                        &labels,
-                        cancel,
-                        shutdown_timeout,
-                    )
-                    .await
-                }))
-                .await
-                .unwrap();
-                (db_name, file, res)
-            }
-        })
-        .buffer_unordered(jobs);
+    let worker_handle = {
+        let engine = engine.clone();
+        let config = config.clone();
+        let labels = Arc::clone(&labels);
+        let result_tx = result_tx.clone();
+        let in_flight = Arc::clone(&in_flight);
+        tokio::spawn(execution_task(
+            jobs,
+            job_rx,
+            result_tx,
+            in_flight,
+            engine,
+            config,
+            labels,
+            directives,
+            part,
+            show_all_errors,
+            cancel.clone(),
+            shutdown_timeout,
+            test_timeout,
+        ))
+    };
+
+    let dropper_handle = {
+        let engine = engine.clone();
+        let config = config.clone();
+        tokio::spawn(drop_task(drop_rx, engine, config))
+    };
+
+    let creator_handle = {
+        let engine = engine.clone();
+        let config = config.clone();
+        tokio::spawn(create_task(test_databases, engine, config, job_tx))
+    };
+
+    drop(result_tx);
 
     eprintln!("{}", style("[TEST IN PROGRESS]").blue().bold());
 
     let mut failed_cases = vec![];
-    let mut failed_db: HashSet<String> = HashSet::new();
+    let mut failed_dbs: HashSet<String> = HashSet::new();
+    let mut connection_refused = false;
+    let mut connection_refused_notified = false;
+    let mut processed = 0usize;
 
+    let start = Instant::now();
+
+    // Progress is checked on a fixed tick rather than only when `recv()` times
+    // out: any result at all used to reset that timeout, so a wedged test stayed
+    // invisible as long as its 127 neighbours kept finishing.
+    const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+    // A test still running after this long is worth naming even while the run is
+    // otherwise making progress.
+    // Observed legitimate durations reach ~1700s under a sanitizer build, so this
+    // is deliberately generous; each test is named at most once (`warned_slow`)
+    // rather than every tick.
+    const SLOW_TEST_AGE: Duration = Duration::from_secs(900);
+
+    let mut ticker = tokio::time::interval(STALL_CHECK_INTERVAL);
+    // `biased` polls `recv()` first, so a steady stream of results starves the
+    // ticker; the default Burst behaviour would then fire every missed tick at
+    // once and print a run of identical reports.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // the first tick completes immediately; discard it
+    let mut last_result = Instant::now();
+    let mut warned_slow: HashSet<String> = HashSet::new();
+
+    'outer: while processed < total_tests {
+        let message = loop {
+            tokio::select! {
+                biased;
+                res = result_rx.recv() => match res {
+                    Some(message) => break message,
+                    // All senders dropped: nothing more will arrive.
+                    None => break 'outer,
+                },
+                _ = ticker.tick() => {
+                    let quiet = last_result.elapsed();
+                    let started = in_flight.lock().map(|m| m.clone()).unwrap_or_default();
+                    // Split what has not reported into tests that are actually
+                    // running (with how long they have been) and tests still
+                    // waiting for a slot. Without the split a wedged test looks
+                    // the same as one that never started.
+                    let mut running: Vec<(Duration, String, String)> = outstanding
+                        .iter()
+                        .filter_map(|(db, file)| {
+                            started.get(db).map(|t| {
+                                (
+                                    t.elapsed(),
+                                    to_relative_path_display(&file.to_string_lossy()),
+                                    db.clone(),
+                                )
+                            })
+                        })
+                        .collect();
+                    // Longest-running first: that is the one to look at.
+                    running.sort_by_key(|a| std::cmp::Reverse(a.0));
+                    // Only tests not already named, so a genuinely long test is
+                    // reported once instead of on every tick.
+                    let slow = running
+                        .iter()
+                        .filter(|(d, _, db)| *d >= SLOW_TEST_AGE && !warned_slow.contains(db))
+                        .count();
+                    for (d, _, db) in &running {
+                        if *d >= SLOW_TEST_AGE {
+                            warned_slow.insert(db.clone());
+                        }
+                    }
+
+                    // Either the whole run went quiet, or something is dragging.
+                    if quiet >= STALL_CHECK_INTERVAL || slow > 0 {
+                        let queued = outstanding.len() - running.len();
+                        let shown: Vec<String> = running
+                            .iter()
+                            .take(10)
+                            .map(|(d, f, _)| format!("{f} ({}s)", d.as_secs()))
+                            .collect();
+                        eprintln!(
+                            "{} {}; {}/{} done, {} running, {} queued{}{}",
+                            style("[STALLED]").yellow().bold(),
+                            if quiet >= STALL_CHECK_INTERVAL {
+                                format!("no result for {}s", quiet.as_secs())
+                            } else {
+                                format!("{slow} test(s) running over {}s", SLOW_TEST_AGE.as_secs())
+                            },
+                            processed,
+                            total_tests,
+                            running.len(),
+                            queued,
+                            if shown.is_empty() { "" } else { "; longest: " },
+                            shown.join(", ")
+                        );
+                    }
+                }
+            }
+        };
+        processed += 1;
+        last_result = Instant::now();
+        outstanding.remove(&message.db_name);
+
+        let TestResultMessage {
+            db_name,
+            file,
+            result,
+        } = message;
+        let test_case_name = file.to_test_case_name();
+        let case = result.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
+        test_suite.add_test_case(case);
+
+        match result {
+            RunResult::Ok(_) => {}
+            RunResult::Err(e) => {
+                if format!("{:?}", e).contains("Connection refused") && !connection_refused {
+                    connection_refused = true;
+                    eprintln!("Connection refused. The server may be down.");
+                }
+                if fail_fast || connection_refused {
+                    eprintln!("Cancelling remaining tests...");
+                    cancel.cancel();
+                }
+
+                failed_cases.push(to_relative_path_display(&file));
+                failed_dbs.insert(db_name.clone());
+            }
+            RunResult::Skipped | RunResult::Cancelled => {}
+        };
+
+        if connection_refused && !connection_refused_notified {
+            let _ = drop_tx.send(DropMessage::ConnectionRefused);
+            connection_refused_notified = true;
+        }
+
+        if !connection_refused {
+            if keep_db_on_failure && failed_dbs.contains(&db_name) {
+                eprintln!(
+                    "+ {}",
+                    style(format!(
+                        "DATABASE {db_name} contains failed cases, kept for debugging"
+                    ))
+                    .red()
+                    .bold()
+                );
+            } else {
+                let _ = drop_tx.send(DropMessage::Drop(db_name.clone()));
+            }
+        }
+    }
+
+    eprintln!(
+        "\nFinished in {} ms. Engine: {engine}, labels: [{}]",
+        start.elapsed().as_millis(),
+        labels.join(", ")
+    );
+
+    drop(drop_tx);
+
+    creator_handle.await??;
+    worker_handle.await??;
+    dropper_handle.await??;
+
+    if processed < total_tests {
+        return Err(anyhow!("worker pool terminated early"));
+    }
+
+    if !failed_cases.is_empty() {
+        failed_cases.sort();
+        Err(anyhow!("some test cases failed:\n{:#?}", failed_cases))
+    } else if cancel.is_cancelled() {
+        Err(anyhow!("some test cases skipped or cancelled"))
+    } else {
+        Ok(())
+    }
+}
+
+async fn create_task(
+    tests: Vec<(String, PathBuf)>,
+    engine: EngineConfig,
+    config: DBConfig,
+    job_tx: mpsc::Sender<TestJob>,
+) -> Result<()> {
+    let mut db = engines::connect(
+        &engine,
+        &config,
+        SslMode::Disable,
+        DBPort::Plain,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    for (db_name, filename) in tests {
+        let query = format!("CREATE DATABASE {db_name};");
+        if let Err(err) = db.run(&query).await {
+            eprintln!("({})  ignore error: {err}", query);
+        }
+
+        if job_tx.send(TestJob { db_name, filename }).await.is_err() {
+            break;
+        }
+    }
+
+    db.shutdown().await;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execution_task(
+    concurrency: usize,
+    mut job_rx: mpsc::Receiver<TestJob>,
+    result_tx: mpsc::Sender<TestResultMessage>,
+    in_flight: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    engine: EngineConfig,
+    config: DBConfig,
+    labels: Arc<Vec<String>>,
+    directives: Directives,
+    part: Option<Part>,
+    show_all_errors: bool,
+    cancel: CancellationToken,
+    shutdown_timeout: Option<Duration>,
+    test_timeout: Option<Duration>,
+) -> Result<()> {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+
+    while let Some(job) = job_rx.recv().await {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let result_tx = result_tx.clone();
+        let engine = engine.clone();
+        let config = config.clone();
+        let labels = Arc::clone(&labels);
+        let cancel = cancel.clone();
+        let in_flight = Arc::clone(&in_flight);
+
+        join_set.spawn(async move {
+            let TestJob { db_name, filename } = job;
+            if let Ok(mut m) = in_flight.lock() {
+                m.insert(db_name.clone(), Instant::now());
+            }
+            let mut job_config = config;
+            job_config.db = db_name.clone();
+
+            let result = connect_and_run_test_file(
+                Vec::new(),
+                filename.clone(),
+                &engine,
+                job_config,
+                labels.as_ref(),
+                directives,
+                part,
+                show_all_errors,
+                cancel,
+                shutdown_timeout,
+                test_timeout,
+            )
+            .await;
+
+            let file = filename.to_string_lossy().to_string();
+            let message = TestResultMessage {
+                db_name,
+                file,
+                result,
+            };
+
+            if let Ok(mut m) = in_flight.lock() {
+                m.remove(&message.db_name);
+            }
+            let _ = result_tx.send(message).await;
+            drop(permit);
+        });
+    }
+
+    drop(result_tx);
+
+    while let Some(join_result) = join_set.join_next().await {
+        join_result?;
+    }
+
+    Ok(())
+}
+
+async fn drop_task(
+    mut drop_rx: mpsc::UnboundedReceiver<DropMessage>,
+    engine: EngineConfig,
+    config: DBConfig,
+) -> Result<()> {
+    const MAX_RETRIES: usize = 1;
+    const RETRY_DELAY: Duration = Duration::from_secs(1);
+    // Recovery tests intentionally crash the server, and the
+    // dropper's startup connect runs concurrently with the test -- it can be in
+    // flight when that crash kills the server, surfacing as a one-off
+    // "connection closed".
+    // CONNECT_RETRIES is deliberately much larger than MAX_RETRIES because the
+    // two cover different situations. The DROP runs *after* the test, when the
+    // server is already back up. This
+    // connect can instead land *during* the crash/restart window, when the
+    // server is genuinely down, so it must keep trying long enough to outlast a
+    // full restart -- many more attempts than reconnecting to an already-up
+    // server.
+    const CONNECT_RETRIES: usize = 10;
+    let mut connect_attempts = 0;
+    let mut db = loop {
+        match engines::connect(
+            &engine,
+            &config,
+            SslMode::Disable,
+            DBPort::Plain,
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(conn) => break conn,
+            Err(e) => {
+                connect_attempts += 1;
+                if connect_attempts > CONNECT_RETRIES {
+                    return Err(e.into());
+                }
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    };
+
+    while let Some(message) = drop_rx.recv().await {
+        match message {
+            DropMessage::ConnectionRefused => {
+                eprintln!("  Connection refused. The server may be down. Exiting...");
+                break;
+            }
+            DropMessage::Drop(db_name) => {
+                match drop_database_with_retry(
+                    &mut db,
+                    &db_name,
+                    &engine,
+                    &config,
+                    MAX_RETRIES,
+                    RETRY_DELAY,
+                )
+                .await
+                {
+                    Ok(()) => {} // Success, maybe reconnected
+                    Err(e) => {
+                        eprintln!("  {e}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    db.shutdown().await;
+    Ok(())
+}
+
+/// Attempts to drop a database with retry logic.
+/// Uses `DROP DATABASE IF EXISTS` for idempotency and retries on any error.
+/// Reconnects to the database before each retry. Fails fast if reconnection fails.
+async fn drop_database_with_retry(
+    db: &mut engines::Engines,
+    db_name: &str,
+    engine: &EngineConfig,
+    config: &DBConfig,
+    max_retries: usize,
+    retry_delay: Duration,
+) -> Result<()> {
+    let query = format!("DROP DATABASE IF EXISTS {db_name};");
+    let total_attempts = max_retries + 1;
+
+    for attempt in 1..=total_attempts {
+        match db.run(&query).await {
+            Ok(_) => {
+                if attempt > 1 {
+                    eprintln!("  Succeed");
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("({query}) error: {err}");
+
+                if attempt < total_attempts {
+                    eprintln!(
+                        "  Retrying with new connection ({}/{})...",
+                        attempt, max_retries
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    match engines::connect(
+                        engine,
+                        config,
+                        SslMode::Disable,
+                        DBPort::Plain,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(new_db) => {
+                            *db = new_db;
+                            continue;
+                        }
+                        Err(_) => {
+                            // Just try again to reconnect
+                        }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "Failed to drop database {db_name} after {max_retries} retries"
+                    ));
+                }
+            }
+        }
+    }
+
+    unreachable!("Loop should always return via Ok or Err branches")
+}
+
+// Run test one be one
+#[allow(clippy::too_many_arguments)]
+async fn run_serial(
+    test_suite: &mut TestSuite,
+    files: Vec<PathBuf>,
+    engine: &EngineConfig,
+    config: DBConfig,
+    RunConfig {
+        labels,
+        directives,
+        part,
+        junit,
+        fail_fast,
+        show_all_errors,
+        show_discovered_tests: _,
+        cancel,
+        shutdown_timeout,
+        test_timeout,
+    }: RunConfig,
+) -> Result<()> {
+    let mut failed_cases = vec![];
     let mut connection_refused = false;
     let start = Instant::now();
 
-    while let Some((db_name, file, res)) = stream.next().await {
-        let test_case_name = file.to_test_case_name();
+    for file in files {
+        let path = file.to_string_lossy().to_string();
+        let test_case_name = path.to_test_case_name();
+        let res = connect_and_run_test_file(
+            stdout(),
+            file,
+            engine,
+            config.clone(),
+            &labels,
+            directives,
+            part,
+            show_all_errors,
+            cancel.clone(),
+            shutdown_timeout,
+            test_timeout,
+        )
+        .await;
+        stdout().flush()?;
+
         let case = res.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
         test_suite.add_test_case(case);
 
@@ -504,20 +1239,154 @@ async fn run_parallel(
                     cancel.cancel();
                 }
 
-                failed_cases.push(test_case_name.clone());
-                failed_db.insert(db_name.clone());
+                failed_cases.push(to_relative_path_display(&path));
             }
             RunResult::Skipped | RunResult::Cancelled => {}
         };
     }
 
-    eprintln!("\n Finished in {} ms", start.elapsed().as_millis());
+    eprintln!(
+        "\nFinished in {} ms. Engine: {engine}, labels: [{}]",
+        start.elapsed().as_millis(),
+        labels.join(", ")
+    );
 
-    if connection_refused {
-        eprintln!("Skip dropping databases due to connection refused: {db_names:?}");
+    if !failed_cases.is_empty() {
+        failed_cases.sort();
+        Err(anyhow!("some test cases failed:\n{:#?}", failed_cases))
+    } else if cancel.is_cancelled() {
+        Err(anyhow!("some test cases skipped or cancelled"))
     } else {
-        for db_name in db_names {
-            if keep_db_on_failure && failed_db.contains(&db_name) {
+        Ok(())
+    }
+}
+
+/// Owns a unique scratch directory under [`std::env::temp_dir`] used to stage
+/// override output. `Drop` removes it; if the process is killed by a signal the
+/// directory is left behind for inspection.
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    /// Creates a fresh `<tmp>/sqllogictest-<suffix>` directory.
+    fn new() -> io::Result<Self> {
+        let suffix = rand::distributions::Alphanumeric
+            .sample_string(&mut rand::thread_rng(), 8)
+            .to_lowercase();
+        let path = std::env::temp_dir().join(format!("sqllogictest-{suffix}"));
+        fs_err::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        // Best-effort cleanup; nothing useful to do on failure.
+        let _ = fs_err::remove_dir_all(&self.path);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_test_files(
+    files: Vec<PathBuf>,
+    engine: &EngineConfig,
+    config: DBConfig,
+    update_mode: &UpdateMode,
+    jobs: Option<usize>,
+    keep_db_on_failure: bool,
+    labels: Vec<String>,
+    directives: Directives,
+    show_discovered_tests: bool,
+) -> Result<()> {
+    let temp_dir = TempDirGuard::new().context("failed to create temp directory for overrides")?;
+
+    eprintln!("staging override output in {}", temp_dir.path().display());
+
+    let mut db = engines::connect(
+        engine,
+        &config,
+        SslMode::Disable,
+        DBPort::Plain,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let test_databases = if jobs.is_some() {
+        test_db_names(files, show_discovered_tests)?
+    } else {
+        files
+            .iter()
+            .map(|path| (config.db.clone(), path.clone()))
+            .collect()
+    };
+
+    let db_names: Vec<String> = test_databases
+        .iter()
+        .map(|(db_name, _)| db_name)
+        .cloned()
+        .collect();
+    if jobs.is_some() {
+        for db_name in &db_names {
+            let query = format!("CREATE DATABASE {db_name};");
+            eprintln!("+ {query}");
+            if let Err(err) = db.run(&query).await {
+                eprintln!("  ignore error: {err}");
+            }
+        }
+    }
+
+    let failed_dbs: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let temp_dir_path: &Path = temp_dir.path();
+
+    let mut stream = futures::stream::iter(test_databases)
+        .map(|(db_name, file)| {
+            let mut config = config.clone();
+            config.db = db_name.clone();
+
+            let failed_dbs = failed_dbs.clone();
+            let labels = &labels;
+            async move {
+                let mut runner = Runner::new(|ssl_mode, port, user, password, database| {
+                    engines::connect(engine, &config, ssl_mode, port, user, password, database)
+                });
+                for label in labels {
+                    runner.add_label(label);
+                }
+                directives.apply(&mut runner);
+                runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
+
+                let mut buffer = vec![];
+                if let Err(e) =
+                    update_test_file(&mut buffer, &mut runner, &file, update_mode, temp_dir_path)
+                        .await
+                {
+                    writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
+                        .expect("cannot write to buffer");
+                    if keep_db_on_failure {
+                        failed_dbs.lock().await.insert(db_name);
+                    }
+                };
+
+                runner.shutdown_async().await;
+                buffer
+            }
+        })
+        .buffer_unordered(jobs.unwrap_or(1));
+
+    while let Some(output) = stream.next().await {
+        io::stdout().write_all(&output)?;
+    }
+
+    if jobs.is_some() {
+        let failed_dbs_guard = failed_dbs.lock().await;
+        for db_name in db_names.iter() {
+            if keep_db_on_failure && failed_dbs_guard.contains(db_name) {
                 eprintln!(
                     "+ {}",
                     style(format!(
@@ -540,103 +1409,6 @@ async fn run_parallel(
             }
         }
     }
-
-    // Shutdown the connection for managing temporary databases.
-    db.shutdown().await;
-
-    if !failed_cases.is_empty() {
-        Err(anyhow!("some test cases failed:\n{:#?}", failed_cases))
-    } else if cancel.is_cancelled() {
-        Err(anyhow!("some test cases skipped or cancelled"))
-    } else {
-        Ok(())
-    }
-}
-
-// Run test one be one
-#[allow(clippy::too_many_arguments)]
-async fn run_serial(
-    test_suite: &mut TestSuite,
-    files: Vec<PathBuf>,
-    engine: &EngineConfig,
-    config: DBConfig,
-    RunConfig {
-        labels,
-        junit,
-        fail_fast,
-        cancel,
-        shutdown_timeout,
-    }: RunConfig,
-) -> Result<()> {
-    let mut failed_cases = vec![];
-    let mut connection_refused = false;
-
-    for file in files {
-        let test_case_name = file.to_string_lossy().to_test_case_name();
-
-        let res = connect_and_run_test_file(
-            stdout(),
-            file,
-            engine,
-            config.clone(),
-            &labels,
-            cancel.clone(),
-            shutdown_timeout,
-        )
-        .await;
-        stdout().flush()?;
-
-        let case = res.to_junit(&test_case_name, junit.as_deref().unwrap_or_default());
-        test_suite.add_test_case(case);
-
-        match res {
-            RunResult::Ok(_) => {}
-            RunResult::Err(e) => {
-                if format!("{:?}", e).contains("Connection refused") {
-                    connection_refused = true;
-                    eprintln!("Connection refused. The server may be down.");
-                }
-                if fail_fast || connection_refused {
-                    eprintln!("Cancelling remaining tests...");
-                    cancel.cancel();
-                }
-
-                failed_cases.push(test_case_name.clone());
-            }
-            RunResult::Skipped | RunResult::Cancelled => {}
-        };
-    }
-
-    if !failed_cases.is_empty() {
-        Err(anyhow!("some test case failed:\n{:#?}", failed_cases))
-    } else if cancel.is_cancelled() {
-        Err(anyhow!("some test cases skipped or cancelled"))
-    } else {
-        Ok(())
-    }
-}
-
-/// * `format` - If true, will not run sqls, only formats the file.
-async fn update_test_files(
-    files: Vec<PathBuf>,
-    engine: &EngineConfig,
-    config: DBConfig,
-    format: bool,
-) -> Result<()> {
-    for file in files {
-        let mut runner = Runner::new(|| engines::connect(engine, &config));
-        runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
-
-        if let Err(e) = update_test_file(&mut io::stdout(), &mut runner, &file, format).await {
-            {
-                println!("{}\n\n{:?}", style("[FAILED]").red().bold(), e);
-                println!();
-            }
-        };
-
-        runner.shutdown_async().await;
-    }
-
     Ok(())
 }
 
@@ -722,14 +1494,19 @@ impl Output for Vec<u8> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run_test_file(
     out: impl Output,
     filename: PathBuf,
     engine: &EngineConfig,
     config: DBConfig,
     labels: &[String],
+    directives: Directives,
+    part: Option<Part>,
+    show_all_errors: bool,
     cancel: CancellationToken,
     shutdown_timeout: Option<Duration>,
+    test_timeout: Option<Duration>,
 ) -> RunResult {
     struct OutputGuard<O: Output>(O);
     impl<O: Output> Drop for OutputGuard<O> {
@@ -758,14 +1535,27 @@ async fn connect_and_run_test_file(
 
     // Hold until the current test is finished or cancelled.
     let _running = RUNNING_TESTS.read().await;
-
-    let mut runner = Runner::new(|| engines::connect(engine, &config));
+    let mut runner = Runner::new(|ssl_mode, port, user, password, database| {
+        engines::connect(engine, &config, ssl_mode, port, user, password, database)
+    });
     for label in labels {
         runner.add_label(label);
     }
+    directives.apply(&mut runner);
     runner.set_var(well_known::DATABASE.to_owned(), config.db.clone());
 
     let begin = Instant::now();
+
+    // A test that never resolves would otherwise hang the entire run: its task
+    // never sends a TestResultMessage, so the receive loop in `run_parallel`
+    // waits forever on a channel whose senders are all still alive.
+    let test_timer = async {
+        match test_timeout {
+            Some(d) => tokio::time::sleep(d).await,
+            // No timeout configured: never fire.
+            None => std::future::pending::<()>().await,
+        }
+    };
 
     // Note: we don't use `CancellationToken::run_until_cancelled` here because it always
     // poll the wrapped future first, while we want cancellation to be more responsive.
@@ -781,7 +1571,21 @@ async fn connect_and_run_test_file(
             .unwrap();
             RunResult::Cancelled
         }
-        result = run_test_file(&mut out.0, &mut runner, filename.clone()) => {
+        _ = test_timer => {
+            let secs = test_timeout.map(|d| d.as_secs()).unwrap_or_default();
+            writeln!(
+                out.0,
+                "{} after {} ms",
+                style("[TIMEOUT]").red().bold(),
+                begin.elapsed().as_millis(),
+            )
+            .unwrap();
+            RunResult::Err(anyhow!(
+                "test file {} exceeded --test-timeout of {secs}s",
+                filename.display()
+            ))
+        }
+        result = run_test_file(&mut out.0, &mut runner, filename.clone(), part, show_all_errors) => {
             if let Err(err) = &result {
                 writeln!(
                     out.0,
@@ -821,25 +1625,39 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
-) -> Result<Duration> {
+    part: Option<Part>,
+    show_all_errors: bool,
+) -> Result<Duration>
+where
+    M::Conn: Send + 'static,
+{
     let filename = filename.as_ref();
 
-    write!(out, "{: <60} .. ", filename.to_string_lossy())?;
+    let name = match part {
+        Some(Part { index, count }) => format!("{} [{index}/{count}]", filename.to_string_lossy()),
+        None => filename.to_string_lossy().into_owned(),
+    };
+    write!(out, "{name: <60} .. ")?;
     flush(out).await?;
 
-    let records = tokio::task::block_in_place(|| sqllogictest::parse_file(filename))
+    let mut records = tokio::task::block_in_place(|| sqllogictest::parse_file(filename))
         .context("failed to parse sqllogictest file")?;
+    if let Some(part) = part {
+        records = part.select(records);
+    }
 
     let mut begin_times = vec![];
     let mut did_pop = false;
 
     begin_times.push(Instant::now());
 
-    for record in records {
+    let mut errors = vec![];
+    let mut locations = vec![];
+    for record in &records {
         if let Record::Halt { .. } = record {
             break;
         }
-        match &record {
+        match record {
             Record::Injected(Injected::BeginInclude(file)) => {
                 begin_times.push(Instant::now());
                 if !did_pop {
@@ -861,11 +1679,26 @@ async fn run_test_file<T: io::Write, M: MakeConnection>(
             }
             _ => {}
         }
+    }
+    begin_times.truncate(1);
 
-        runner
-            .run_async(record)
-            .await
-            .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+    // Use run_multi_async so that `async` and `wait` records are handled correctly.
+    if let Err(e) = runner.run_multi_records(records).await {
+        if show_all_errors {
+            errors.push(e.kind());
+            locations.push(e.location());
+        } else {
+            return Err(e)
+                .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+                .context(format!(
+                    "failed to run `{}`",
+                    style(filename.to_string_lossy()).bold()
+                ));
+        }
+    }
+    if !errors.is_empty() {
+        let e = Err(TestError::new_composite(errors, locations));
+        e.map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
             .context(format!(
                 "failed to run `{}`",
                 style(filename.to_string_lossy()).bold()
@@ -920,13 +1753,41 @@ fn finish_test_file<T: io::Write>(
     Ok::<_, anyhow::Error>(())
 }
 
+/// Leaves at most one of the newlines a rewritten file ends with: the last record is a
+/// statement or a query, or the original file ended with several.
+fn trim_trailing_newlines(outfile: &mut File) -> io::Result<()> {
+    const N: usize = 8;
+    let mut buf = [0u8; N];
+    loop {
+        let tail = outfile.metadata()?.len().min(N as u64) as usize;
+        if tail == 0 {
+            return Ok(());
+        }
+        outfile.seek(SeekFrom::End(-(tail as i64)))?;
+        outfile.read_exact(&mut buf[..tail])?;
+        let num_newlines = buf[..tail]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\n')
+            .count();
+        assert!(num_newlines > 0);
+        if num_newlines > 1 {
+            outfile.set_len(outfile.metadata()?.len() - num_newlines as u64 + 1)?;
+        }
+        if num_newlines <= 1 || num_newlines < tail {
+            return Ok(());
+        }
+    }
+}
+
 /// Different from [`sqllogictest::update_test_file`], we re-implement it here to print some
 /// progress information.
 async fn update_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
-    format: bool,
+    update_mode: &UpdateMode,
+    temp_dir: &Path,
 ) -> Result<()> {
     let filename = filename.as_ref();
     let records = tokio::task::block_in_place(|| {
@@ -942,18 +1803,38 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
 
     begin_times.push(Instant::now());
 
-    fn create_outfile(filename: impl AsRef<Path>) -> io::Result<(PathBuf, File)> {
-        let filename = filename.as_ref();
-        let outfilename = filename.file_name().unwrap().to_str().unwrap().to_owned() + ".temp";
-        let outfilename = filename.parent().unwrap().join(outfilename);
-        // create a temp file in read-write mode
-        let outfile = OpenOptions::new()
+    /// Mirrors the source path's structure inside `temp_dir` and opens the
+    /// staging file in read+write mode. Absolute paths under the CWD are made
+    /// relative first so the temp tree stays shallow; root and `..` components
+    /// are sanitized so the output path can never escape `temp_dir`.
+    fn create_outfile(source: impl AsRef<Path>, temp_dir: &Path) -> io::Result<(PathBuf, File)> {
+        use std::path::Component;
+
+        let source = source.as_ref();
+        let cwd = std::env::current_dir().ok();
+        let relative = cwd
+            .as_deref()
+            .and_then(|cwd| source.strip_prefix(cwd).ok())
+            .unwrap_or(source);
+
+        let mut staged = temp_dir.to_path_buf();
+        for comp in relative.components() {
+            match comp {
+                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => staged.push("__up__"),
+                Component::Normal(s) => staged.push(s),
+            }
+        }
+        if let Some(parent) = staged.parent() {
+            fs_err::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .read(true)
-            .open(&outfilename)?;
-        Ok((outfilename, outfile))
+            .open(&staged)?;
+        Ok((staged, file))
     }
 
     fn override_with_outfile(
@@ -961,31 +1842,21 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
         outfilename: &PathBuf,
         outfile: &mut File,
     ) -> io::Result<()> {
-        // check whether outfile ends with multiple newlines, which happens if
-        // - the last record is statement/query
-        // - the original file ends with multiple newlines
+        trim_trailing_newlines(outfile)?;
 
-        const N: usize = 8;
-        let mut buf = [0u8; N];
-        loop {
-            outfile.seek(SeekFrom::End(-(N as i64))).unwrap();
-            outfile.read_exact(&mut buf).unwrap();
-            let num_newlines = buf.iter().rev().take_while(|&&b| b == b'\n').count();
-            assert!(num_newlines > 0);
+        let replace_via_copy = || -> io::Result<()> {
+            fs_err::copy(outfilename, filename)?;
+            fs_err::remove_file(outfilename)?;
+            Ok(())
+        };
 
-            if num_newlines > 1 {
-                // if so, remove the last ones
-                outfile
-                    .set_len(outfile.metadata().unwrap().len() - num_newlines as u64 + 1)
-                    .unwrap();
-            }
-
-            if num_newlines == 1 || num_newlines < N {
-                break;
-            }
+        // For symlinks, copy through the link instead of replacing it.
+        // For regular files, prefer atomic rename; fall back to copy when the
+        // staged file lives on a different filesystem (e.g. /tmp on tmpfs).
+        let is_symlink = fs_err::symlink_metadata(filename)?.is_symlink();
+        if is_symlink || fs_err::rename(outfilename, filename).is_err() {
+            replace_via_copy()?;
         }
-
-        fs_err::rename(outfilename, filename)?;
 
         Ok(())
     }
@@ -996,7 +1867,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
         outfile: File,
         halt: bool,
     }
-    let (outfilename, outfile) = create_outfile(filename)?;
+    let (outfilename, outfile) = create_outfile(filename, temp_dir)?;
     let mut stack = vec![Item {
         filename: filename.to_string_lossy().to_string(),
         outfilename,
@@ -1014,7 +1885,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
 
         match &record {
             Record::Injected(Injected::BeginInclude(filename)) => {
-                let (outfilename, outfile) = create_outfile(filename)?;
+                let (outfilename, outfile) = create_outfile(filename, temp_dir)?;
                 stack.push(Item {
                     filename: filename.clone(),
                     outfilename,
@@ -1052,7 +1923,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
                     writeln!(outfile, "{record}")?;
                     continue;
                 }
-                update_record(outfile, runner, record, format)
+                update_record(outfile, runner, record, update_mode)
                     .await
                     .context(format!("failed to run `{}`", style(filename).bold()))?;
             }
@@ -1083,25 +1954,49 @@ async fn update_record<M: MakeConnection>(
     outfile: &mut File,
     runner: &mut Runner<M::Conn, M>,
     record: Record<<M::Conn as AsyncDB>::ColumnType>,
-    format: bool,
+    update_mode: &UpdateMode,
 ) -> Result<()> {
     assert!(!matches!(record, Record::Injected(_)));
 
-    if format {
+    if *update_mode == UpdateMode::Format {
         writeln!(outfile, "{record}")?;
         return Ok(());
     }
 
-    let record_output = runner.apply_record(record.clone()).await;
+    let record_output = runner.run_record(record.clone()).await;
     match update_record_with_output(
         &record,
         &record_output,
         "\t",
         default_validator,
-        default_normalizer,
+        trim_normalizer,
         default_column_validator,
+        update_mode,
     ) {
         Some(new_record) => {
+            // Check if skipif was added (new conditions > old conditions)
+            let old_conditions_len = match &record {
+                Record::Statement { conditions, .. } => conditions.len(),
+                Record::Query { conditions, .. } => conditions.len(),
+                _ => 0,
+            };
+            let new_conditions = match &new_record {
+                Record::Statement { conditions, .. } => conditions,
+                Record::Query { conditions, .. } => conditions,
+                _ => &vec![],
+            };
+
+            // Write any new conditions that were added
+            if new_conditions.len() > old_conditions_len {
+                for condition in &new_conditions[..new_conditions.len() - old_conditions_len] {
+                    writeln!(
+                        outfile,
+                        "{}",
+                        Record::<<M::Conn as AsyncDB>::ColumnType>::Condition(condition.clone())
+                    )?;
+                }
+            }
+
             writeln!(outfile, "{new_record}")?;
         }
         None => {
@@ -1117,5 +2012,33 @@ impl<T: AsRef<str>> T {
     /// Normalize the path to the test case name.
     pub fn to_test_case_name(&self) -> String {
         self.as_ref().replace([' ', '.', '-', '/'], "_")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trimmed(content: &[u8]) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.slt");
+        std::fs::write(&path, content).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        trim_trailing_newlines(&mut file).unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn trim_trailing_newlines_keeps_one() {
+        assert_eq!(trimmed(b""), b"");
+        assert_eq!(trimmed(b"\n"), b"\n");
+        assert_eq!(trimmed(b"\n\n\n"), b"\n");
+        assert_eq!(trimmed(b"a\n"), b"a\n");
+        assert_eq!(trimmed(b"query\n----\n1\n\n\n"), b"query\n----\n1\n");
+        assert_eq!(trimmed(&[b"x".as_slice(), &[b'\n'; 20]].concat()), b"x\n");
     }
 }
