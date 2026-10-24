@@ -1753,6 +1753,33 @@ fn finish_test_file<T: io::Write>(
     Ok::<_, anyhow::Error>(())
 }
 
+/// Leaves at most one of the newlines a rewritten file ends with: the last record is a
+/// statement or a query, or the original file ended with several.
+fn trim_trailing_newlines(outfile: &mut File) -> io::Result<()> {
+    const N: usize = 8;
+    let mut buf = [0u8; N];
+    loop {
+        let tail = outfile.metadata()?.len().min(N as u64) as usize;
+        if tail == 0 {
+            return Ok(());
+        }
+        outfile.seek(SeekFrom::End(-(tail as i64)))?;
+        outfile.read_exact(&mut buf[..tail])?;
+        let num_newlines = buf[..tail]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\n')
+            .count();
+        assert!(num_newlines > 0);
+        if num_newlines > 1 {
+            outfile.set_len(outfile.metadata()?.len() - num_newlines as u64 + 1)?;
+        }
+        if num_newlines <= 1 || num_newlines < tail {
+            return Ok(());
+        }
+    }
+}
+
 /// Different from [`sqllogictest::update_test_file`], we re-implement it here to print some
 /// progress information.
 async fn update_test_file<T: io::Write, M: MakeConnection>(
@@ -1815,29 +1842,7 @@ async fn update_test_file<T: io::Write, M: MakeConnection>(
         outfilename: &PathBuf,
         outfile: &mut File,
     ) -> io::Result<()> {
-        // check whether outfile ends with multiple newlines, which happens if
-        // - the last record is statement/query
-        // - the original file ends with multiple newlines
-
-        const N: usize = 8;
-        let mut buf = [0u8; N];
-        loop {
-            outfile.seek(SeekFrom::End(-(N as i64))).unwrap();
-            outfile.read_exact(&mut buf).unwrap();
-            let num_newlines = buf.iter().rev().take_while(|&&b| b == b'\n').count();
-            assert!(num_newlines > 0);
-
-            if num_newlines > 1 {
-                // if so, remove the last ones
-                outfile
-                    .set_len(outfile.metadata().unwrap().len() - num_newlines as u64 + 1)
-                    .unwrap();
-            }
-
-            if num_newlines == 1 || num_newlines < N {
-                break;
-            }
-        }
+        trim_trailing_newlines(outfile)?;
 
         let replace_via_copy = || -> io::Result<()> {
             fs_err::copy(outfilename, filename)?;
@@ -2007,5 +2012,33 @@ impl<T: AsRef<str>> T {
     /// Normalize the path to the test case name.
     pub fn to_test_case_name(&self) -> String {
         self.as_ref().replace([' ', '.', '-', '/'], "_")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trimmed(content: &[u8]) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.slt");
+        std::fs::write(&path, content).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        trim_trailing_newlines(&mut file).unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    #[test]
+    fn trim_trailing_newlines_keeps_one() {
+        assert_eq!(trimmed(b""), b"");
+        assert_eq!(trimmed(b"\n"), b"\n");
+        assert_eq!(trimmed(b"\n\n\n"), b"\n");
+        assert_eq!(trimmed(b"a\n"), b"a\n");
+        assert_eq!(trimmed(b"query\n----\n1\n\n\n"), b"query\n----\n1\n");
+        assert_eq!(trimmed(&[b"x".as_slice(), &[b'\n'; 20]].concat()), b"x\n");
     }
 }
