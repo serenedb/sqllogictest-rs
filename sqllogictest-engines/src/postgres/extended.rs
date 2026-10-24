@@ -8,7 +8,6 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use futures::{pin_mut, StreamExt};
 use pg_interval::Interval;
 use postgres_types::{accepts, FromSql, Kind, ToSql, Type};
-use rust_decimal::Decimal;
 use sqllogictest::{DBOutput, DefaultColumnType};
 
 use crate::postgres::error::PgDriverError;
@@ -184,6 +183,77 @@ impl fmt::Display for UuidValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+#[derive(Debug)]
+struct NumericValue(String);
+
+impl<'a> FromSql<'a> for NumericValue {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(NumericValue(
+            numeric_to_string(raw).ok_or("numeric value: malformed payload")?,
+        ))
+    }
+
+    accepts!(NUMERIC);
+}
+
+impl fmt::Display for NumericValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+fn numeric_to_string(raw: &[u8]) -> Option<String> {
+    let word = |i: usize| -> Option<u16> {
+        Some(u16::from_be_bytes(
+            raw.get(i * 2..i * 2 + 2)?.try_into().ok()?,
+        ))
+    };
+    let ndigits = word(0)? as usize;
+    let weight = word(1)? as i16 as i64;
+    let sign = word(2)?;
+    let dscale = word(3)? as usize;
+    if raw.len() != (4 + ndigits) * 2 {
+        return None;
+    }
+    let digit = |d: i64| -> u16 {
+        if d < 0 || d as usize >= ndigits {
+            0
+        } else {
+            word(4 + d as usize).unwrap_or(0)
+        }
+    };
+    let mut s = match sign {
+        0x0000 => String::new(),
+        0x4000 => String::from("-"),
+        0xC000 => return Some("NaN".to_string()),
+        0xD000 => return Some("Infinity".to_string()),
+        0xF000 => return Some("-Infinity".to_string()),
+        _ => return None,
+    };
+    if weight < 0 {
+        s.push('0');
+    } else {
+        let _ = write!(s, "{}", digit(0));
+        for d in 1..=weight {
+            let _ = write!(s, "{:04}", digit(d));
+        }
+    }
+    if dscale > 0 {
+        s.push('.');
+        let start = s.len();
+        let mut d = weight + 1;
+        while s.len() - start < dscale {
+            let _ = write!(s, "{:04}", digit(d));
+            d += 1;
+        }
+        s.truncate(start + dscale);
+    }
+    Some(s)
 }
 
 // BIT / BIT VARYING. tokio-postgres has no builtin FromSql for these without
@@ -616,8 +686,7 @@ fn render_record_field(oid: i32, bytes: &[u8]) -> Option<String> {
                 return Some(s);
             }
             Type::NUMERIC => {
-                let d = Decimal::from_sql(&Type::NUMERIC, bytes).ok()?;
-                return Some(d.to_string());
+                return numeric_to_string(bytes);
             }
             Type::TIMESTAMP => {
                 let dt = NaiveDateTime::from_sql(&Type::TIMESTAMP, bytes).ok()?;
@@ -1211,10 +1280,10 @@ impl sqllogictest::AsyncDB for Postgres<Extended> {
                         array_process!(row, row_vec, idx, i64);
                     }
                     Type::NUMERIC => {
-                        single_process!(row, row_vec, idx, Decimal);
+                        single_process!(row, row_vec, idx, NumericValue);
                     }
                     Type::NUMERIC_ARRAY => {
-                        array_process!(row, row_vec, idx, Decimal);
+                        array_process!(row, row_vec, idx, NumericValue);
                     }
                     Type::DATE => {
                         single_process!(row, row_vec, idx, DateValue);
