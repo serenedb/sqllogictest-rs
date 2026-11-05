@@ -612,7 +612,12 @@ pub(crate) fn align_with_ignore_marker(expected: &str, actual: &str) -> String {
     let mut actual_rem = actual;
 
     for (i, chunk) in expected_chunks.into_iter().enumerate() {
-        let Some(pos) = actual_rem.find(chunk) else {
+        let found = if ends_with_ignore && i + 1 == chunks_count {
+            Some(actual_rem.len())
+        } else {
+            actual_rem.find(chunk)
+        };
+        let Some(pos) = found else {
             pending = Some(match pending {
                 Some(prev) => widen(expected, prev, chunk),
                 None => chunk,
@@ -2264,6 +2269,26 @@ SELECT 1
         let expected = "foo<slt:ignore>";
         let actual = "foobarbaz";
         assert_eq!(align_with_ignore_marker(expected, actual), expected);
+    }
+
+    #[test]
+    fn test_align_trailing_marker_keeps_replaced_fragment() {
+        let expected = "error: old wording.<slt:ignore>";
+        let actual = "error: new wording\nDETAIL: more";
+        assert_eq!(
+            align_with_ignore_marker_checked(expected, actual),
+            "error: new wording\nDETAIL: more<slt:ignore>"
+        );
+    }
+
+    #[test]
+    fn test_align_trailing_marker_cuts_after_shared_suffix() {
+        let expected = "error: old reason, see log<slt:ignore>";
+        let actual = "error: new reason, see log 42";
+        assert_eq!(
+            align_with_ignore_marker_checked(expected, actual),
+            "error: new reason, see log<slt:ignore>"
+        );
     }
 
     #[test]
