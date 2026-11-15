@@ -2396,7 +2396,7 @@ pub fn update_record_with_output<T: ColumnType>(
                 loc,
                 conditions,
                 connection,
-                expected: mut expected @ (StatementExpect::Ok | StatementExpect::Count(_)),
+                expected,
                 retry,
                 exec_async,
             },
@@ -2410,17 +2410,15 @@ pub fn update_record_with_output<T: ColumnType>(
             // This case can be used when we want to only ensure the query succeeds,
             // but don't care about the output.
             // DuckDB has a few of these.
-
-            if let StatementExpect::Count(expected_count) = &mut expected {
-                *expected_count = rows.len() as u64;
-            }
-
             Some(Record::Statement {
                 sql,
                 loc,
                 conditions,
                 connection,
-                expected,
+                expected: match expected {
+                    StatementExpect::Count(_) => StatementExpect::Count(rows.len() as u64),
+                    StatementExpect::Ok | StatementExpect::Error(_) => StatementExpect::Ok,
+                },
                 retry,
                 exec_async,
             })
@@ -2638,25 +2636,16 @@ pub fn update_record_with_output<T: ColumnType>(
             },
             RecordOutput::System {
                 stdout: actual_stdout,
-                error,
+                error: None,
             },
-        ) => {
-            if let Some(error) = error {
-                tracing::error!(
-                    ?error,
-                    command,
-                    "system command failed while updating the record. It will be unchanged."
-                );
-            }
-            Some(Record::System {
-                loc,
-                conditions,
-                command,
-                stdout: actual_stdout.clone(),
-                retry,
-                exec_async,
-            })
-        }
+        ) => Some(Record::System {
+            loc,
+            conditions,
+            command,
+            stdout: actual_stdout.clone(),
+            retry,
+            exec_async,
+        }),
 
         // No update possible, return the original record
         _ => None,
@@ -3268,6 +3257,38 @@ Caused by:
             ),
         }
         .run_with(default_column_validator)
+    }
+
+    #[test]
+    fn test_statement_error_to_ok_with_rows() {
+        TestCase {
+            input: "statement error\n\
+                    select 1;\n\
+                    ----\n\
+                    TestError: no",
+            record_output: query_output(&[&["?column?"], &["1"]], vec![DefaultColumnType::Any]),
+            expected: Some(
+                "statement ok\n\
+                 select 1;",
+            ),
+        }
+        .run()
+    }
+
+    #[test]
+    fn test_system_failure_is_left_as_it_is() {
+        TestCase {
+            input: "system ok\n\
+                    echo 1\n\
+                    ----\n\
+                    1\n",
+            record_output: RecordOutput::System {
+                stdout: None,
+                error: Some(Arc::new(TestError("exit status: 1".to_string()))),
+            },
+            expected: None,
+        }
+        .run()
     }
 
     #[derive(Debug)]

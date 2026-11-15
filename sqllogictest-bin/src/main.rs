@@ -1328,23 +1328,29 @@ async fn update_test_files(
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
-                if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, update_mode).await
-                {
-                    writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
-                        .expect("cannot write to buffer");
-                    if keep_db_on_failure {
-                        failed_dbs.lock().await.insert(db_name);
-                    }
-                };
+                let failed =
+                    match update_test_file(&mut buffer, &mut runner, &file, update_mode).await {
+                        Ok(()) => None,
+                        Err(e) => {
+                            writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
+                                .expect("cannot write to buffer");
+                            if keep_db_on_failure {
+                                failed_dbs.lock().await.insert(db_name);
+                            }
+                            Some(to_relative_path_display(&file.to_string_lossy()))
+                        }
+                    };
 
                 runner.shutdown_async().await;
-                buffer
+                (buffer, failed)
             }
         })
         .buffer_unordered(jobs.unwrap_or(1));
 
-    while let Some(output) = stream.next().await {
+    let mut failed_files = vec![];
+    while let Some((output, failed)) = stream.next().await {
         io::stdout().write_all(&output)?;
+        failed_files.extend(failed);
     }
 
     if jobs.is_some() {
@@ -1372,6 +1378,10 @@ async fn update_test_files(
                 eprintln!("  ignore DROP DATABASE error: {err}");
             }
         }
+    }
+    if !failed_files.is_empty() {
+        failed_files.sort();
+        bail!("some test files failed to update:\n{:#?}", failed_files);
     }
     Ok(())
 }
@@ -1842,6 +1852,7 @@ where
 
     let mut files = vec![name.clone()];
     let mut edits: HashMap<String, HashMap<u32, Edit<_>>> = HashMap::new();
+    let mut left = vec![];
     for (index, record) in records.iter().enumerate() {
         if let Record::Injected(Injected::BeginInclude(file)) = record {
             files.push(file.clone());
@@ -1869,11 +1880,15 @@ where
             .filter(|new| reformat || new != record)
             .map(|new| Edit::Replace(Box::new(new))),
         };
-        if let Some(edit) = edit {
-            edits
-                .entry(loc.file().to_owned())
-                .or_default()
-                .insert(loc.line(), edit);
+        match (edit, outcome.error) {
+            (Some(edit), _) => {
+                edits
+                    .entry(loc.file().to_owned())
+                    .or_default()
+                    .insert(loc.line(), edit);
+            }
+            (None, Some(error)) => left.push(error),
+            (None, None) => {}
         }
     }
 
@@ -1890,6 +1905,16 @@ where
         }
     }
 
+    if !left.is_empty() {
+        let errors = left
+            .iter()
+            .map(|error| error.display(console::colors_enabled()).to_string())
+            .join("\n");
+        return Err(anyhow!("{errors}")).context(format!(
+            "failed to update `{}`: these records fail and are left as they are",
+            style(&name).bold()
+        ));
+    }
     finish_test_file(out, &mut begin_times, &mut false, &name)?;
     writeln!(out)?;
     Ok(())
@@ -2022,6 +2047,23 @@ select 2
 v
 2
 "
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_test_file_fails_on_a_record_it_cannot_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("system.slt");
+        let text = "system ok\nexit 3\n\nquery\nselect 2\n----\nv\n3\n";
+        fs_err::write(&file, text).unwrap();
+        let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
+        let error = update_test_file(&mut vec![], &mut runner, &file, &UpdateMode::Override)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("left as they are"));
+        assert_eq!(
+            fs_err::read_to_string(&file).unwrap(),
+            text.replace("v\n3", "v\n2")
         );
     }
 
