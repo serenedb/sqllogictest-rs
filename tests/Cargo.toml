@@ -43,3 +43,7 @@ path = "./let/let_test.rs"
 [[test]]
 name = "async"
 path = "./async/async.rs"
+
+[[test]]
+name = "reporting"
+path = "./reporting/reporting.rs"

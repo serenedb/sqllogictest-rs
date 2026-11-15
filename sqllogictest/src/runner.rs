@@ -906,6 +906,32 @@ fn is_connection_failure<D: AsyncDB>(err: &TestError) -> bool {
     }
 }
 
+/// Whether the record of `outcome` failed because its connection is gone.
+fn lost_connection<D: AsyncDB>(outcome: &RecordOutcome<D::ColumnType>) -> bool {
+    outcome
+        .error
+        .as_ref()
+        .is_some_and(is_connection_failure::<D>)
+}
+
+/// Hands `outcome` to `report`, unless its record did not run.
+fn report_outcome<T: ColumnType>(
+    report: &mut impl FnMut(RecordOutcome<T>) -> Result<(), TestError>,
+    outcome: RecordOutcome<T>,
+) -> Result<(), TestError> {
+    if matches!(outcome.output, RecordOutput::Nothing) && outcome.error.is_none() {
+        return Ok(());
+    }
+    report(outcome)
+}
+
+/// An async record running on a named connection, which it hands back with its outcome.
+type NamedTask<D> =
+    tokio::task::JoinHandle<(ConnectionTask<D>, RecordOutcome<<D as AsyncDB>::ColumnType>)>;
+
+/// An async record running on a connection of its own, or on none.
+type AnonymousTask<T> = tokio::task::JoinHandle<RecordOutcome<T>>;
+
 pub struct TaskContext<D: AsyncDB> {
     vars: RunVariables,
     check_options: CheckOptions<D>,
@@ -1530,13 +1556,23 @@ impl<D: AsyncDB> ConnectionTask<D> {
         }
     }
 
+    /// Runs `record` once: what it gave, and whether that meets the record's expectation.
     async fn run_record_async_no_retry(
         &mut self,
         record: Record<D::ColumnType>,
-    ) -> Result<RecordOutput<D::ColumnType>, TestError> {
-        let result = self.apply_record(record.clone()).await;
+    ) -> (RecordOutput<D::ColumnType>, Result<(), TestError>) {
+        let output = self.apply_record(record.clone()).await;
+        let verdict = self.check_output(record, &output);
+        (output, verdict)
+    }
 
-        match (record, &result) {
+    /// Checks what `record` gave against its expectation.
+    fn check_output(
+        &self,
+        record: Record<D::ColumnType>,
+        output: &RecordOutput<D::ColumnType>,
+    ) -> Result<(), TestError> {
+        match (record, output) {
             (_, RecordOutput::Nothing) => {}
             // Tolerate the mismatched return type...
             (
@@ -1715,13 +1751,15 @@ impl<D: AsyncDB> ConnectionTask<D> {
             _ => unreachable!(),
         }
 
-        Ok(result)
+        Ok(())
     }
 
+    /// Runs `record`, retrying it as its `retry` clause says until it meets its expectation:
+    /// what the last attempt gave, and whether that meets the expectation.
     pub async fn run_record(
         &mut self,
         record: Record<D::ColumnType>,
-    ) -> Result<RecordOutput<D::ColumnType>, TestError> {
+    ) -> (RecordOutput<D::ColumnType>, Result<(), TestError>) {
         let (retry, loc) = match &record {
             Record::Statement { retry, loc, .. } => (retry.clone(), loc.clone()),
             Record::Query { retry, loc, .. } => (retry.clone(), loc.clone()),
@@ -1733,36 +1771,57 @@ impl<D: AsyncDB> ConnectionTask<D> {
             return self.run_record_async_no_retry(record).await;
         };
 
-        let (attempts, backoff) = resolve_retry(&retry, &self.context.vars, &loc)?;
+        let (attempts, backoff) = match resolve_retry(&retry, &self.context.vars, &loc) {
+            Ok(resolved) => resolved,
+            Err(err) => return (RecordOutput::Nothing, Err(err)),
+        };
 
-        // Retry for `attempts` times
-        let mut last_error = None;
-        for attempt in 0..attempts {
-            let result = self.run_record_async_no_retry(record.clone()).await;
-            if result.is_ok() {
-                return result;
+        let mut attempt = 1;
+        loop {
+            let (output, verdict) = self.run_record_async_no_retry(record.clone()).await;
+            if verdict.is_ok() || attempt == attempts {
+                return (output, verdict);
             }
             tracing::warn!(
                 target: "sqllogictest::retry",
-                attempt = attempt + 1,
+                attempt,
                 attempts,
                 backoff = ?backoff,
-                error = ?result,
+                error = ?verdict,
                 "retrying"
             );
             D::sleep(backoff).await;
-            last_error = result.err();
+            attempt += 1;
         }
-
-        Err(last_error.unwrap())
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn run_record_test(
         &mut self,
         record: Record<D::ColumnType>,
-    ) -> Result<RecordOutput<D::ColumnType>, TestError> {
+    ) -> (RecordOutput<D::ColumnType>, Result<(), TestError>) {
         block_on_tokio(self.run_record(record))
+    }
+}
+
+/// What running a statement, a query or a system command gave.
+#[derive(Debug)]
+pub struct RecordOutcome<T: ColumnType> {
+    /// The position of the record among the records run.
+    pub index: usize,
+    /// What the last attempt to run the record gave.
+    pub output: RecordOutput<T>,
+    /// Why `output` fails the record's expectation, `None` when it meets it.
+    pub error: Option<TestError>,
+}
+
+impl<T: ColumnType> RecordOutcome<T> {
+    fn new(index: usize, output: RecordOutput<T>, verdict: Result<(), TestError>) -> Self {
+        Self {
+            index,
+            output,
+            error: verdict.err(),
+        }
     }
 }
 
@@ -1834,153 +1893,106 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         self.check_options.flat_values = flat_values;
     }
 
-    /// Run a single record, acquiring and returning a connection as needed.
-    ///
-    /// Returns the raw [`RecordOutput`] without comparing it against any expected value.
-    /// Useful for update modes that rewrite expected values based on actual output.
-    pub async fn run_record(
-        &mut self,
-        record: Record<D::ColumnType>,
-    ) -> RecordOutput<D::ColumnType> {
-        let maybe_conn_name = match &record {
-            Record::Statement { connection, .. }
-            | Record::Query { connection, .. }
-            | Record::Let { connection, .. } => Some(connection.clone()),
-            _ => None,
-        };
-
-        let mut task = if let Some(ref conn_name) = maybe_conn_name {
-            match self.conn.get(conn_name.clone()).await {
-                Ok(conn) => ConnectionTask {
-                    conn: Some(conn),
-                    context: TaskContext {
-                        vars: self.vars.clone(),
-                        check_options: self.check_options.clone(),
-                    },
-                    pending_error: None,
-                },
-                Err(e) => ConnectionTask {
-                    conn: None,
-                    context: TaskContext {
-                        vars: self.vars.clone(),
-                        check_options: self.check_options.clone(),
-                    },
-                    pending_error: Some(Arc::new(e)),
-                },
-            }
-        } else {
-            ConnectionTask {
-                conn: None,
-                context: TaskContext {
-                    vars: self.vars.clone(),
-                    check_options: self.check_options.clone(),
-                },
-                pending_error: None,
-            }
-        };
-
-        let output = task.apply_record(record).await;
-        self.vars = task.context.vars.clone();
-        self.check_options = task.context.check_options.clone();
-        // Return connection to pool
-        if let (Some(conn_name), Some(conn)) = (maybe_conn_name, task.conn) {
-            self.conn.add(conn_name, conn);
-        }
-        output
-    }
-
     /// Get the named connection from `pending` (if an in-flight task exists for it, wait for it
-    /// first) or from the connection pool (creating one if needed), with optional retry.
-    async fn get_or_resume_named_conn(
+    /// first and hand its outcome to `report`) or from the connection pool (creating one if
+    /// needed), with optional retry.
+    async fn get_or_resume_named_conn<F>(
         &mut self,
         conn_name: ConnectionName,
-        pending: &mut HashMap<
-            ConnectionName,
-            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
-        >,
+        pending: &mut HashMap<ConnectionName, NamedTask<D>>,
         loc: &Location,
         sql: &str,
         retry: &Option<RetryConfig>,
+        report: &mut F,
     ) -> Result<ConnectionTask<D>, TestError>
     where
         D: Send + 'static,
+        F: FnMut(RecordOutcome<D::ColumnType>) -> Result<(), TestError>,
     {
         if let Some(handle) = pending.remove(&conn_name) {
             tracing::info!(target: "sqllogictest::wait", ?conn_name, "waiting for async task before reuse");
-            let mut task = handle
+            let (mut task, outcome) = handle
                 .await
-                .expect("Background task panicked or was aborted")?;
-            task.context.vars = self.vars.clone();
-            task.context.check_options = self.check_options.clone();
-            Ok(task)
-        } else {
-            let (attempts, backoff) = resolve_retry_params(retry, &self.vars);
-            let mut last_err = None;
-            let mut conn_opt = None;
-            for attempt in 0..attempts {
-                match self.conn.get(conn_name.clone()).await {
-                    Ok(c) => {
-                        conn_opt = Some(c);
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "sqllogictest::retry",
-                            attempt = attempt + 1,
-                            attempts,
-                            backoff = ?backoff,
-                            "retrying connection"
-                        );
-                        last_err = Some(e);
-                        if attempt + 1 < attempts {
-                            D::sleep(backoff).await;
-                        }
+                .expect("Background task panicked or was aborted");
+            let lost = lost_connection::<D>(&outcome);
+            report_outcome(report, outcome)?;
+            if !lost {
+                task.context.vars = self.vars.clone();
+                task.context.check_options = self.check_options.clone();
+                return Ok(task);
+            }
+        }
+        let (attempts, backoff) = resolve_retry_params(retry, &self.vars);
+        let mut last_err = None;
+        let mut conn_opt = None;
+        for attempt in 0..attempts {
+            match self.conn.get(conn_name.clone()).await {
+                Ok(c) => {
+                    conn_opt = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "sqllogictest::retry",
+                        attempt = attempt + 1,
+                        attempts,
+                        backoff = ?backoff,
+                        "retrying connection"
+                    );
+                    last_err = Some(e);
+                    if attempt + 1 < attempts {
+                        D::sleep(backoff).await;
                     }
                 }
             }
-            let conn = conn_opt.ok_or_else(|| TestError {
-                loc: loc.clone(),
-                kind: Box::new(TestErrorKind::Fail {
-                    sql: sql.to_owned(),
-                    err: Arc::new(last_err.unwrap()),
-                    kind: RecordKind::Statement,
-                }),
-            })?;
-            Ok(ConnectionTask {
-                conn: Some(conn),
-                context: TaskContext {
-                    vars: self.vars.clone(),
-                    check_options: self.check_options.clone(),
-                },
-                pending_error: None,
-            })
         }
+        let conn = conn_opt.ok_or_else(|| TestError {
+            loc: loc.clone(),
+            kind: Box::new(TestErrorKind::Fail {
+                sql: sql.to_owned(),
+                err: Arc::new(last_err.unwrap()),
+                kind: RecordKind::Statement,
+            }),
+        })?;
+        Ok(ConnectionTask {
+            conn: Some(conn),
+            context: TaskContext {
+                vars: self.vars.clone(),
+                check_options: self.check_options.clone(),
+            },
+            pending_error: None,
+        })
     }
 
-    /// Drain all in-flight named and anonymous async tasks, returning connections to the pool.
-    async fn drain_all_pending(
+    /// Drain all in-flight named and anonymous async tasks, handing their outcomes to `report`
+    /// and returning connections to the pool.
+    async fn drain_all_pending<F>(
         &mut self,
-        pending: &mut HashMap<
-            ConnectionName,
-            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
-        >,
-        anon_pending: &mut Vec<tokio::task::JoinHandle<Result<(), TestError>>>,
+        pending: &mut HashMap<ConnectionName, NamedTask<D>>,
+        anon_pending: &mut Vec<AnonymousTask<D::ColumnType>>,
+        report: &mut F,
     ) -> Result<(), TestError>
     where
         D: Send + 'static,
+        F: FnMut(RecordOutcome<D::ColumnType>) -> Result<(), TestError>,
     {
         for (name, handle) in pending.drain() {
             tracing::info!(target: "sqllogictest::wait", ?name, "waiting for async task to complete");
-            let task = handle
+            let (task, outcome) = handle
                 .await
-                .expect("Background task panicked or was aborted")?;
+                .expect("Background task panicked or was aborted");
             tracing::info!(target: "sqllogictest::wait", ?name, "async task completed");
-            self.conn.add(name, task.conn.unwrap());
+            let lost = lost_connection::<D>(&outcome);
+            report_outcome(report, outcome)?;
+            if let Some(conn) = task.conn.filter(|_| !lost) {
+                self.conn.add(name, conn);
+            }
         }
         for handle in anon_pending.drain(..) {
-            handle
+            let outcome = handle
                 .await
-                .expect("Background task panicked or was aborted")?;
+                .expect("Background task panicked or was aborted");
+            report_outcome(report, outcome)?;
         }
         Ok(())
     }
@@ -2001,27 +2013,46 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
     where
         D: Send + 'static,
     {
+        self.run_multi_records_reporting(records, |outcome| match outcome.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        })
+        .await
+    }
+
+    /// Runs multiple records like [`Runner::run_multi_records`], handing `report` the outcome
+    /// of every statement, query and system command that runs, in the order they finish. A
+    /// record that fails its expectation stops the run only when `report` returns an error:
+    /// otherwise the run goes on, as it does for the records that follow a failed one in an
+    /// update of the test files. A `let` that fails always stops the run, since the records
+    /// that follow it use its variables.
+    pub async fn run_multi_records_reporting(
+        &mut self,
+        records: impl IntoIterator<Item = Record<D::ColumnType>>,
+        mut report: impl FnMut(RecordOutcome<D::ColumnType>) -> Result<(), TestError>,
+    ) -> Result<(), TestError>
+    where
+        D: Send + 'static,
+    {
+        let report = &mut report;
         let mut semaphore: Arc<tokio::sync::Semaphore> = Arc::new(tokio::sync::Semaphore::new(
             self.check_options.max_async_connections,
         ));
 
         // exec_async named tasks in-flight, keyed by connection name.
-        let mut pending: HashMap<
-            ConnectionName,
-            tokio::task::JoinHandle<Result<ConnectionTask<D>, TestError>>,
-        > = HashMap::new();
+        let mut pending: HashMap<ConnectionName, NamedTask<D>> = HashMap::new();
 
         // exec_async anonymous tasks in-flight (System or connectionless records).
-        let mut anon_pending: Vec<tokio::task::JoinHandle<Result<(), TestError>>> = Vec::new();
+        let mut anon_pending: Vec<AnonymousTask<D::ColumnType>> = Vec::new();
 
-        for record in records.into_iter() {
+        for (index, record) in records.into_iter().enumerate() {
             if let Record::Halt { .. } = record {
                 break;
             }
 
             // Wait drains all in-flight tasks before continuing.
             if let Record::Wait { .. } = record {
-                self.drain_all_pending(&mut pending, &mut anon_pending)
+                self.drain_all_pending(&mut pending, &mut anon_pending, report)
                     .await?;
                 continue;
             }
@@ -2065,13 +2096,14 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                         loc,
                                         sql,
                                         retry,
+                                        report,
                                     )
                                     .await?;
                                 let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
                                     let _permit = permit;
-                                    task.run_record(record).await?;
-                                    Ok(task)
+                                    let (output, verdict) = task.run_record(record).await;
+                                    (task, RecordOutcome::new(index, output, verdict))
                                 });
                                 pending.insert(conn_name, handle);
                             }
@@ -2096,7 +2128,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                 let permit = acquire_permit(&semaphore).await;
                                 let handle = tokio::spawn(async move {
                                     let _permit = permit;
-                                    task.run_record(record).await.map(|_| ())
+                                    let (output, verdict) = task.run_record(record).await;
+                                    RecordOutcome::new(index, output, verdict)
                                 });
                                 anon_pending.push(handle);
                             }
@@ -2106,7 +2139,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                             Some(rc) => resolve_retry(rc, &self.vars, loc)?,
                             None => (1, Duration::ZERO),
                         };
-                        let mut last_error = None;
+                        let mut last = None;
                         for attempt in 0..attempts {
                             let mut task = match self
                                 .get_or_resume_named_conn(
@@ -2115,6 +2148,7 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                     loc,
                                     sql,
                                     &None,
+                                    report,
                                 )
                                 .await
                             {
@@ -2131,43 +2165,35 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                                     _ => return Err(conn_err),
                                 },
                             };
-                            let result = task.run_record_async_no_retry(record.clone()).await;
+                            let (output, verdict) =
+                                task.run_record_async_no_retry(record.clone()).await;
                             self.vars = task.context.vars.clone();
                             self.check_options = task.context.check_options.clone();
-                            match result {
-                                Ok(_) => {
-                                    if let Some(conn) = task.conn {
-                                        self.conn.add(conn_name.clone(), conn);
-                                    }
-                                    last_error = None;
-                                    break;
-                                }
-                                Err(err) => {
-                                    if let Some(conn) = task.conn {
-                                        if is_connection_failure::<D>(&err) {
-                                            drop(conn);
-                                        } else {
-                                            self.conn.add(conn_name.clone(), conn);
-                                        }
-                                    }
-                                    if attempt + 1 < attempts {
-                                        tracing::warn!(
-                                            target: "sqllogictest::retry",
-                                            attempt = attempt + 1,
-                                            attempts,
-                                            backoff = ?backoff,
-                                            error = ?err,
-                                            "retrying"
-                                        );
-                                        D::sleep(backoff).await;
-                                    }
-                                    last_error = Some(err);
-                                }
+                            let lost = verdict
+                                .as_ref()
+                                .is_err_and(|err| is_connection_failure::<D>(err));
+                            if let Some(conn) = task.conn.filter(|_| !lost) {
+                                self.conn.add(conn_name.clone(), conn);
+                            }
+                            let passed = verdict.is_ok();
+                            if !passed && attempt + 1 < attempts {
+                                tracing::warn!(
+                                    target: "sqllogictest::retry",
+                                    attempt = attempt + 1,
+                                    attempts,
+                                    backoff = ?backoff,
+                                    error = ?verdict,
+                                    "retrying"
+                                );
+                                D::sleep(backoff).await;
+                            }
+                            last = Some((output, verdict));
+                            if passed {
+                                break;
                             }
                         }
-                        if let Some(err) = last_error {
-                            return Err(err);
-                        }
+                        let (output, verdict) = last.expect("a record runs at least once");
+                        report_outcome(report, RecordOutcome::new(index, output, verdict))?;
                     }
                 }
 
@@ -2181,9 +2207,16 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                 } => {
                     let conn_name = connection.clone();
                     let mut task = self
-                        .get_or_resume_named_conn(conn_name.clone(), &mut pending, loc, sql, &None)
+                        .get_or_resume_named_conn(
+                            conn_name.clone(),
+                            &mut pending,
+                            loc,
+                            sql,
+                            &None,
+                            report,
+                        )
                         .await?;
-                    task.run_record(record).await?;
+                    task.run_record(record).await.1?;
                     self.vars = task.context.vars.clone();
                     self.check_options = task.context.check_options.clone();
                     self.conn.add(conn_name, task.conn.unwrap());
@@ -2204,11 +2237,13 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
                         let permit = acquire_permit(&semaphore).await;
                         let handle = tokio::spawn(async move {
                             let _permit = permit;
-                            task.run_record(record).await.map(|_| ())
+                            let (output, verdict) = task.run_record(record).await;
+                            RecordOutcome::new(index, output, verdict)
                         });
                         anon_pending.push(handle);
                     } else {
-                        task.run_record(record).await?;
+                        let (output, verdict) = task.run_record(record).await;
+                        report_outcome(report, RecordOutcome::new(index, output, verdict))?;
                         self.vars = task.context.vars;
                         let old_limit = self.check_options.max_async_connections;
                         self.check_options = task.context.check_options;
@@ -2225,9 +2260,8 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
             }
         }
 
-        self.drain_all_pending(&mut pending, &mut anon_pending)
-            .await?;
-        Ok(())
+        self.drain_all_pending(&mut pending, &mut anon_pending, report)
+            .await
     }
 
     /// Run multiple records.
@@ -2335,8 +2369,9 @@ pub enum UpdateMode {
     SkipFailed { label: String, reason: String },
 }
 
-/// Updates the specified [`Record`] with the [`QueryOutput`] produced
-/// by a Database, returning `Some(new_record)`.
+/// Updates the specified [`Record`] with the [`RecordOutput`] produced
+/// by a Database, returning `Some(new_record)`, for [`UpdateMode::Override`] and
+/// [`UpdateMode::OverrideWithFormat`].
 ///
 /// If an update is not supported or not necessary, returns `None`
 pub fn update_record_with_output<T: ColumnType>(
@@ -2349,10 +2384,6 @@ pub fn update_record_with_output<T: ColumnType>(
     update_mode: &UpdateMode,
 ) -> Option<Record<T>> {
     let force_override = matches!(update_mode, UpdateMode::OverrideWithFormat);
-    let skip_failed = match update_mode {
-        UpdateMode::SkipFailed { label, reason } => Some((label.as_str(), reason.as_str())),
-        _ => None,
-    };
     match (record.clone(), record_output) {
         (_, RecordOutput::Nothing) => None,
         // statement, query
@@ -2440,88 +2471,42 @@ pub fn update_record_with_output<T: ColumnType>(
             RecordOutput::Statement { count, error },
         ) => match (error, expected) {
             // Ok
-            (None, expected) => {
-                // If we expected an error but got success, add skipif in skip_failed mode
-                if matches!(expected, StatementExpect::Error(_)) {
-                    if let Some((label, reason)) = skip_failed {
-                        let mut new_conditions = conditions.clone();
-                        new_conditions.insert(
-                            0,
-                            Condition::SkipIf {
-                                label: label.to_string(),
-                                comments: vec![format!("# {}", reason)],
-                            },
-                        );
-                        return Some(Record::Statement {
-                            sql,
-                            expected,
-                            loc,
-                            conditions: new_conditions,
-                            connection,
-                            retry,
-                            exec_async,
-                        });
-                    }
-                }
-                Some(Record::Statement {
-                    sql,
-                    loc,
-                    conditions,
-                    connection,
-                    expected: match expected {
-                        StatementExpect::Count(_) => StatementExpect::Count(*count),
-                        StatementExpect::Error(_) | StatementExpect::Ok => StatementExpect::Ok,
-                    },
-                    retry,
-                    exec_async,
-                })
-            }
+            (None, expected) => Some(Record::Statement {
+                sql,
+                loc,
+                conditions,
+                connection,
+                expected: match expected {
+                    StatementExpect::Count(_) => StatementExpect::Count(*count),
+                    StatementExpect::Error(_) | StatementExpect::Ok => StatementExpect::Ok,
+                },
+                retry,
+                exec_async,
+            }),
             // Error match
             (Some(e), StatementExpect::Error(expected_error))
                 if expected_error.is_match(&e.to_string(), None) =>
             {
                 None
             }
-            // Error mismatch, update expected error or prepend skipif
+            // Error mismatch, update expected error
             (Some(e), r) => {
-                if let Some((label, reason)) = skip_failed {
-                    // Prepend skipif directive
-                    let mut new_conditions = conditions.clone();
-                    new_conditions.insert(
-                        0,
-                        Condition::SkipIf {
-                            label: label.to_string(),
-                            comments: vec![format!("# {}", reason)],
-                        },
-                    );
-                    Some(Record::Statement {
-                        sql,
-                        expected: r,
-                        loc,
-                        conditions: new_conditions,
-                        connection,
-                        retry,
-                        exec_async,
-                    })
-                } else {
-                    // Original behavior: update expected error
-                    let reference = match &r {
-                        StatementExpect::Error(e) => Some(e),
-                        StatementExpect::Count(_) | StatementExpect::Ok => None,
-                    };
-                    Some(Record::Statement {
-                        sql,
-                        expected: StatementExpect::Error(ExpectedError::from_actual_error(
-                            reference,
-                            &e.to_string(),
-                        )),
-                        loc,
-                        conditions,
-                        connection,
-                        retry,
-                        exec_async,
-                    })
-                }
+                let reference = match &r {
+                    StatementExpect::Error(e) => Some(e),
+                    StatementExpect::Count(_) | StatementExpect::Ok => None,
+                };
+                Some(Record::Statement {
+                    sql,
+                    expected: StatementExpect::Error(ExpectedError::from_actual_error(
+                        reference,
+                        &e.to_string(),
+                    )),
+                    loc,
+                    conditions,
+                    connection,
+                    retry,
+                    exec_async,
+                })
             }
         },
         // query, query
@@ -2545,44 +2530,22 @@ pub fn update_record_with_output<T: ColumnType>(
             }
             // Error mismatch
             (Some(e), r) => {
-                if let Some((label, reason)) = skip_failed {
-                    // Prepend skipif directive
-                    let mut new_conditions = conditions.clone();
-                    new_conditions.insert(
-                        0,
-                        Condition::SkipIf {
-                            label: label.to_string(),
-                            comments: vec![format!("# {}", reason)],
-                        },
-                    );
-                    Some(Record::Query {
-                        sql,
-                        expected: r,
-                        loc,
-                        conditions: new_conditions,
-                        connection,
-                        retry,
-                        exec_async,
-                    })
-                } else {
-                    // Original behavior: update expected error
-                    let reference = match &r {
-                        QueryExpect::Error(e) => Some(e),
-                        QueryExpect::Results { .. } => None,
-                    };
-                    Some(Record::Query {
-                        sql,
-                        expected: QueryExpect::Error(ExpectedError::from_actual_error(
-                            reference,
-                            &e.to_string(),
-                        )),
-                        loc,
-                        conditions,
-                        connection,
-                        retry,
-                        exec_async,
-                    })
-                }
+                let reference = match &r {
+                    QueryExpect::Error(e) => Some(e),
+                    QueryExpect::Results { .. } => None,
+                };
+                Some(Record::Query {
+                    sql,
+                    expected: QueryExpect::Error(ExpectedError::from_actual_error(
+                        reference,
+                        &e.to_string(),
+                    )),
+                    loc,
+                    conditions,
+                    connection,
+                    retry,
+                    exec_async,
+                })
             }
             (None, expected) => {
                 let (results_match, types_match) = match &expected {
@@ -2597,30 +2560,6 @@ pub fn update_record_with_output<T: ColumnType>(
                     ),
                 };
 
-                // If there's a mismatch and skip_failed mode is enabled, add skipif
-                if !results_match || !types_match {
-                    if let Some((label, reason)) = skip_failed {
-                        let mut new_conditions = conditions.clone();
-                        new_conditions.insert(
-                            0,
-                            Condition::SkipIf {
-                                label: label.to_string(),
-                                comments: vec![format!("# {}", reason)],
-                            },
-                        );
-                        return Some(Record::Query {
-                            sql,
-                            expected,
-                            loc,
-                            conditions: new_conditions,
-                            connection,
-                            retry,
-                            exec_async,
-                        });
-                    }
-                }
-
-                // Otherwise, update results normally
                 let results = match &expected {
                     // If validation succeeds and formatting normalization is not forced, preserve
                     // original.

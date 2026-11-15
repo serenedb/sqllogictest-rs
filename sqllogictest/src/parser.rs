@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::iter::Peekable;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1135,7 +1136,7 @@ impl ParseErrorKind {
 
 /// Parse a sqllogictest script into a list of records.
 pub fn parse<T: ColumnType>(script: &str) -> Result<Vec<Record<T>>, ParseError> {
-    parse_inner(&Location::new("<unknown>", 0), script)
+    parse_with_name(script, "<unknown>")
 }
 
 /// Parse a sqllogictest script into a list of records with a given script name.
@@ -1143,31 +1144,59 @@ pub fn parse_with_name<T: ColumnType>(
     script: &str,
     name: impl Into<Arc<str>>,
 ) -> Result<Vec<Record<T>>, ParseError> {
+    Ok(parse_with_spans(script, name)?
+        .into_iter()
+        .map(|(record, _)| record)
+        .collect())
+}
+
+/// A record and the lines of its script it was parsed from: 0-based, the end exclusive, the
+/// empty lines that end the record included.
+pub type SpannedRecord<T> = (Record<T>, Range<usize>);
+
+/// Parses a script like [`parse_with_name`], pairing every record with the lines it was parsed
+/// from. An `include` is not expanded.
+pub fn parse_with_spans<T: ColumnType>(
+    script: &str,
+    name: impl Into<Arc<str>>,
+) -> Result<Vec<SpannedRecord<T>>, ParseError> {
     parse_inner(&Location::new(name, 0), script)
 }
 
 #[allow(clippy::collapsible_match)]
-fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record<T>>, ParseError> {
+fn parse_inner<T: ColumnType>(
+    loc: &Location,
+    script: &str,
+) -> Result<Vec<SpannedRecord<T>>, ParseError> {
     let mut lines = script.lines().enumerate().peekable();
     let mut records = vec![];
+    let mut spans = vec![];
+    let mut first_line = 0;
     let mut conditions = vec![];
     let mut connection = Connection::Default;
     let mut comments = vec![];
 
     while let Some((num, line)) = lines.next() {
+        spans.resize(records.len(), first_line..num);
         if let Some(text) = line.strip_prefix('#') {
+            if comments.is_empty() {
+                first_line = num;
+            }
             comments.push(text.to_string());
             if lines.peek().is_none() {
                 // Special handling for the case where the last line is a comment.
                 records.push(Record::Comment(comments));
+                spans.push(first_line..num + 1);
                 break;
             }
             continue;
         }
         if !comments.is_empty() {
             records.push(Record::Comment(comments));
+            spans.push(first_line..num);
             comments = vec![];
         }
+        first_line = num;
 
         if line.is_empty() {
             records.push(Record::Newline);
@@ -1545,7 +1574,8 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
             _ => return Err(ParseErrorKind::InvalidLine(line.into()).at(loc)),
         }
     }
-    Ok(records)
+    spans.resize(records.len(), first_line..script.lines().count());
+    Ok(records.into_iter().zip(spans).collect())
 }
 
 /// Parse a sqllogictest file. The included scripts are inserted after the `include` record.
@@ -1561,7 +1591,7 @@ fn parse_file_inner<T: ColumnType>(loc: Location) -> Result<Vec<Record<T>>, Pars
     }
     let script = std::fs::read_to_string(path).unwrap();
     let mut records = vec![];
-    for rec in parse_inner(&loc, &script)? {
+    for (rec, _) in parse_inner(&loc, &script)? {
         records.push(rec.clone());
 
         if let Record::Include { filename, loc } = rec {
@@ -1881,6 +1911,52 @@ select * from foo;
                 retry: None,
                 exec_async: false,
             }]
+        );
+    }
+
+    #[test]
+    fn test_parse_with_spans() {
+        let script = "\
+# a comment
+# on two lines
+connection default
+statement ok
+SELECT 1
+
+
+query rowsort
+SELECT 2
+----
+?column?
+2
+
+\x20\x20
+statement error
+SELECT 3
+----
+db error: ERROR: first line
+
+second line
+
+
+# the last line";
+        let spans = parse_with_spans::<DefaultColumnType>(script, "test")
+            .unwrap()
+            .into_iter()
+            .map(|(record, span)| (record.to_string().lines().next().map(str::to_owned), span))
+            .collect::<Vec<_>>();
+        let line = |text: &str| Some(text.to_owned());
+        assert_eq!(
+            spans,
+            vec![
+                (line("# a comment"), 0..2),
+                (line("connection default"), 2..3),
+                (line("statement ok"), 3..6),
+                (None, 6..7),
+                (line("query rowsort"), 7..13),
+                (line("statement error"), 14..22),
+                (line("# the last line"), 22..23),
+            ]
         );
     }
 

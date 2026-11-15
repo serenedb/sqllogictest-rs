@@ -36,7 +36,8 @@ You can use it as follows:
 ```sh
 # run scripts in `test` directory against postgres with default connection settings
 sqllogictest './test/**/*.slt'
-# run the tests, and update the test files with the actual output!
+# run the tests, and rewrite the records whose output differs from their expectation with the
+# actual output: every other line of the files keeps its text
 sqllogictest './test/**/*.slt' --override
 ```
 

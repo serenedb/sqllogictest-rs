@@ -1,8 +1,9 @@
 mod engines;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, stdout, Read, Seek, SeekFrom, Stdout, Write};
+use std::io::{self, stdout, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +14,6 @@ use clap::{Arg, ArgAction, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use console::style;
 use engines::{EngineConfig, EngineType};
 use fancy_regex::Regex;
-use fs_err::{File, OpenOptions};
 use futures::StreamExt;
 use itertools::Itertools;
 use quick_junit::{NonSuccessKind, Report, TestCase, TestCaseStatus, TestSuite};
@@ -115,7 +115,8 @@ struct Opt {
     #[clap(long)]
     options: Option<String>,
 
-    /// Overrides the test files with the actual output of the database.
+    /// Runs the test files and rewrites the records whose output differs from their
+    /// expectation with the actual output of the database; every other line keeps its text.
     #[clap(long, conflicts_with_all = ["force_override", "format", "skip_failed"])]
     r#override: bool,
     /// Overrides the test files with the actual output of the database,
@@ -1261,36 +1262,6 @@ async fn run_serial(
     }
 }
 
-/// Owns a unique scratch directory under [`std::env::temp_dir`] used to stage
-/// override output. `Drop` removes it; if the process is killed by a signal the
-/// directory is left behind for inspection.
-struct TempDirGuard {
-    path: PathBuf,
-}
-
-impl TempDirGuard {
-    /// Creates a fresh `<tmp>/sqllogictest-<suffix>` directory.
-    fn new() -> io::Result<Self> {
-        let suffix = rand::distributions::Alphanumeric
-            .sample_string(&mut rand::thread_rng(), 8)
-            .to_lowercase();
-        let path = std::env::temp_dir().join(format!("sqllogictest-{suffix}"));
-        fs_err::create_dir_all(&path)?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        // Best-effort cleanup; nothing useful to do on failure.
-        let _ = fs_err::remove_dir_all(&self.path);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn update_test_files(
     files: Vec<PathBuf>,
@@ -1303,10 +1274,6 @@ async fn update_test_files(
     directives: Directives,
     show_discovered_tests: bool,
 ) -> Result<()> {
-    let temp_dir = TempDirGuard::new().context("failed to create temp directory for overrides")?;
-
-    eprintln!("staging override output in {}", temp_dir.path().display());
-
     let mut db = engines::connect(
         engine,
         &config,
@@ -1342,7 +1309,6 @@ async fn update_test_files(
     }
 
     let failed_dbs: Arc<Mutex<HashSet<String>>> = Arc::default();
-    let temp_dir_path: &Path = temp_dir.path();
 
     let mut stream = futures::stream::iter(test_databases)
         .map(|(db_name, file)| {
@@ -1362,9 +1328,7 @@ async fn update_test_files(
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
 
                 let mut buffer = vec![];
-                if let Err(e) =
-                    update_test_file(&mut buffer, &mut runner, &file, update_mode, temp_dir_path)
-                        .await
+                if let Err(e) = update_test_file(&mut buffer, &mut runner, &file, update_mode).await
                 {
                     writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
                         .expect("cannot write to buffer");
@@ -1753,257 +1717,181 @@ fn finish_test_file<T: io::Write>(
     Ok::<_, anyhow::Error>(())
 }
 
-/// Leaves at most one of the newlines a rewritten file ends with: the last record is a
-/// statement or a query, or the original file ended with several.
-fn trim_trailing_newlines(outfile: &mut File) -> io::Result<()> {
-    const N: usize = 8;
-    let mut buf = [0u8; N];
-    loop {
-        let tail = outfile.metadata()?.len().min(N as u64) as usize;
-        if tail == 0 {
-            return Ok(());
+/// What an update does to a record of a test file.
+enum Edit<T: ColumnType> {
+    /// The record is written anew.
+    Replace(Box<Record<T>>),
+    /// The line goes right before the record, which keeps its text.
+    Prepend(String),
+}
+
+/// The line a statement, a query or a system command starts at.
+fn record_line<T: ColumnType>(record: &Record<T>) -> Option<u32> {
+    match record {
+        Record::Statement { loc, .. } | Record::Query { loc, .. } | Record::System { loc, .. } => {
+            Some(loc.line())
         }
-        outfile.seek(SeekFrom::End(-(tail as i64)))?;
-        outfile.read_exact(&mut buf[..tail])?;
-        let num_newlines = buf[..tail]
-            .iter()
-            .rev()
-            .take_while(|&&b| b == b'\n')
-            .count();
-        assert!(num_newlines > 0);
-        if num_newlines > 1 {
-            outfile.set_len(outfile.metadata()?.len() - num_newlines as u64 + 1)?;
-        }
-        if num_newlines <= 1 || num_newlines < tail {
-            return Ok(());
-        }
+        _ => None,
     }
 }
 
-/// Different from [`sqllogictest::update_test_file`], we re-implement it here to print some
-/// progress information.
+/// The test file `text` with each record `edits` names by its line edited, keeping the
+/// empty lines after a replaced record, as many as its new text needs at least. With `reformat`
+/// every record is written anew; otherwise the rest keeps its text.
+fn rewrite<T: ColumnType>(
+    text: &str,
+    name: &str,
+    edits: &HashMap<u32, Edit<T>>,
+    reformat: bool,
+) -> Result<String> {
+    let records =
+        sqllogictest::parse_with_spans::<T>(text, name).map_err(|e| anyhow!("{:?}", e))?;
+    let lines = text.split_inclusive('\n').collect_vec();
+    let mut out = String::with_capacity(text.len());
+    let mut written = 0;
+    let mut records = records.into_iter().peekable();
+    while let Some((record, span)) = records.next() {
+        let edit = record_line(&record).and_then(|line| edits.get(&line));
+        if reformat {
+            match edit {
+                Some(Edit::Replace(new)) => writeln!(out, "{new}")?,
+                _ => writeln!(out, "{record}")?,
+            }
+            continue;
+        }
+        let Some(edit) = edit else {
+            continue;
+        };
+        out.extend(lines[written..span.start].iter().copied());
+        written = span.start;
+        match edit {
+            Edit::Prepend(line) => writeln!(out, "{line}")?,
+            Edit::Replace(new) => {
+                let mut empty = lines[span.clone()]
+                    .iter()
+                    .rev()
+                    .take_while(|line| matches!(**line, "\n" | "\r\n"))
+                    .count();
+                let mut end = span.end;
+                while let Some((Record::Newline, next)) = records.peek() {
+                    empty += 1;
+                    end = next.end;
+                    records.next();
+                }
+                let new = new.to_string();
+                let body = new.trim_end_matches('\n');
+                writeln!(out, "{body}")?;
+                if end < lines.len() {
+                    out.push_str(&"\n".repeat(empty.max(new.len() - body.len())));
+                }
+                written = end;
+            }
+        }
+    }
+    if reformat {
+        out.truncate(out.trim_end_matches('\n').len());
+        if !out.is_empty() {
+            out.push('\n');
+        }
+    } else {
+        out.extend(lines[written..].iter().copied());
+    }
+    Ok(out)
+}
+
+/// Runs a test file the way a test run does, then rewrites, in it and in the files it
+/// includes, the statements, queries and system commands whose outcome fails their
+/// expectation, as `update_mode` says; the modes that reformat write every record anew.
 async fn update_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
     update_mode: &UpdateMode,
-    temp_dir: &Path,
-) -> Result<()> {
+) -> Result<()>
+where
+    M::Conn: Send + 'static,
+{
     let filename = filename.as_ref();
+    let name = filename.to_string_lossy().into_owned();
     let records = tokio::task::block_in_place(|| {
         sqllogictest::parse_file(filename).map_err(|e| anyhow!("{:?}", e))
     })
     .context("failed to parse sqllogictest file")?;
 
-    let mut begin_times = vec![];
-    let mut did_pop = false;
-
-    write!(out, "{: <60} .. ", filename.to_string_lossy())?;
+    write!(out, "{name: <60} .. ")?;
     flush(out).await?;
+    let mut begin_times = vec![Instant::now()];
 
-    begin_times.push(Instant::now());
-
-    /// Mirrors the source path's structure inside `temp_dir` and opens the
-    /// staging file in read+write mode. Absolute paths under the CWD are made
-    /// relative first so the temp tree stays shallow; root and `..` components
-    /// are sanitized so the output path can never escape `temp_dir`.
-    fn create_outfile(source: impl AsRef<Path>, temp_dir: &Path) -> io::Result<(PathBuf, File)> {
-        use std::path::Component;
-
-        let source = source.as_ref();
-        let cwd = std::env::current_dir().ok();
-        let relative = cwd
-            .as_deref()
-            .and_then(|cwd| source.strip_prefix(cwd).ok())
-            .unwrap_or(source);
-
-        let mut staged = temp_dir.to_path_buf();
-        for comp in relative.components() {
-            match comp {
-                Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
-                Component::ParentDir => staged.push("__up__"),
-                Component::Normal(s) => staged.push(s),
-            }
-        }
-        if let Some(parent) = staged.parent() {
-            fs_err::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&staged)?;
-        Ok((staged, file))
-    }
-
-    fn override_with_outfile(
-        filename: &String,
-        outfilename: &PathBuf,
-        outfile: &mut File,
-    ) -> io::Result<()> {
-        trim_trailing_newlines(outfile)?;
-
-        let replace_via_copy = || -> io::Result<()> {
-            fs_err::copy(outfilename, filename)?;
-            fs_err::remove_file(outfilename)?;
-            Ok(())
-        };
-
-        // For symlinks, copy through the link instead of replacing it.
-        // For regular files, prefer atomic rename; fall back to copy when the
-        // staged file lives on a different filesystem (e.g. /tmp on tmpfs).
-        let is_symlink = fs_err::symlink_metadata(filename)?.is_symlink();
-        if is_symlink || fs_err::rename(outfilename, filename).is_err() {
-            replace_via_copy()?;
-        }
-
-        Ok(())
-    }
-
-    struct Item {
-        filename: String,
-        outfilename: PathBuf,
-        outfile: File,
-        halt: bool,
-    }
-    let (outfilename, outfile) = create_outfile(filename, temp_dir)?;
-    let mut stack = vec![Item {
-        filename: filename.to_string_lossy().to_string(),
-        outfilename,
-        outfile,
-        halt: false,
-    }];
-
-    for record in records {
-        let Item {
-            filename,
-            outfilename,
-            outfile,
-            halt,
-        } = stack.last_mut().unwrap();
-
-        match &record {
-            Record::Injected(Injected::BeginInclude(filename)) => {
-                let (outfilename, outfile) = create_outfile(filename, temp_dir)?;
-                stack.push(Item {
-                    filename: filename.clone(),
-                    outfilename,
-                    outfile,
-                    halt: false,
-                });
-
-                begin_times.push(Instant::now());
-                if !did_pop {
-                    writeln!(out, "{}", style("[BEGIN]").blue().bold())?;
-                } else {
-                    writeln!(out)?;
-                }
-                did_pop = false;
-                write!(
-                    out,
-                    "{}{: <60} .. ",
-                    "| ".repeat(begin_times.len() - 1),
-                    filename
-                )?;
-                flush(out).await?;
-            }
-            Record::Injected(Injected::EndInclude(file)) => {
-                override_with_outfile(filename, outfilename, outfile)?;
-                stack.pop();
-                finish_test_file(out, &mut begin_times, &mut did_pop, file)?;
-            }
-            _ => {
-                if *halt {
-                    writeln!(outfile, "{record}")?;
-                    continue;
-                }
-                if matches!(record, Record::Halt { .. }) {
-                    *halt = true;
-                    writeln!(outfile, "{record}")?;
-                    continue;
-                }
-                update_record(outfile, runner, record, update_mode)
-                    .await
-                    .context(format!("failed to run `{}`", style(filename).bold()))?;
-            }
-        }
-    }
-
-    finish_test_file(
-        out,
-        &mut begin_times,
-        &mut did_pop,
-        &filename.to_string_lossy(),
-    )?;
-
-    writeln!(out)?;
-
-    let Item {
-        filename,
-        outfilename,
-        outfile,
-        halt: _,
-    } = stack.last_mut().unwrap();
-    override_with_outfile(filename, outfilename, outfile)?;
-
-    Ok(())
-}
-
-async fn update_record<M: MakeConnection>(
-    outfile: &mut File,
-    runner: &mut Runner<M::Conn, M>,
-    record: Record<<M::Conn as AsyncDB>::ColumnType>,
-    update_mode: &UpdateMode,
-) -> Result<()> {
-    assert!(!matches!(record, Record::Injected(_)));
-
-    if *update_mode == UpdateMode::Format {
-        writeln!(outfile, "{record}")?;
-        return Ok(());
-    }
-
-    let record_output = runner.run_record(record.clone()).await;
-    match update_record_with_output(
-        &record,
-        &record_output,
-        "\t",
-        default_validator,
-        trim_normalizer,
-        default_column_validator,
+    let reformat = matches!(
         update_mode,
-    ) {
-        Some(new_record) => {
-            // Check if skipif was added (new conditions > old conditions)
-            let old_conditions_len = match &record {
-                Record::Statement { conditions, .. } => conditions.len(),
-                Record::Query { conditions, .. } => conditions.len(),
-                _ => 0,
-            };
-            let new_conditions = match &new_record {
-                Record::Statement { conditions, .. } => conditions,
-                Record::Query { conditions, .. } => conditions,
-                _ => &vec![],
-            };
-
-            // Write any new conditions that were added
-            if new_conditions.len() > old_conditions_len {
-                for condition in &new_conditions[..new_conditions.len() - old_conditions_len] {
-                    writeln!(
-                        outfile,
-                        "{}",
-                        Record::<<M::Conn as AsyncDB>::ColumnType>::Condition(condition.clone())
-                    )?;
+        UpdateMode::Format | UpdateMode::OverrideWithFormat
+    );
+    let mut outcomes = HashMap::new();
+    if *update_mode != UpdateMode::Format {
+        runner
+            .run_multi_records_reporting(records.clone(), |outcome| {
+                if reformat || outcome.error.is_some() {
+                    outcomes.insert(outcome.index, outcome);
                 }
-            }
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
+            .context(format!("failed to run `{}`", style(&name).bold()))?;
+    }
 
-            writeln!(outfile, "{new_record}")?;
+    let mut files = vec![name.clone()];
+    let mut edits: HashMap<String, HashMap<u32, Edit<_>>> = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Record::Injected(Injected::BeginInclude(file)) = record {
+            files.push(file.clone());
         }
-        None => {
-            writeln!(outfile, "{record}")?;
+        let (
+            Some(outcome),
+            Record::Statement { loc, .. } | Record::Query { loc, .. } | Record::System { loc, .. },
+        ) = (outcomes.remove(&index), record)
+        else {
+            continue;
+        };
+        let edit = match update_mode {
+            UpdateMode::SkipFailed { label, reason } => {
+                Some(Edit::Prepend(format!("skipif {label} # {reason}")))
+            }
+            _ => update_record_with_output(
+                record,
+                &outcome.output,
+                "\t",
+                default_validator,
+                trim_normalizer,
+                default_column_validator,
+                update_mode,
+            )
+            .filter(|new| reformat || new != record)
+            .map(|new| Edit::Replace(Box::new(new))),
+        };
+        if let Some(edit) = edit {
+            edits
+                .entry(loc.file().to_owned())
+                .or_default()
+                .insert(loc.line(), edit);
         }
     }
 
+    for file in files.into_iter().unique() {
+        let edits = edits.remove(&file).unwrap_or_default();
+        if !reformat && edits.is_empty() {
+            continue;
+        }
+        let text = fs_err::read_to_string(&file)?;
+        let rewritten = rewrite(&text, &file, &edits, reformat)
+            .with_context(|| format!("failed to rewrite `{file}`"))?;
+        if rewritten != text {
+            fs_err::write(&file, rewritten)?;
+        }
+    }
+
+    finish_test_file(out, &mut begin_times, &mut false, &name)?;
+    writeln!(out)?;
     Ok(())
 }
 
@@ -2017,28 +1905,326 @@ impl<T: AsRef<str>> T {
 
 #[cfg(test)]
 mod tests {
+    use sqllogictest::{DBOutput, DefaultColumnType};
+
     use super::*;
 
-    fn trimmed(content: &[u8]) -> Vec<u8> {
+    /// Answers `select <value>` with the column `v` holding `value`, and `fail <message>` with
+    /// that error.
+    struct FakeDB;
+
+    #[derive(Debug)]
+    struct FakeDBError(String);
+
+    impl std::fmt::Display for FakeDBError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for FakeDBError {}
+
+    impl sqllogictest::DB for FakeDB {
+        type Error = FakeDBError;
+        type ColumnType = DefaultColumnType;
+
+        fn run(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, FakeDBError> {
+            if let Some(message) = sql.strip_prefix("fail ") {
+                return Err(FakeDBError(message.to_string()));
+            }
+            let value = sql.strip_prefix("select ").unwrap();
+            Ok(DBOutput::Rows {
+                types: vec![DefaultColumnType::Any],
+                rows: vec![vec!["v".to_string()], vec![value.to_string()]],
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_test_file_rewrites_the_failed_records_of_a_file_and_its_includes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("out.slt");
-        std::fs::write(&path, content).unwrap();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
+        let main = dir.path().join("main.slt");
+        let included = dir.path().join("included.slt");
+        fs_err::write(
+            &main,
+            "\
+statement ok
+select ok
+
+include included.slt
+
+query II
+select a.parquet
+----
+v
+old
+
+
+statement ok
+fail now
+",
+        )
+        .unwrap();
+        fs_err::write(
+            &included,
+            "\
+query  rowsort
+select 1
+----
+v
+1
+
+query
+select 2
+----
+v
+3
+",
+        )
+        .unwrap();
+        let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
+        update_test_file(&mut vec![], &mut runner, &main, &UpdateMode::Override)
+            .await
             .unwrap();
-        trim_trailing_newlines(&mut file).unwrap();
-        std::fs::read(&path).unwrap()
+        assert_eq!(
+            fs_err::read_to_string(&main).unwrap(),
+            "\
+statement ok
+select ok
+
+include included.slt
+
+query II
+select a.parquet
+----
+v
+a.parquet
+
+
+statement error now
+fail now
+"
+        );
+        assert_eq!(
+            fs_err::read_to_string(&included).unwrap(),
+            "\
+query  rowsort
+select 1
+----
+v
+1
+
+query
+select 2
+----
+v
+2
+"
+        );
+    }
+
+    fn replace(line: u32, record: &str) -> (u32, Edit<DefaultColumnType>) {
+        let mut records = sqllogictest::parse(record).unwrap();
+        (line, Edit::Replace(Box::new(records.remove(0))))
+    }
+
+    fn rewritten(
+        text: &str,
+        edits: impl IntoIterator<Item = (u32, Edit<DefaultColumnType>)>,
+    ) -> String {
+        rewrite(text, "test.slt", &edits.into_iter().collect(), false).unwrap()
+    }
+
+    const FILE: &str = "\
+# a comment  with  spaces\x20\x20\n\
+connection default\n\
+statement ok\n\
+CREATE TABLE t (a INT)\n\
+\n\
+\n\
+query ok retry 3 backoff 1500ms\n\
+SELECT   a\n\
+FROM t\n\
+----\n\
+a\n\
+1\n\
+\n\
+\x20\x20\x20\n\
+statement error\n\
+SELECT 1/0\n\
+----\n\
+db error: ERROR: old\n\
+\n\
+\n\
+statement ok\n\
+DROP TABLE t\n";
+
+    #[test]
+    fn rewrite_keeps_every_record_it_does_not_edit() {
+        assert_eq!(rewritten(FILE, []), FILE);
+        assert_eq!(
+            rewritten(
+                FILE,
+                [replace(
+                    15,
+                    "statement error\nSELECT 1/0\n----\ndb error: ERROR: new\n"
+                )]
+            ),
+            FILE.replace("ERROR: old", "ERROR: new")
+        );
     }
 
     #[test]
-    fn trim_trailing_newlines_keeps_one() {
-        assert_eq!(trimmed(b""), b"");
-        assert_eq!(trimmed(b"\n"), b"\n");
-        assert_eq!(trimmed(b"\n\n\n"), b"\n");
-        assert_eq!(trimmed(b"a\n"), b"a\n");
-        assert_eq!(trimmed(b"query\n----\n1\n\n\n"), b"query\n----\n1\n");
-        assert_eq!(trimmed(&[b"x".as_slice(), &[b'\n'; 20]].concat()), b"x\n");
+    fn rewrite_keeps_the_empty_lines_after_a_record() {
+        let error = "statement error\nCREATE TABLE t (a INT)\n----\ndb error: ERROR: exists\n";
+        assert_eq!(
+            rewritten(FILE, [replace(3, error)]),
+            FILE.replace(
+                "statement ok\nCREATE TABLE t (a INT)\n",
+                "statement error\nCREATE TABLE t (a INT)\n----\ndb error: ERROR: exists\n"
+            )
+        );
+        assert_eq!(
+            rewritten(FILE, [replace(15, "statement ok\nSELECT 1/0\n")]),
+            FILE.replace(
+                "statement error\nSELECT 1/0\n----\ndb error: ERROR: old\n",
+                "statement ok\nSELECT 1/0\n"
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_ends_an_error_block_with_two_empty_lines() {
+        assert_eq!(
+            rewritten(
+                "statement ok\nSELECT 1\n\nquery\nSELECT 2\n----\n?column?\n2\n",
+                [replace(1, "statement error\nSELECT 1\n----\ndb error: ERROR: no\n")]
+            ),
+            "statement error\nSELECT 1\n----\ndb error: ERROR: no\n\n\nquery\nSELECT 2\n----\n?column?\n2\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_ends_the_file_with_one_newline() {
+        assert_eq!(
+            rewritten(
+                "statement ok\nSELECT 1\n\nstatement ok\nSELECT 2\n\n\n",
+                [replace(
+                    4,
+                    "statement error\nSELECT 2\n----\ndb error: ERROR: no\n"
+                )]
+            ),
+            "statement ok\nSELECT 1\n\nstatement error\nSELECT 2\n----\ndb error: ERROR: no\n"
+        );
+        assert_eq!(
+            rewritten(
+                "statement ok\nSELECT 1",
+                [replace(1, "statement count 1\nSELECT 1\n")]
+            ),
+            "statement count 1\nSELECT 1\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_prepends_a_line_to_a_record() {
+        assert_eq!(
+            rewritten(
+                "onlyif serenedb\nconnection other\nstatement ok\nSELECT 1\n",
+                [(3, Edit::Prepend("skipif serenedb # reason".to_string()))]
+            ),
+            "onlyif serenedb\nconnection other\nskipif serenedb # reason\nstatement ok\nSELECT 1\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_reformats_every_record() {
+        let edits = [replace(
+            15,
+            "statement error\nSELECT 1/0\n----\ndb error: ERROR: new\n",
+        )];
+        assert_eq!(
+            rewrite(FILE, "test.slt", &edits.into_iter().collect(), true).unwrap(),
+            "\
+# a comment  with  spaces\n\
+connection default\n\
+statement ok\n\
+CREATE TABLE t (a INT)\n\
+\n\
+\n\
+query ?? retry 3 backoff 1s500ms\n\
+SELECT   a\n\
+FROM t\n\
+----\n\
+a\n\
+1\n\
+\n\
+statement error\n\
+SELECT 1/0\n\
+----\n\
+db error: ERROR: new\n\
+\n\
+\n\
+statement ok\n\
+DROP TABLE t\n"
+        );
+    }
+
+    async fn updated(text: &str, update_mode: UpdateMode) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("modes.slt");
+        fs_err::write(&file, text).unwrap();
+        let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
+        update_test_file(&mut vec![], &mut runner, &file, &update_mode)
+            .await
+            .unwrap();
+        fs_err::read_to_string(&file).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_test_file_puts_a_skipif_before_each_failed_record() {
+        let text =
+            "statement ok\nselect 1\n\nquery\nselect 2\n----\nv\n3\n\nstatement ok\nfail no\n";
+        let skip_failed = UpdateMode::SkipFailed {
+            label: "serenedb".to_string(),
+            reason: "not yet".to_string(),
+        };
+        assert_eq!(
+            updated(text, skip_failed).await,
+            text.replace("\nquery", "\nskipif serenedb # not yet\nquery")
+                .replace(
+                    "\nstatement ok\nfail",
+                    "\nskipif serenedb # not yet\nstatement ok\nfail"
+                )
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_test_file_writes_every_record_anew_in_the_modes_that_reformat() {
+        let text = "\
+query   II
+select 1
+----
+v
+1
+
+
+statement  error
+fail no
+----
+no
+
+
+\x20
+statement   ok
+select 2
+";
+        assert_eq!(
+            updated(text, UpdateMode::Format).await,
+            "query II\nselect 1\n----\nv\n1\n\n\nstatement error\nfail no\n----\nno\n\n\nstatement ok\nselect 2\n"
+        );
+        assert_eq!(
+            updated(text, UpdateMode::OverrideWithFormat).await,
+            "query II\nselect 1\n----\nv\n1\n\n\nstatement error\nfail no\n----\nno\n\n\nstatement ok\nselect 2\n"
+        );
     }
 }
