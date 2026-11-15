@@ -113,10 +113,16 @@ pub enum RetryBackoff {
 impl std::fmt::Display for RetryBackoff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RetryBackoff::Duration(d) => write!(f, "{}", humantime::format_duration(*d)),
+            RetryBackoff::Duration(d) => write!(f, "{}", format_duration(*d)),
             RetryBackoff::EnvVar(var) => write!(f, "{}", var),
         }
     }
+}
+
+/// Formats a duration as the single token the parser reads back: `1s500ms`, where
+/// [`humantime::format_duration`] writes `1s 500ms`.
+fn format_duration(d: Duration) -> String {
+    humantime::format_duration(d).to_string().replace(' ', "")
 }
 
 /// Configuration for retry behavior
@@ -419,7 +425,7 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 Ok(())
             }
             Record::Sleep { loc: _, duration } => {
-                write!(f, "sleep {}", humantime::format_duration(*duration))
+                write!(f, "sleep {}", format_duration(*duration))
             }
             Record::Print { loc: _, text } => {
                 write!(f, "print {text}")
@@ -457,6 +463,9 @@ impl<T: ColumnType> std::fmt::Display for Record<T> {
                 }
             },
             Record::Connection(conn) => {
+                if *conn == Connection::Default {
+                    return write!(f, "connection default");
+                }
                 if let Connection::Named {
                     name,
                     ssl_mode,
@@ -1891,6 +1900,26 @@ select * from foo;
         assert_eq!(*label, None);
         assert_eq!(retry.attempts, RetryAttempts::Count(3));
         assert_eq!(records[0].to_string(), script);
+    }
+
+    #[test]
+    fn test_connection_default_roundtrip() {
+        let script = "connection default\nstatement ok\nSELECT 1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        assert_eq!(records[0], Record::Connection(Connection::Default));
+        assert_eq!(records[0].to_string(), "connection default");
+    }
+
+    #[test]
+    fn test_duration_roundtrip() {
+        let script = "statement ok retry 3 backoff 1500ms\nSELECT 1\n\nsleep 2001ms\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        let unparsed = records.iter().map(|r| r.to_string()).join("\n");
+        assert_eq!(
+            unparsed,
+            "statement ok retry 3 backoff 1s500ms\nSELECT 1\n\nsleep 2s1ms"
+        );
+        assert_eq!(parse::<DefaultColumnType>(&unparsed).unwrap(), records);
     }
 
     #[test]
