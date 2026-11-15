@@ -1994,15 +1994,17 @@ select ok
 
 include included.slt
 
-query II
+query
 select a.parquet
 ----
 v
 a.parquet
 
 
-statement error now
+statement error
 fail now
+----
+now
 "
         );
         assert_eq!(
@@ -2224,7 +2226,7 @@ select 2
         );
         assert_eq!(
             updated(text, UpdateMode::OverrideWithFormat).await,
-            "query II\nselect 1\n----\nv\n1\n\n\nstatement error\nfail no\n----\nno\n\n\nstatement ok\nselect 2\n"
+            "query\nselect 1\n----\nv\n1\n\n\nstatement error\nfail no\n----\nno\n\n\nstatement ok\nselect 2\n"
         );
     }
 }

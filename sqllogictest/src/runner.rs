@@ -2373,6 +2373,9 @@ pub enum UpdateMode {
 /// by a Database, returning `Some(new_record)`, for [`UpdateMode::Override`] and
 /// [`UpdateMode::OverrideWithFormat`].
 ///
+/// A query's new header carries no type letters `column_type_validator` does not check, and
+/// a new error is expected under `----`, matched as exact text.
+///
 /// If an update is not supported or not necessary, returns `None`
 pub fn update_record_with_output<T: ColumnType>(
     record: &Record<T>,
@@ -2548,16 +2551,12 @@ pub fn update_record_with_output<T: ColumnType>(
                 })
             }
             (None, expected) => {
-                let (results_match, types_match) = match &expected {
-                    QueryExpect::Error(_) => (false, false), // Expected error but got success
+                let results_match = match &expected {
+                    QueryExpect::Error(_) => false, // Expected error but got success
                     QueryExpect::Results {
                         results: expected_results,
-                        types: expected_types,
                         ..
-                    } => (
-                        validator(normalizer, rows, expected_results),
-                        column_type_validator(types, expected_types),
-                    ),
+                    } => validator(normalizer, rows, expected_results),
                 };
 
                 let results = match &expected {
@@ -2598,39 +2597,30 @@ pub fn update_record_with_output<T: ColumnType>(
                     // Otherwise, regenerate with proper formatting.
                     _ => rows.iter().map(|cols| cols.join(col_separator)).collect(),
                 };
-                let types = match &expected {
-                    // If validation is successful, we respect the original file's expected types.
+                let (sort_mode, result_mode, label) = match expected {
                     QueryExpect::Results {
-                        types: expected_types,
+                        sort_mode,
+                        result_mode,
+                        label,
                         ..
-                    } if types_match => expected_types.clone(),
-                    _ => types.clone(),
+                    } => (sort_mode, result_mode, label),
+                    QueryExpect::Error(_) => (None, None, None),
                 };
                 Some(Record::Query {
                     sql,
                     loc,
                     conditions,
                     connection,
-                    expected: match expected {
-                        QueryExpect::Results {
-                            sort_mode,
-                            label,
-                            result_mode,
-                            ..
-                        } => QueryExpect::Results {
-                            results,
+                    expected: QueryExpect::Results {
+                        results,
+                        types: header_types(
                             types,
-                            sort_mode,
-                            result_mode,
-                            label,
-                        },
-                        QueryExpect::Error(_) => QueryExpect::Results {
-                            results,
-                            types,
-                            sort_mode: None,
-                            result_mode: None,
-                            label: None,
-                        },
+                            sort_mode.is_none() && label.is_some(),
+                            column_type_validator,
+                        ),
+                        sort_mode,
+                        result_mode,
+                        label,
                     },
                     retry,
                     exec_async,
@@ -2671,6 +2661,26 @@ pub fn update_record_with_output<T: ColumnType>(
         // No update possible, return the original record
         _ => None,
     }
+}
+
+/// The type letters of a query header written for columns of the `actual` types: those types
+/// when `column_type_validator` checks them, otherwise none, or one `?` per column before a
+/// label right after them, which the parser would read as the types.
+fn header_types<T: ColumnType>(
+    actual: &[T],
+    before_label: bool,
+    column_type_validator: ColumnTypeValidator<T>,
+) -> Vec<T> {
+    if !column_type_validator(&actual.to_vec(), &Vec::new()) {
+        return actual.to_vec();
+    }
+    if !before_label {
+        return Vec::new();
+    }
+    actual
+        .iter()
+        .map(|t| T::from_char('?').unwrap_or_else(|| t.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2838,8 +2848,10 @@ mod tests {
             record_output: query_output_error("MyAwesomeDB Error"),
 
             expected: Some(
-                "query error TestError: MyAwesomeDB Error\n\
-                 select * from foo;\n",
+                "query error\n\
+                 select * from foo;\n\
+                 ----\n\
+                 TestError: MyAwesomeDB Error",
             ),
         }
         .run()
@@ -2986,8 +2998,10 @@ Caused by:
 
             // expect the output includes foo
             expected: Some(
-                "statement error TestError: foo\n\
-                 insert into foo values(2);",
+                "statement error\n\
+                 insert into foo values(2);\n\
+                 ----\n\
+                 TestError: foo",
             ),
         }
         .run()
@@ -3029,8 +3043,10 @@ Caused by:
 
             // expect the output includes foo
             expected: Some(
-                "statement error TestError: foo\n\
-                 insert into foo values(2);",
+                "statement error\n\
+                 insert into foo values(2);\n\
+                 ----\n\
+                 TestError: foo",
             ),
         }
         .run()
@@ -3068,15 +3084,19 @@ Caused by:
                     inser into foo values(2);",
 
             // Model a run that produced an error message that contains regex special characters
-            record_output: statement_output_error("The operation (inser) is not supported. Did you mean [insert]?"),
+            record_output: statement_output_error(
+                "The operation (inser) is not supported. Did you mean [insert]?",
+            ),
 
             // expect the output includes foo
             expected: Some(
-                "statement error TestError: The operation \\(inser\\) is not supported\\. Did you mean \\[insert\\]\\?\n\
-                 inser into foo values(2);",
+                "statement error\n\
+                 inser into foo values(2);\n\
+                 ----\n\
+                 TestError: The operation (inser) is not supported. Did you mean [insert]?",
             ),
         }
-            .run()
+        .run()
     }
 
     #[test]
@@ -3105,15 +3125,19 @@ Caused by:
                     selec *;",
 
             // Model a run that produced an error message that contains regex special characters
-            record_output: query_output_error("The operation (selec) is not supported. Did you mean [select]?"),
+            record_output: query_output_error(
+                "The operation (selec) is not supported. Did you mean [select]?",
+            ),
 
             // expect the output includes foo
             expected: Some(
-                "query error TestError: The operation \\(selec\\) is not supported\\. Did you mean \\[select\\]\\?\n\
-                 selec *;",
+                "query error\n\
+                 selec *;\n\
+                 ----\n\
+                 TestError: The operation (selec) is not supported. Did you mean [select]?",
             ),
         }
-            .run()
+        .run()
     }
 
     #[test]
@@ -3134,6 +3158,118 @@ Caused by:
         .run()
     }
 
+    #[test]
+    fn test_query_error_to_results_without_unchecked_types() {
+        TestCase {
+            input: "query error MyAwesomeDB Error\n\
+                    select a, b from foo;",
+            record_output: query_output(
+                &[&["a", "b"], &["3", "4"]],
+                vec![DefaultColumnType::Integer, DefaultColumnType::Any],
+            ),
+            expected: Some(
+                "query\n\
+                 select a, b from foo;\n\
+                 ----\n\
+                 a b\n\
+                 3 4",
+            ),
+        }
+        .run_with(default_column_validator)
+    }
+
+    #[test]
+    fn test_query_error_to_results_with_checked_types() {
+        TestCase {
+            input: "query error\n\
+                    select a, b from foo;\n\
+                    ----\n\
+                    MyAwesomeDB Error",
+            record_output: query_output(
+                &[&["3", "4"]],
+                vec![DefaultColumnType::Integer, DefaultColumnType::Any],
+            ),
+            expected: Some(
+                "query I?\n\
+                 select a, b from foo;\n\
+                 ----\n\
+                 3 4",
+            ),
+        }
+        .run()
+    }
+
+    #[test]
+    fn test_query_replacement_without_unchecked_types() {
+        TestCase {
+            input: "query ok retry 3 backoff 1s\n\
+                    select a, b from foo;\n\
+                    ----\n\
+                    a b\n\
+                    1 2",
+            record_output: query_output(
+                &[&["a", "b"], &["3", "4"]],
+                vec![DefaultColumnType::Integer, DefaultColumnType::Integer],
+            ),
+            expected: Some(
+                "query retry 3 backoff 1s\n\
+                 select a, b from foo;\n\
+                 ----\n\
+                 a b\n\
+                 3 4",
+            ),
+        }
+        .run_with(default_column_validator)
+    }
+
+    #[test]
+    fn test_query_replacement_with_sort_mode_without_unchecked_types() {
+        TestCase {
+            input: "query ?? rowsort\n\
+                    insert into foo values (1, 2) returning a, b, c;\n\
+                    ----\n\
+                    a b\n\
+                    1 2",
+            record_output: query_output(
+                &[&["a", "b", "c"], &["1", "2", "3"]],
+                vec![
+                    DefaultColumnType::Integer,
+                    DefaultColumnType::Integer,
+                    DefaultColumnType::Integer,
+                ],
+            ),
+            expected: Some(
+                "query rowsort\n\
+                 insert into foo values (1, 2) returning a, b, c;\n\
+                 ----\n\
+                 a b c\n\
+                 1 2 3",
+            ),
+        }
+        .run_with(default_column_validator)
+    }
+
+    #[test]
+    fn test_query_replacement_with_label_has_a_type_per_column() {
+        TestCase {
+            input: "query I my_label\n\
+                    select a, b from foo;\n\
+                    ----\n\
+                    1",
+            record_output: query_output(
+                &[&["1", "2"]],
+                vec![DefaultColumnType::Integer, DefaultColumnType::Integer],
+            ),
+            expected: Some(
+                "query ?? my_label\n\
+                 select a, b from foo;\n\
+                 ----\n\
+                 1 2",
+            ),
+        }
+        .run_with(default_column_validator)
+    }
+
     #[derive(Debug)]
     struct TestCase<'a> {
         input: &'a str,
@@ -3144,6 +3280,11 @@ Caused by:
     impl TestCase<'_> {
         #[track_caller]
         fn run(self) {
+            self.run_with(strict_column_validator)
+        }
+
+        #[track_caller]
+        fn run_with(self, column_type_validator: ColumnTypeValidator<DefaultColumnType>) {
             let Self {
                 input,
                 record_output,
@@ -3161,7 +3302,7 @@ Caused by:
                 " ",
                 default_validator,
                 default_normalizer,
-                strict_column_validator,
+                column_type_validator,
                 &UpdateMode::Override,
             );
 

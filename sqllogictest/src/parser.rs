@@ -768,31 +768,20 @@ impl ExpectedError {
     /// Creates an expected error message from the actual error message. Used by the runner
     /// to update the test cases with `--override`.
     ///
-    /// A reference might be provided to help decide whether to use inline or multiline.
+    /// The message is expected under `----` and matched as exact text, also when the
+    /// reference is an inline regex: a reference under `----` keeps its `<slt:ignore>`
+    /// markers where they still fit, so only the fragments that diverge change.
     pub fn from_actual_error(reference: Option<&Self>, actual_err: &str) -> Self {
         let trimmed_err = actual_err.trim();
-        let err_is_multiline = trimmed_err.lines().next_tuple::<(_, _)>().is_some();
-
-        let multiline = match reference {
-            Some(Self::Multiline(_)) => true, // always multiline if the ref is multiline
-            _ => err_is_multiline,            // prefer inline as long as it fits
+        let body = match reference {
+            Some(Self::Multiline(ref_body)) if contains_ignore_marker(ref_body) => {
+                align_with_ignore_marker_checked(ref_body.trim(), trimmed_err)
+            }
+            _ => trimmed_err.to_string(),
         };
-
-        if multiline {
-            // If the reference is a Multiline using `<slt:ignore>`, preserve the markers and
-            // only substitute the fragments that diverge — same behavior as query results.
-            let body = match reference {
-                Some(Self::Multiline(ref_body)) if contains_ignore_marker(ref_body) => {
-                    align_with_ignore_marker_checked(ref_body.trim(), trimmed_err)
-                }
-                _ => trimmed_err.to_string(),
-            };
-            // Even if the actual error is empty, we still use `Multiline` to indicate that
-            // an exact empty error is expected, instead of any error by `Empty`.
-            Self::Multiline(body)
-        } else {
-            Self::new_inline(regex::escape(actual_err)).expect("escaped regex should be valid")
-        }
+        // Even if the actual error is empty, we still use `Multiline` to indicate that
+        // an exact empty error is expected, instead of any error by `Empty`.
+        Self::Multiline(body)
     }
 }
 
@@ -1996,6 +1985,26 @@ second line
             "statement ok retry 3 backoff 1s500ms\nSELECT 1\n\nsleep 2s1ms"
         );
         assert_eq!(parse::<DefaultColumnType>(&unparsed).unwrap(), records);
+    }
+
+    #[test]
+    fn test_error_from_actual_error_is_under_delimiter() {
+        let actual = "db error: ERROR: relation \"t\" does not exist (1.5)";
+        let expected = ExpectedError::Multiline(actual.to_owned());
+        assert_eq!(ExpectedError::from_actual_error(None, actual), expected);
+        let inline = ExpectedError::new_inline("relation .* missing".to_owned()).unwrap();
+        assert_eq!(
+            ExpectedError::from_actual_error(Some(&inline), actual),
+            expected
+        );
+        let ignoring =
+            ExpectedError::Multiline("db error: ERROR: relation <slt:ignore> is gone".to_owned());
+        assert_eq!(
+            ExpectedError::from_actual_error(Some(&ignoring), actual),
+            ExpectedError::Multiline(
+                "db error: ERROR: relation <slt:ignore> does not exist (1.5)".to_owned()
+            )
+        );
     }
 
     #[test]
