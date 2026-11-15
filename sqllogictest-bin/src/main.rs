@@ -22,8 +22,8 @@ use rand::seq::SliceRandom;
 use sqllogictest::substitution::well_known;
 use sqllogictest::{
     default_column_validator, default_validator, trim_normalizer, update_record_with_output,
-    AsyncDB, ColumnType, DBPort, Injected, MakeConnection, Partitioner, Record, Runner, SslMode,
-    TestError, UpdateMode,
+    AsyncDB, ColumnType, DBPort, Injected, MakeConnection, Partitioner, QueryExpect, Record,
+    RecordOutput, Runner, SslMode, StatementExpect, TestError, UpdateMode,
 };
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -1745,6 +1745,41 @@ fn record_line<T: ColumnType>(record: &Record<T>) -> Option<u32> {
     }
 }
 
+/// The SQLSTATE of a statement or query that does not parse.
+const SYNTAX_ERROR: &str = "42601";
+
+/// Whether `record` expects its statement or query to succeed, and `output` is the error of
+/// SQL that does not parse: a typo, which no update turns into the expectation.
+fn is_typo<D: AsyncDB>(
+    record: &Record<D::ColumnType>,
+    output: &RecordOutput<D::ColumnType>,
+) -> bool {
+    let expects_success = matches!(
+        record,
+        Record::Statement {
+            expected: StatementExpect::Ok | StatementExpect::Count(_),
+            ..
+        } | Record::Query {
+            expected: QueryExpect::Results { .. },
+            ..
+        }
+    );
+    let (RecordOutput::Statement {
+        error: Some(error), ..
+    }
+    | RecordOutput::Query {
+        error: Some(error), ..
+    }) = output
+    else {
+        return false;
+    };
+    expects_success
+        && error
+            .downcast_ref::<D::Error>()
+            .and_then(D::error_sql_state)
+            .is_some_and(|state| state == SYNTAX_ERROR)
+}
+
 /// The test file `text` with each record `edits` names by its line edited, keeping the
 /// empty lines after a replaced record, as many as its new text needs at least. With `reformat`
 /// every record is written anew; otherwise the rest keeps its text.
@@ -1868,6 +1903,7 @@ where
             UpdateMode::SkipFailed { label, reason } => {
                 Some(Edit::Prepend(format!("skipif {label} # {reason}")))
             }
+            _ if is_typo::<M::Conn>(record, &outcome.output) => None,
             _ => update_record_with_output(
                 record,
                 &outcome.output,
@@ -1934,16 +1970,19 @@ mod tests {
 
     use super::*;
 
-    /// Answers `select <value>` with the column `v` holding `value`, and `fail <message>` with
-    /// that error.
+    /// Answers `select <value>` with the column `v` holding `value`, `fail <message>` with
+    /// that error, and `syntax <message>` with that error of SQL that does not parse.
     struct FakeDB;
 
     #[derive(Debug)]
-    struct FakeDBError(String);
+    struct FakeDBError {
+        message: String,
+        sql_state: Option<String>,
+    }
 
     impl std::fmt::Display for FakeDBError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", self.0)
+            write!(f, "{}", self.message)
         }
     }
 
@@ -1954,14 +1993,25 @@ mod tests {
         type ColumnType = DefaultColumnType;
 
         fn run(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, FakeDBError> {
+            let error = |message: &str, sql_state: Option<&str>| FakeDBError {
+                message: message.to_string(),
+                sql_state: sql_state.map(str::to_string),
+            };
             if let Some(message) = sql.strip_prefix("fail ") {
-                return Err(FakeDBError(message.to_string()));
+                return Err(error(message, None));
+            }
+            if let Some(message) = sql.strip_prefix("syntax ") {
+                return Err(error(message, Some(SYNTAX_ERROR)));
             }
             let value = sql.strip_prefix("select ").unwrap();
             Ok(DBOutput::Rows {
                 types: vec![DefaultColumnType::Any],
                 rows: vec![vec!["v".to_string()], vec![value.to_string()]],
             })
+        }
+
+        fn error_sql_state(err: &FakeDBError) -> Option<String> {
+            err.sql_state.clone()
         }
     }
 
@@ -2064,6 +2114,38 @@ v
         assert_eq!(
             fs_err::read_to_string(&file).unwrap(),
             text.replace("v\n3", "v\n2")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn update_test_file_does_not_take_a_typo_for_an_expected_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("typo.slt");
+        let text = "\
+statement ok
+syntax error at or near \"SELEC\"
+
+query
+syntax error at or near \"FORM\"
+----
+v
+1
+
+statement error
+syntax error at or near \"WHERE\"
+----
+old
+";
+        fs_err::write(&file, text).unwrap();
+        let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
+        let error = update_test_file(&mut vec![], &mut runner, &file, &UpdateMode::Override)
+            .await
+            .unwrap_err();
+        let error = format!("{error:?}");
+        assert!(error.contains("SELEC") && error.contains("FORM"));
+        assert_eq!(
+            fs_err::read_to_string(&file).unwrap(),
+            text.replace("\nold\n", "\nerror at or near \"WHERE\"\n")
         );
     }
 
