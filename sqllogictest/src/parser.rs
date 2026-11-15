@@ -1335,7 +1335,9 @@ fn parse_inner<T: ColumnType>(loc: &Location, script: &str) -> Result<Vec<Record
                     }
                     [type_str, rest @ ..] => {
                         // query [async] [<type-string>] [<sort-mode>] [<label>] [retry <attempts> backoff <backoff>]
-                        let (types, res) = if SortMode::try_from_str(type_str).is_ok() {
+                        let no_types =
+                            SortMode::try_from_str(type_str).is_ok() || *type_str == "retry";
+                        let (types, res) = if no_types {
                             (Vec::new(), res)
                         } else {
                             let types = type_str
@@ -1871,6 +1873,24 @@ select * from foo;
                 exec_async: false,
             }]
         );
+    }
+
+    #[test]
+    fn test_query_retry_without_types() {
+        let script = "query retry 3 backoff 1s\nSELECT 1\n----\n?column?\n1\n";
+        let records = parse::<DefaultColumnType>(script).unwrap();
+        let Record::Query {
+            expected: QueryExpect::Results { types, label, .. },
+            retry: Some(retry),
+            ..
+        } = &records[0]
+        else {
+            panic!("not a query with a retry: {:?}", records[0]);
+        };
+        assert!(types.is_empty());
+        assert_eq!(*label, None);
+        assert_eq!(retry.attempts, RetryAttempts::Count(3));
+        assert_eq!(records[0].to_string(), script);
     }
 
     #[test]
