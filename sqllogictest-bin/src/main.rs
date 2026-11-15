@@ -1326,20 +1326,31 @@ async fn update_test_files(
                 }
                 directives.apply(&mut runner);
                 runner.set_var(well_known::DATABASE.to_owned(), db_name.clone());
+                let per_run_values = match jobs {
+                    Some(_) => vec![db_name.clone()],
+                    None => Vec::new(),
+                };
 
                 let mut buffer = vec![];
-                let failed =
-                    match update_test_file(&mut buffer, &mut runner, &file, update_mode).await {
-                        Ok(()) => None,
-                        Err(e) => {
-                            writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
-                                .expect("cannot write to buffer");
-                            if keep_db_on_failure {
-                                failed_dbs.lock().await.insert(db_name);
-                            }
-                            Some(to_relative_path_display(&file.to_string_lossy()))
+                let failed = match update_test_file(
+                    &mut buffer,
+                    &mut runner,
+                    &file,
+                    update_mode,
+                    per_run_values,
+                )
+                .await
+                {
+                    Ok(()) => None,
+                    Err(e) => {
+                        writeln!(buffer, "{}\n\n{:?}\n", style("[FAILED]").red().bold(), e)
+                            .expect("cannot write to buffer");
+                        if keep_db_on_failure {
+                            failed_dbs.lock().await.insert(db_name);
                         }
-                    };
+                        Some(to_relative_path_display(&file.to_string_lossy()))
+                    }
+                };
 
                 runner.shutdown_async().await;
                 (buffer, failed)
@@ -1847,11 +1858,14 @@ fn rewrite<T: ColumnType>(
 /// Runs a test file the way a test run does, then rewrites, in it and in the files it
 /// includes, the statements, queries and system commands whose outcome fails their
 /// expectation, as `update_mode` says; the modes that reformat write every record anew.
+/// `per_run_values` differ on every run, like the database a parallel run creates: no
+/// expectation it writes pins them.
 async fn update_test_file<T: io::Write, M: MakeConnection>(
     out: &mut T,
     runner: &mut Runner<M::Conn, M>,
     filename: impl AsRef<Path>,
     update_mode: &UpdateMode,
+    mut per_run_values: Vec<String>,
 ) -> Result<()>
 where
     M::Conn: Send + 'static,
@@ -1884,6 +1898,7 @@ where
             .map_err(|e| anyhow!("{}", e.display(console::colors_enabled())))
             .context(format!("failed to run `{}`", style(&name).bold()))?;
     }
+    per_run_values.extend(runner.per_run_values());
 
     let mut files = vec![name.clone()];
     let mut edits: HashMap<String, HashMap<u32, Edit<_>>> = HashMap::new();
@@ -1906,7 +1921,7 @@ where
             _ if is_typo::<M::Conn>(record, &outcome.output) => None,
             _ => update_record_with_output(
                 record,
-                &outcome.output,
+                &outcome.output.ignoring(&per_run_values),
                 "\t",
                 default_validator,
                 trim_normalizer,
@@ -2029,7 +2044,7 @@ select ok
 include included.slt
 
 query II
-select a.parquet
+select db_x1y2/a.parquet
 ----
 v
 old
@@ -2058,9 +2073,16 @@ v
         )
         .unwrap();
         let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
-        update_test_file(&mut vec![], &mut runner, &main, &UpdateMode::Override)
-            .await
-            .unwrap();
+        let database = vec!["db_x1y2".to_string()];
+        update_test_file(
+            &mut vec![],
+            &mut runner,
+            &main,
+            &UpdateMode::Override,
+            database,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             fs_err::read_to_string(&main).unwrap(),
             "\
@@ -2070,10 +2092,10 @@ select ok
 include included.slt
 
 query
-select a.parquet
+select db_x1y2/a.parquet
 ----
 v
-a.parquet
+<slt:ignore>/a.parquet
 
 
 statement error
@@ -2107,9 +2129,15 @@ v
         let text = "system ok\nexit 3\n\nquery\nselect 2\n----\nv\n3\n";
         fs_err::write(&file, text).unwrap();
         let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
-        let error = update_test_file(&mut vec![], &mut runner, &file, &UpdateMode::Override)
-            .await
-            .unwrap_err();
+        let error = update_test_file(
+            &mut vec![],
+            &mut runner,
+            &file,
+            &UpdateMode::Override,
+            vec![],
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:?}").contains("left as they are"));
         assert_eq!(
             fs_err::read_to_string(&file).unwrap(),
@@ -2138,9 +2166,15 @@ old
 ";
         fs_err::write(&file, text).unwrap();
         let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
-        let error = update_test_file(&mut vec![], &mut runner, &file, &UpdateMode::Override)
-            .await
-            .unwrap_err();
+        let error = update_test_file(
+            &mut vec![],
+            &mut runner,
+            &file,
+            &UpdateMode::Override,
+            vec![],
+        )
+        .await
+        .unwrap_err();
         let error = format!("{error:?}");
         assert!(error.contains("SELEC") && error.contains("FORM"));
         assert_eq!(
@@ -2300,7 +2334,7 @@ DROP TABLE t\n"
         let file = dir.path().join("modes.slt");
         fs_err::write(&file, text).unwrap();
         let mut runner = Runner::new(|_, _, _, _, _| async { Ok(FakeDB) });
-        update_test_file(&mut vec![], &mut runner, &file, &update_mode)
+        update_test_file(&mut vec![], &mut runner, &file, &update_mode, vec![])
             .await
             .unwrap();
         fs_err::read_to_string(&file).unwrap()

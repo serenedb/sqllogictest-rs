@@ -74,6 +74,47 @@ pub enum RecordOutput<T: ColumnType> {
     },
 }
 
+impl<T: ColumnType> RecordOutput<T> {
+    /// Replaces every occurrence of `values` in the rows, the output and the error with
+    /// `<slt:ignore>`, so an expectation written from the output holds whatever they are.
+    pub fn ignoring(self, values: &[String]) -> Self {
+        let mut values = values.iter().filter(|v| !v.is_empty()).collect_vec();
+        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        let ignore = |text: String| {
+            values.iter().fold(text, |text, value| {
+                text.replace(value.as_str(), IGNORE_MARKER)
+            })
+        };
+        let ignore_error = |error: Option<AnyError>| {
+            error.map(|error| Arc::new(IgnoringError(ignore(error.to_string()))) as AnyError)
+        };
+        match self {
+            RecordOutput::Query { types, rows, error } => RecordOutput::Query {
+                types,
+                rows: rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(ignore).collect())
+                    .collect(),
+                error: ignore_error(error),
+            },
+            RecordOutput::Statement { count, error } => RecordOutput::Statement {
+                count,
+                error: ignore_error(error),
+            },
+            RecordOutput::System { stdout, error } => RecordOutput::System {
+                stdout: stdout.map(ignore),
+                error: ignore_error(error),
+            },
+            output @ (RecordOutput::Nothing | RecordOutput::Let { .. }) => output,
+        }
+    }
+}
+
+/// An error whose message had values replaced with `<slt:ignore>`.
+#[derive(thiserror::Error, Debug)]
+#[error("{0}")]
+struct IgnoringError(String);
+
 /// Error type for `let` record execution.
 #[derive(thiserror::Error, Debug, Clone)]
 #[non_exhaustive]
@@ -1863,6 +1904,15 @@ impl<D: AsyncDB, M: MakeConnection<Conn = D>> Runner<D, M> {
         self.vars.locals.set_var(key, value);
     }
 
+    /// The values of `__TEST_DIR__` and `__RUN_ID__`, once a record used them: they differ on
+    /// every run.
+    pub fn per_run_values(&self) -> Vec<String> {
+        match self.vars.locals.test_dir.get() {
+            Some(_) => vec![self.vars.locals.test_dir(), self.vars.locals.run_id()],
+            None => Vec::new(),
+        }
+    }
+
     pub fn with_normalizer(&mut self, normalizer: Normalizer) {
         self.check_options.normalizer = normalizer;
     }
@@ -3289,6 +3339,35 @@ Caused by:
             expected: None,
         }
         .run()
+    }
+
+    #[test]
+    fn test_record_output_ignoring() {
+        let values = ["tmpAbC1".to_string(), "/tmp/.tmpAbC1".to_string()];
+        let RecordOutput::Query { rows, error, .. } = RecordOutput::Query {
+            types: vec![DefaultColumnType::Text],
+            rows: vec![
+                vec!["path".to_string()],
+                vec!["/tmp/.tmpAbC1/a.parquet".to_string()],
+                vec!["db_tmpAbC1".to_string()],
+            ],
+            error: Some(Arc::new(TestError("'/tmp/.tmpAbC1' is locked".to_string()))),
+        }
+        .ignoring(&values) else {
+            unreachable!()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec!["path".to_string()],
+                vec!["<slt:ignore>/a.parquet".to_string()],
+                vec!["db_<slt:ignore>".to_string()],
+            ]
+        );
+        assert_eq!(
+            error.unwrap().to_string(),
+            "TestError: '<slt:ignore>' is locked"
+        );
     }
 
     #[derive(Debug)]

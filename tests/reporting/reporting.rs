@@ -171,6 +171,34 @@ attempt
 }
 
 #[tokio::test]
+async fn test_per_run_values_are_the_test_directory_and_run_id_once_used() {
+    let db = FakeDB {
+        log: Arc::default(),
+        attempts: Arc::default(),
+    };
+    let mut runner = sqllogictest::Runner::new(move |_, _, _, _, _| {
+        let db = db.clone();
+        async move { Ok(db) }
+    });
+    assert!(runner.per_run_values().is_empty());
+    let script = "control substitution on\n\nquery T\nselect ${__TEST_DIR__}\n----\n/tmp\n";
+    let mut outcomes = vec![];
+    runner
+        .run_multi_records_reporting(sqllogictest::parse(script).unwrap(), |outcome| {
+            outcomes.push(outcome);
+            Ok(())
+        })
+        .await
+        .expect("no record stops the run");
+    let values = runner.per_run_values();
+    let [test_dir, run_id] = values.as_slice() else {
+        panic!("not a test directory and a run id: {values:?}");
+    };
+    assert!(test_dir.contains(run_id.as_str()));
+    assert_eq!(rows(&outcomes[0]), [[test_dir.as_str()]]);
+}
+
+#[tokio::test]
 async fn test_reporting_stops_at_a_failed_let() {
     let run = run("\
 let x
